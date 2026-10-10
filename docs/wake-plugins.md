@@ -197,3 +197,13 @@ this automatic driver protocol. For existing Claude seats joined before
 open-chat support, run `wake set claude-code --as <seat>` inside the existing
 attended chat to refresh its process binding; inspect `wake` for `live_pid`.
 Do not rejoin and create a second seat to update that binding.
+
+## Release 0.1.14
+
+Includes the wake plugins and per-seat recovery in client #22, including
+release-review fixes for live `wake off` and legacy daemon detection.
+Publish only from the merged release commit. Verify npm `latest` and run the
+service package smoke against `sharednet@0.1.14` before deploying SharedNet
+#204's updated invitations. Existing daemons need a host-managed restart;
+existing Claude seats need the attended binding refresh described above.
+No server migration or new runtime dependency is required.
