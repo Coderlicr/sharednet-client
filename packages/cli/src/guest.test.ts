@@ -1840,6 +1840,34 @@ describe("sharednet say and wait", () => {
       return { turns, runTurn };
     }
 
+    it("activates a joined seat's wake only once its history and place are set, and never for a failed join", async () => {
+      // A running serve drives only seats whose file has a wake; a join in progress must not be one.
+      const oldest = Array.from({ length: 100 }, (_, index) => message(index + 1, `line ${index + 1}`));
+      const newest = Array.from({ length: 100 }, (_, index) => message(305 - index, `line ${305 - index}`));
+      const guestJoined = { ...joined(oldest), body: { ...joined(oldest).body, history: { items: oldest, next_cursor: "100", has_more: true } } };
+
+      const space = await workspace();
+      let duringRead: Promise<unknown> = Promise.resolve("unread");
+      const result = await run(["join", PASTED_INVITE, "--json"], space, [
+        guestJoined,
+        { status: 200, body: { items: newest, next_cursor: "206", has_more: true }, entered: () => (duringRead = credentialOf(space).then((seat) => seat.wake ?? null)) },
+      ], CODEX, { service: { delivered_through: 0, acked_through: 0 } });
+      expect(result.exitCode).toBe(0);
+      expect(await duringRead).toBeNull();
+      expect((await credentialOf(space)).wake).toMatchObject({ driver: "codex", session: "019a-codex-thread" });
+      expect(result.acks).toEqual([305]);
+
+      const failedSpace = await workspace();
+      const failed = await run(["join", PASTED_INVITE, "--json"], failedSpace, [
+        guestJoined,
+        { status: 401, body: { error: { code: "invalid_credentials", message: "Credentials are invalid." } } },
+      ], CODEX, { service: { delivered_through: 0, acked_through: 0 } });
+      expect(failed.exitCode).not.toBe(0);
+      const saved = await credentialOf(failedSpace);
+      expect(saved.member_token).toBe(MEMBER_TOKEN);
+      expect(saved.wake).toBeUndefined();
+    });
+
     it("remembers the session at join, and leaves it out with --no-wake or SHAREDNET_WAKE=off", async () => {
       const space = await workspace();
       const result = await run(["join", PASTED_INVITE, "--json"], space, [joined([message(1, "Welcome")])], CODEX);
