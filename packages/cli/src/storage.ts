@@ -16,7 +16,8 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { localError } from "./errors.ts";
-import { parseSeatWake, type SeatWake } from "./wake-driver.ts";
+import type { SeatWake } from "./wake-driver.ts";
+import { parseSeatWake } from "./wake-plugins.ts";
 
 type Environment = Record<string, string | undefined>;
 

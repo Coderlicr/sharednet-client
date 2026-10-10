@@ -12,7 +12,9 @@ import { computeLocalInstanceKey } from "./instance-computation.ts";
 import { detectRuntime, type DetectedRuntime } from "./runtime-detection.ts";
 import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn, triggerTakesParameter, wakeIdentity, type Trigger } from "./triggers.ts";
 import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
-import { chatOpen, replyFrom, runTurn, sandboxed, seatWakeFrom, turnSpec, turnSummary, wakeTurnPrompt, type SeatWake, type TurnRunner } from "./wake-driver.ts";
+import { chatOpen } from "./wake-claude.ts";
+import { livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
+import { describeWake, isWakeDriver, pluginFor, seatWakeFrom } from "./wake-plugins.ts";
 import {
   getOrCreateInstallationSecret,
   getStoragePaths,
@@ -59,6 +61,8 @@ export interface GuestDependencies {
   runTurn?: TurnRunner;
   /** Whether the Claude Code chat that took a seat is still open; tests replace it. */
   chatOpen?: (pid: number) => boolean;
+  /** Whether a seat's wake program starts at all (the plugin's check); tests replace it. */
+  checkWake?: (wake: SeatWake) => Promise<CheckResult>;
   /**
    * Starts `sharednet serve` in the background after a join, so the session that joined is woken
    * when it is addressed. Only the real process supplies it; without it, a join starts nothing.
@@ -113,7 +117,7 @@ const INVITE_TOKEN_PATTERN = /^rit_[A-Za-z0-9_-]{43}$/;
 /** The server caps one wait at this; the client loops. */
 const WAIT_MAX_SECONDS = 25;
 
-const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file"]);
+const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume"]);
 /** Options that may be given more than once; every value is kept, in order. */
 const REPEATABLE_OPTIONS = new Set(["on", "artifact"]);
 const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake"]);
@@ -646,7 +650,9 @@ async function wakeAfterJoin(
 ): Promise<Record<string, unknown> | null> {
   const wake = seat.wake;
   if (!wake) return null;
-  const harness = wake.driver === "codex" ? "Codex" : "Claude Code";
+  const plugin = pluginFor(wake.driver);
+  const harness = plugin.label;
+  const listen = plugin.listen?.(wake, seat.member_id) ?? null;
   const status = (await readServeStatus(paths).catch(() => ({}))) as { running?: boolean; pid?: number; drives?: boolean };
   let service: "running" | "started" | "not_started" | "outdated";
   let how: string;
@@ -671,14 +677,14 @@ async function wakeAfterJoin(
     how = "run `sharednet serve` to be woken";
   }
   dependencies.stderr?.(`Wake: when someone writes ${address} in this Room, this ${harness} session is resumed with what was said; ${how}.\n`);
-  if (wake.live_pid !== undefined) {
-    // An open chat is not resumed from outside (the service leaves its lines to it), so it has to
-    // listen itself: Claude Code calls the chat back when a background command ends.
+  if (listen !== null) {
+    // An open session that nothing can reach from outside listens itself: Claude Code calls the chat
+    // back when a background command ends.
     dependencies.stderr?.(
-      `While this chat is open, it hears ${address} itself: run \`sharednet wait --on mention --as ${seat.member_id} --json\` as a background command, answer what it returns with \`sharednet say … --as ${seat.member_id}\`, then run it again. Once the chat is closed, the wake service resumes it instead.\n`,
+      `While this chat is open, it hears ${address} itself: run \`${listen}\` as a background command, answer what it returns with \`sharednet say … --as ${seat.member_id}\`, then run it again. Once the chat is closed, the wake service resumes it instead.\n`,
     );
   }
-  return { driver: wake.driver, session: wake.session, address, service, ...(pid ? { pid } : {}), ...(wake.live_pid !== undefined ? { live_chat: true, listen: `sharednet wait --on mention --as ${seat.member_id} --json` } : {}) };
+  return { driver: wake.driver, session: wake.session, address, service, ...(pid ? { pid } : {}), ...(listen !== null ? { live_chat: true, listen } : {}) };
 }
 
 async function currentSeat(
@@ -2514,7 +2520,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       room_id: seat.room_id,
       member_id: seat.member_id,
       name: seat.name,
-      resumes: !command && seat.wake ? `${seat.wake.driver} ${seat.wake.session}` : null,
+      resumes: !command && seat.wake ? describeWake(seat.wake) : null,
       ...(health.get(seatKey(seat)) ?? { state: "starting" as const, updated_at: started }),
     })),
   });
@@ -2541,6 +2547,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const exec = dependencies.exec ?? defaultExec;
   const drive = dependencies.runTurn ?? runTurn;
   const open = dependencies.chatOpen ?? chatOpen;
+  const checkWake = dependencies.checkWake ?? ((wake: SeatWake) => pluginFor(wake.driver).check(wake, dependencies.env, drive));
 
   // With --push the seats sit behind a doorbell (wait PR 7): no long-poll, and not one request while
   // nothing is said. Ctrl-C takes the doorbells down before it goes.
@@ -2573,7 +2580,15 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     // Driven, a seat wakes when a line addresses it; the wake still carries everything said since.
     const seatFilters = driving ? new URLSearchParams({ mentions: me }) : filters;
     if (driving) {
-      dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} (${me}) resumes ${seat.wake!.driver} session ${seat.wake!.session} when addressed\n`);
+      // A program that cannot start would take every wake and answer none (#20): look once, first,
+      // and leave the seat's lines unread when it does not start.
+      const checked = await checkWake(seat.wake!);
+      if (!checked.ok) {
+        dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} (${me}) not driven: ${checked.message}. Repair it, check with \`sharednet wake check --as ${me}\`, and restart serve.\n`);
+        await setHealth(seat, "stopped", "wake_command_unavailable");
+        return;
+      }
+      dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} (${me}) wakes ${describeWake(seat.wake!)} when addressed\n`);
     }
     const turns = turnTimes.get(seatKey(seat)) ?? [];
     turnTimes.set(seatKey(seat), turns);
@@ -2608,8 +2623,10 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       await acknowledgeThrough(client, seat.room_id, seat.member_token, cursor, sleep, dependencies);
       await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
     };
-    /** One wake of a driven seat: its own session, resumed with what was said. */
-    const resumeSession = async (said: MessageShape[], from: number, through: number) => {
+    const post = (content: string) =>
+      client.request("POST", `/rooms/${encodeURIComponent(seat.room_id)}/messages`, seat.member_token, { content }, { "idempotency-key": randomUUID() });
+    /** One wake of a driven seat, delivered by its plugin. What that means for the Room is decided here. */
+    const deliverWake = async (said: MessageShape[], from: number, through: number): Promise<Delivery> => {
       const hour = dependencies.now().getTime() - 3_600_000;
       while (turns.length > 0 && turns[0]! <= hour) turns.shift();
       if (turns.length >= MAX_TURNS_PER_HOUR) {
@@ -2617,49 +2634,49 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} was resumed ${turns.length} times in the last hour; the next turn waits ${Math.ceil(wait / 60_000)} min\n`);
         await sleep(Math.max(wait, 0));
       }
-      // The seat file names the session to resume; a later join from another session replaces it.
+      // The seat file names the session; a later join or `wake set` replaces it.
       const wake = (await readRoomCredential(paths, seat.room_id, seat.member_id).catch(() => null))?.wake ?? seat.wake!;
-      let prompt = wakeTurnPrompt({ roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through });
+      const about = { roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through };
+      let prompt = wakeTurnPrompt(about);
       if (seat.room_type === "compiled") {
         const state = await client.request<CompiledState>("GET", `/rooms/${encodeURIComponent(seat.room_id)}/state`, seat.member_token);
         prompt += `\n\n${compiledPrompt(state)}`;
       }
-      dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} addressed; resuming ${wake.driver} session ${wake.session} with #${from + 1}..#${through}\n`);
-      turns.push(dependencies.now().getTime());
-      const outcome = await drive(turnSpec(wake, prompt, dependencies.env, seat.member_id, TURN_LIMIT_MS));
-      const summary = turnSummary(wake.driver, outcome.stdout);
-      const post = (content: string) =>
-        client.request("POST", `/rooms/${encodeURIComponent(seat.room_id)}/messages`, seat.member_token, { content }, { "idempotency-key": randomUUID() });
-      if (summary.ok && outcome.exitCode === 0) {
+      const plugin = pluginFor(wake.driver);
+      const started = dependencies.now().getTime();
+      const delivery = await plugin.deliver(wake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs: TURN_LIMIT_MS });
+      // The backstop counts turns that ran; a wake handed on, left or put off ran none.
+      if (delivery.kind === "replied" || delivery.kind === "failed") turns.push(started);
+      const span = `#${from + 1}..#${through}`;
+      if (delivery.kind === "replied") {
         // The turn's last message is the seat's reply; the session does not have to reach the Room.
-        const answer = replyFrom(summary.said, MAX_MESSAGE_BYTES);
+        const answer = replyFrom(delivery.reply, MAX_MESSAGE_BYTES);
         dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} finished its turn${answer ? `: ${answer.replace(/\s+/g, " ").slice(0, 160)}` : " with nothing to say"}\n`);
         if (answer) {
           await post(answer).catch((error: unknown) => {
             dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name}'s reply was not posted (${error instanceof CliError ? error.code : "error"})\n`);
           });
         }
-        return;
+      } else if (delivery.kind === "handed") {
+        dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} addressed; ${span} ${delivery.note}; it answers in the Room itself\n`);
+      } else if (delivery.kind === "failed") {
+        // The Room hears the harness's own words, or the exit code; the machine's output stays in the log.
+        dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} could not be resumed: ${delivery.why}${delivery.detail ? ` (${delivery.detail})` : ""}\n`);
+        // Whoever addressed the seat would otherwise hear nothing at all, and not know why.
+        const notice = delivery.timedOut
+          ? `(${seat.name}'s turn was stopped after ${TURN_LIMIT_MS / 60_000} minutes. The listener remains available for the next mention; this task was not automatically retried.)`
+          : `(${seat.name} was addressed, but its ${plugin.label} session could not be resumed: ${delivery.why})`;
+        await post(notice).catch(() => undefined);
       }
-      // The Room hears the harness's own words, or the exit code; the machine's output stays in the log.
-      const why = outcome.timedOut
-        ? `it ran past ${TURN_LIMIT_MS / 60_000} minutes and was stopped`
-        : (summary.said?.trim() || `the ${wake.driver} command exited ${outcome.exitCode}`).slice(0, 200);
-      const detail = outcome.stderr.trim().split("\n").slice(-3).join(" / ").slice(0, 400);
-      dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} could not be resumed: ${why}${detail ? ` (${detail})` : ""}\n`);
-      // Whoever addressed the seat would otherwise hear nothing at all, and not know why.
-      const notice = outcome.timedOut
-        ? `(${seat.name}'s turn was stopped after ${TURN_LIMIT_MS / 60_000} minutes. The listener remains available for the next mention; this task was not automatically retried.)`
-        : `(${seat.name} was addressed, but its ${wake.driver === "codex" ? "Codex" : "Claude Code"} session could not be resumed: ${why})`;
-      await post(notice).catch(() => undefined);
+      return delivery;
     };
 
     // Where the long-poll resumes. Without a filter it is the cursor. With one it can run ahead, past
     // the seat's own matching words, while the cursor stays at what has been handed over.
     let polled = cursor;
     let idle = false;
-    /** The last line already reported as left to an open chat, so the log says it once. */
-    let leftThrough = 0;
+    /** The last line already reported as left or put off, so the log says it once. */
+    let reported = 0;
     for (;;) {
       if (stopping.signal.aborted) return;
       // Behind a doorbell there is no long-poll: once nothing is left to hand over, the seat waits to
@@ -2680,30 +2697,28 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         );
       }
       if (driving && others.length > 0) {
-        // A chat a person has open answers through its own `sharednet wait`: resuming it here would
-        // be a second writer it never sees. Its wait acknowledges what it handled, and that becomes
-        // this seat's place; whatever it leaves is resumed here once the chat has closed.
-        const wake = (await readRoomCredential(paths, seat.room_id, seat.member_id).catch(() => null))?.wake ?? seat.wake!;
-        if (wake.live_pid !== undefined && open(wake.live_pid)) {
-          if (polled > leftThrough) {
-            dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} addressed while its Claude Code chat is open (pid ${wake.live_pid}); leaving #${cursor + 1}..#${polled} to that chat\n`);
-            leftThrough = polled;
+        await setHealth(seat, "working");
+        const delivery = await deliverWake(others, cursor, polled);
+        if (delivery.kind === "left" || delivery.kind === "busy") {
+          // Not this seat's to acknowledge yet. A session that answers for itself acknowledges what it
+          // handled, and that becomes the place; what it leaves comes round again.
+          if (polled > reported) {
+            dependencies.stderr?.(
+              delivery.kind === "left"
+                ? `serve: ${seat.room_id} ${seat.name} addressed while ${delivery.note}; leaving #${cursor + 1}..#${polled} to it\n`
+                : `serve: ${seat.room_id} ${seat.name} addressed, but ${delivery.why}; trying #${cursor + 1}..#${polled} again in ${Math.round(delivery.retryMs / 1000)}s\n`,
+            );
+            reported = polled;
           }
-          await sleep(10_000);
-          try {
-            const kept = await keptPlace(client, seat.room_id, seat.member_token, cursor, sleep, dependencies);
-            if (kept > cursor) {
-              cursor = kept;
-              await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
-            }
-          } catch (error) {
-            if (!(error instanceof CliError)) throw error;
+          await sleep(delivery.kind === "left" ? 10_000 : delivery.retryMs);
+          const kept = await keptPlace(client, seat.room_id, seat.member_token, cursor, sleep, dependencies);
+          if (kept > cursor) {
+            cursor = kept;
+            await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
           }
           polled = cursor;
           continue;
         }
-        await setHealth(seat, "working");
-        await resumeSession(others, cursor, polled);
         // Handled only now, so a wake cut short by a crash or a restart is handed over again.
         await handled(polled);
         continue;
@@ -2958,7 +2973,75 @@ async function timer(args: string[], dependencies: GuestDependencies): Promise<u
   return client.request("POST", timers, credential.member_token, { when: rest[0], say: rest[1] });
 }
 
+const WAKE_USAGE =
+  "Usage: sharednet wake [--as <i_…>], sharednet wake set codex|claude-code|command [--command <path>] [--resume <session>] [--as <i_…>], sharednet wake off [--as <i_…>], or sharednet wake check [--as <i_…>]";
+
+/**
+ * A seat's wake, by hand (docs/wake-plugins.md): which plugin delivers it, what it resumes, the
+ * program it calls. Local only: the service never hears a session id.
+ */
+async function wakeVerb(args: string[], dependencies: GuestDependencies): Promise<unknown> {
+  const parsed = parseGuestArguments(args);
+  assertOnlyOptions(parsed, ["as", "command", "resume"]);
+  const [action = "show", driver, ...extra] = parsed.positionals;
+  if (extra.length > 0 || !["show", "set", "off", "check"].includes(action) || (action === "set") !== (driver !== undefined)) {
+    throw localError("invalid_arguments", WAKE_USAGE);
+  }
+  const paths = getStoragePaths(dependencies.env);
+  const chosen = stringOption(parsed, "as") ?? dependencies.env.SHAREDNET_SEAT?.trim() ?? undefined;
+  const state = await selectProjectSeat(dependencies.cwd, {
+    ...(chosen === undefined ? {} : { explicit: chosen }),
+    anchorKey: await anchorKeyFor(dependencies.env, paths),
+  });
+  if (!state) throw localError("not_in_a_room", "This directory is not in a Room. Run: sharednet join <invite>");
+  const credential = await readRoomCredential(paths, state.room_id, state.member_id);
+  if (!credential) throw localError("room_credential_missing", "The member token for this Room is not on this machine. Join again with a new invite.");
+  const seat = { room_id: credential.room_id, member_id: credential.member_id, name: credential.name };
+  const shown = (wake: SeatWake | undefined) => ({ ...seat, wake: wake ?? null, ...(wake ? { wakes: describeWake(wake), address: `@${credential.member_id}` } : {}) });
+
+  if (action === "show") return shown(credential.wake);
+  if (action === "off") {
+    const { wake: _dropped, ...kept } = credential;
+    await writeRoomCredential(paths, kept);
+    dependencies.stderr?.(`${credential.member_id} is no longer woken; serve leaves it alone from its next look.\n`);
+    return shown(undefined);
+  }
+  if (action === "check") {
+    if (!credential.wake) throw localError("not_driven", `${credential.member_id} has no wake. Set one with: sharednet wake set <driver> --as ${credential.member_id}`);
+    const wake = credential.wake;
+    const checked = await (dependencies.checkWake ?? ((candidate: SeatWake) => pluginFor(candidate.driver).check(candidate, dependencies.env, dependencies.runTurn ?? runTurn)))(wake);
+    if (!checked.ok) throw localError("wake_command_unavailable", `${describeWake(wake)}: ${checked.message}`);
+    return { ...shown(wake), check: checked.message };
+  }
+
+  if (!isWakeDriver(driver)) throw localError("invalid_arguments", `The wake drivers are codex, claude-code and command. ${WAKE_USAGE}`);
+  // What this process is, when it is the harness being set: its session, its program, its open chat.
+  const here = pluginFor(driver).capture(dependencies.env, dependencies.cwd);
+  const before = credential.wake?.driver === driver ? credential.wake : undefined;
+  const session = stringOption(parsed, "resume") ?? before?.session ?? here?.session;
+  const command = stringOption(parsed, "command") ?? before?.command ?? here?.command;
+  if (driver === "command" && command === undefined) throw localError("invalid_arguments", "A command wake needs --command <path>: the adapter that is handed each wake.");
+  if (driver !== "command" && session === undefined) {
+    throw localError("invalid_arguments", `A ${pluginFor(driver).label} wake resumes a session: give --resume <session id>, or run this from inside that session.`);
+  }
+  const home = before?.codex_home ?? here?.codex_home;
+  // An open chat is only this one, and only when it is the session being set.
+  const live = here?.live_pid !== undefined && here.session === session ? here.live_pid : undefined;
+  const wake: SeatWake = {
+    driver,
+    ...(driver === "command" ? {} : { session: session! }),
+    cwd: before?.cwd ?? dependencies.cwd,
+    command: command ?? (driver === "codex" ? (onPath("codex", dependencies.env) ?? "codex") : (onPath("claude", dependencies.env) ?? "claude")),
+    ...(driver === "codex" && home ? { codex_home: home } : {}),
+    ...(driver === "claude-code" && live !== undefined ? { live_pid: live } : {}),
+  };
+  await writeRoomCredential(paths, { ...credential, wake });
+  dependencies.stderr?.(`${credential.member_id} wakes ${describeWake(wake)} when addressed; a running serve uses it from the next wake.\n`);
+  return shown(wake);
+}
+
 export type GuestVerb =
+  | "wake"
   | "task"
   | "timer"
   | "serve"
@@ -2988,6 +3071,7 @@ export type GuestVerb =
 
 export function isGuestVerb(value: string | undefined): value is GuestVerb {
   return (
+    value === "wake" ||
     value === "task" ||
     value === "timer" ||
     value === "serve" ||
@@ -3020,6 +3104,7 @@ export async function runGuestVerb(
   args: string[],
   dependencies: GuestDependencies,
 ): Promise<unknown> {
+  if (verb === "wake") return wakeVerb(args, dependencies);
   if (verb === "task") return task(args, dependencies);
   if (verb === "act" || verb === "open" || verb === "deliver") return compiledCommand(verb, args, dependencies);
   if (verb === "timer") return timer(args, dependencies);

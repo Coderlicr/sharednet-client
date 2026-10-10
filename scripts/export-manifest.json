@@ -337,6 +337,12 @@
     "packages/cli/src/task-guard.ts",
     "packages/cli/src/task-guard.test.ts",
     "docs/task-mention-gates.md",
-    "docs/superpowers/plans/2026-10-09-task-mention-gates.md"
+    "docs/superpowers/plans/2026-10-09-task-mention-gates.md",
+    "docs/wake-plugins.md",
+    "packages/cli/src/wake-plugins.ts",
+    "packages/cli/src/wake-plugins.test.ts",
+    "packages/cli/src/wake-codex.ts",
+    "packages/cli/src/wake-claude.ts",
+    "packages/cli/src/wake-command.ts"
   ]
 }

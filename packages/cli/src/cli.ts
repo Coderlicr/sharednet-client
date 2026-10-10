@@ -14,7 +14,7 @@ import { dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type Doc
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
-import type { TurnRunner } from "./wake-driver.ts";
+import type { CheckResult, SeatWake, TurnRunner } from "./wake-driver.ts";
 
 
 type Environment = Record<string, string | undefined>;
@@ -43,6 +43,7 @@ export interface CliDependencies {
   runTurn?: TurnRunner;
   /** Whether the Claude Code chat that took a seat is still open, in `serve`; tests replace it. */
   chatOpen?: (pid: number) => boolean;
+  checkWake?: (wake: SeatWake) => Promise<CheckResult>;
   /** Starts `serve` in the background after a join; only the real process (main.ts) supplies it. */
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
 }
@@ -61,6 +62,7 @@ interface ResolvedDependencies {
   signal?: AbortSignal;
   runTurn?: TurnRunner;
   chatOpen?: (pid: number) => boolean;
+  checkWake?: (wake: SeatWake) => Promise<CheckResult>;
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
 }
 
@@ -686,7 +688,7 @@ async function execute(
   }
   throw localError(
     "unknown_command",
-    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/watch/export, and decision list/approve/deny.",
+    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, wake/wake set/off/check, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/watch/export, and decision list/approve/deny.",
   );
 }
 
@@ -753,6 +755,7 @@ export async function runCli(
     ...(supplied.signal ? { signal: supplied.signal } : {}),
     ...(supplied.runTurn ? { runTurn: supplied.runTurn } : {}),
     ...(supplied.chatOpen ? { chatOpen: supplied.chatOpen } : {}),
+    ...(supplied.checkWake ? { checkWake: supplied.checkWake } : {}),
     ...(supplied.startWakeService ? { startWakeService: supplied.startWakeService } : {}),
   };
   let json = argv.includes("--json");
