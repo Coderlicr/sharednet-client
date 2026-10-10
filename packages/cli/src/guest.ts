@@ -401,7 +401,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     throw invalidServerResponse();
   }
   // The service hands a guest the Room's oldest page; when there is more, the newest is what to hand over.
-  const history = payload.history.has_more ? await latestHistory(client, payload.room.id, memberToken) : payload.history;
+  const history = payload.history.has_more ? await historyOrFallback(client, payload.room.id, memberToken, payload.history, dependencies) : payload.history;
 
   const credential: StoredRoomCredential = {
     schema_version: 1,
@@ -519,8 +519,7 @@ async function enterAsSeat(
     { "idempotency-key": randomUUID() },
   );
   if (!payload.room?.id || !payload.membership?.member_id) throw invalidServerResponse();
-  const history = await latestHistory(client, roomId, seat.member_token);
-  if (!Array.isArray(history?.items)) throw invalidServerResponse();
+  const history = await historyOrFallback(client, roomId, seat.member_token, { items: [], next_cursor: null, has_more: false }, dependencies);
   // The session entering is the one to wake; a seat entered from no session keeps the one it had.
   const { wake: previous, ...held } = seat;
   const wake = choice.wakeOff ? null : (choice.wake ?? previous ?? null);
@@ -594,8 +593,7 @@ async function joinAsAccount(
     { "idempotency-key": randomUUID() },
   );
   if (!payload.room?.id || !payload.membership?.member_id) throw invalidServerResponse();
-  const history = await latestHistory(client, roomId, session.instance_token);
-  if (!Array.isArray(history?.items)) throw invalidServerResponse();
+  const history = await historyOrFallback(client, roomId, session.instance_token, { items: [], next_cursor: null, has_more: false }, dependencies);
 
   // The seat file mirrors the session so say/wait need no second lookup; the
   // session file stays the source of a fresh token when the lease is renewed.
@@ -1052,6 +1050,21 @@ async function latestHistory(client: ApiClient, roomId: string, token: string): 
   const page = await client.request<PageShape>("GET", `/rooms/${encodeURIComponent(roomId)}/messages?order=desc&limit=${JOIN_HISTORY}`, token);
   if (!Array.isArray(page?.items)) throw invalidServerResponse();
   return { ...page, items: [...page.items].sort((a, b) => a.sequence - b.sequence) };
+}
+
+/**
+ * The newest history, or `fallback` when it cannot be read. By then the service has seated the join,
+ * so failing here would leave a seat whose token was never saved; the join is kept, and the next wake
+ * carries whatever the fallback did not cover.
+ */
+async function historyOrFallback(client: ApiClient, roomId: string, token: string, fallback: PageShape, dependencies: GuestDependencies): Promise<PageShape> {
+  try {
+    return await latestHistory(client, roomId, token);
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    dependencies.stderr?.(`The Room's newest lines could not be read (${error.code}); joined anyway, and the next wake carries what was said after the history shown.\n`);
+    return fallback;
+  }
 }
 
 /** A join hands over the history it returns, so the seat's place starts after it, as the MCP join's does. */

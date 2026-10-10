@@ -512,6 +512,46 @@ describe("sharednet join", () => {
     expect(guest.acks).toEqual([305]);
   });
 
+  it("keeps a join whose newest lines cannot be read, so the seat the service made is never lost", async () => {
+    const unavailable = { status: 503, body: { error: { code: "service_unavailable", message: "Try again." } } };
+    // A guest: the service already seated it and handed over its oldest page.
+    const oldest = Array.from({ length: 100 }, (_, index) => message(index + 1, `line ${index + 1}`));
+    const space = await workspace();
+    const guest = await run(
+      ["join", PASTED_INVITE, "--name", "reviewer", "--json"],
+      space,
+      [{ ...joined(oldest), body: { ...joined(oldest).body, history: { items: oldest, next_cursor: "100", has_more: true } } }, unavailable],
+      {},
+      { service: { delivered_through: 0, acked_through: 0 } },
+    );
+    expect(guest.exitCode).toBe(0);
+    expect(guest.stderr).toContain("The Room's newest lines could not be read (service_unavailable); joined anyway");
+    expect(JSON.parse(guest.stdout).last_sequence).toBe(100);
+    const saved = JSON.parse(await readFile(join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, `${MEMBER_ID}.json`), "utf8"));
+    expect(saved.member_token).toBe(MEMBER_TOKEN);
+
+    // An account seat: joined, history unreadable; the seat file is written all the same.
+    const instance = {
+      id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", agent_id: null, runtime_kind: "claude-code", cli_version: "0.1.3",
+      status: "online", display_name: null, started_at: "2026-09-06T00:00:00.000Z", last_seen_at: "2026-09-06T00:00:00.000Z",
+      lease_expires_at: "2099-09-06T00:01:30.000Z", token_expires_at: "2099-09-07T00:00:00.000Z", ended_at: null, revoked_at: null,
+    };
+    const accountSpace = await workspace();
+    const account = await run(
+      ["join", PASTED_INVITE, "--name", "reviewer", "--json"],
+      accountSpace,
+      [
+        { status: 201, body: { instance, token: `sni_${"A".repeat(43)}`, heartbeat_after_seconds: 30 } },
+        { status: 200, body: { room: { id: ROOM_ID, name: "Launch review", state: "open" }, membership: { member_id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", kind: "instance", admitted_by: "invite", name: "reviewer", state: "active" } } },
+        unavailable,
+      ],
+      { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}` },
+    );
+    expect(account.exitCode).toBe(0);
+    expect(JSON.parse(account.stdout).last_sequence).toBe(0);
+    await stat(join(accountSpace.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, "i_AccountSeat1.json"));
+  });
+
   it("joins as the account when a credential is present: registers an Instance, joins with the invite, reads history", async () => {
     const space = await workspace();
     const instance = {
