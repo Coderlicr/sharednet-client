@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runCli } from "./cli.ts";
 import type { CommandRunner } from "./guest.ts";
-import type { TurnRunner, TurnSpec } from "./wake-driver.ts";
+import { runTurn as realRunTurn, type TurnOutcome, type TurnRunner, type TurnSpec } from "./wake-driver.ts";
 
 const cleanup: string[] = [];
 
@@ -93,6 +93,7 @@ async function run(
     now?: () => Date;
     service?: { delivered_through: number; acked_through: number };
     runTurn?: TurnRunner;
+    probeOutcome?: TurnOutcome;
     startWakeService?: (input: { env: Record<string, string | undefined>; logFile: string }) => number | null;
   } = {},
 ) {
@@ -104,7 +105,7 @@ async function run(
   // The seat's place is the service's (wait PR 5). A stand-in keeps it here, so the scripted
   // answers stay what each test is about; `acks` is what the CLI told it, in order. Pass the same
   // `service` to two runs and it carries over, as the real one does.
-  const { service: kept, ...dependencyOverrides } = overrides;
+  const { service: kept, runTurn: turn, probeOutcome, ...dependencyOverrides } = overrides;
   const service = kept ?? { delivered_through: 0, acked_through: 0 };
   const acks: number[] = [];
   const fetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
@@ -148,6 +149,9 @@ async function run(
     stdout: (value) => stdout.push(value),
     stderr: (value) => stderr.push(value),
     ...dependencyOverrides,
+    runTurn: async (spec) => spec.args.length === 1 && spec.args[0] === "--version"
+      ? (probeOutcome ?? { exitCode: 0, stdout: "synthetic harness 1.0", stderr: "", timedOut: false })
+      : (turn ?? realRunTurn)(spec),
   });
   return { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), requests, acks, service };
 }
@@ -1637,6 +1641,44 @@ describe("sharednet say and wait", () => {
       return { turns, runTurn };
     }
 
+    it.each([
+      { exitCode: 1, stdout: "", stderr: "Error: spawn /synthetic/vendor/codex ENOENT\n    at ChildProcess\n}", timedOut: false },
+      { exitCode: 127, stdout: "", stderr: "spawn /synthetic/codex ENOENT", timedOut: false },
+      { exitCode: 1, stdout: "", stderr: "", timedOut: true },
+    ])("refuses to advertise a wake service when the harness cannot launch ($exitCode, timeout=$timedOut)", async (probeOutcome) => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const result = await run(["serve", "--json"], space, [revoked()], CODEX, { probeOutcome });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain("wake_command_unavailable");
+      expect(result.stdout + result.stderr).toContain("--version");
+      expect(result.stdout + result.stderr).toContain("repair");
+      if (probeOutcome.stderr) expect(result.stderr).toContain("ENOENT");
+      expect(result.requests).toHaveLength(0);
+      expect(result.acks).toEqual([]);
+      const status = await run(["serve", "--status", "--json"], space, []);
+      expect(JSON.parse(status.stdout).running).toBe(false);
+    });
+
+    it("detects a real executable wrapper whose native payload is absent before contacting the Room", async () => {
+      const space = await workspace();
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const bin = join(space.root, "bin");
+      await mkdir(bin);
+      await writeFile(join(bin, "codex"), '#!/bin/sh\nexec /nonexistent/sharednet-test-native-codex "$@"\n', { mode: 0o755 });
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], { ...CODEX, PATH: bin })).exitCode).toBe(0);
+      const fetch = vi.fn();
+      const stderr: string[] = [];
+      const exitCode = await runCli(["serve", "--json"], {
+        env: { ...space.env, ...CODEX, PATH: bin }, cwd: space.project, fetch,
+        stdout: (text) => stderr.push(text), stderr: (text) => stderr.push(text),
+      });
+      expect(exitCode).not.toBe(0);
+      expect(stderr.join("")).toContain("wake_command_unavailable");
+      expect(stderr.join("")).toContain("sharednet-test-native-codex");
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
     it("remembers the session at join, and leaves it out with --no-wake or SHAREDNET_WAKE=off", async () => {
       const space = await workspace();
       const result = await run(["join", PASTED_INVITE, "--json"], space, [joined([message(1, "Welcome")])], CODEX);
@@ -1757,6 +1799,31 @@ describe("sharednet say and wait", () => {
       expect(result.requests.filter((request) => request.init.method === "POST")).toHaveLength(0);
       expect(result.acks).toEqual([2]);
       expect(result.stderr).toContain("finished its turn with nothing to say");
+    });
+
+    it("retries an active-writer conflict without acknowledging the addressed message", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const service = { delivered_through: 1, acked_through: 1 };
+      const marks: number[] = [];
+      const { runTurn: answered } = turnsOf();
+      const runTurn: TurnRunner = async (spec) => {
+        marks.push(service.acked_through);
+        if (marks.length === 1) return { exitCode: 1, stdout: "", stderr: "thread-store conflict: thread synthetic-thread already has an active writer", timedOut: false };
+        return answered(spec);
+      };
+      const result = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex review this")]), page([addressed(2, "@codex review this")]),
+        page([addressed(2, "@codex review this")]), page([addressed(2, "@codex review this")]),
+        { status: 201, body: { message: own(3, "@host 2+2 is 4.") } }, revoked(),
+      ], CODEX, { service, runTurn });
+      expect(result.exitCode).toBe(0);
+      expect(marks).toEqual([1, 1]);
+      expect(result.acks).toEqual([2]);
+      expect(result.stderr).toContain("active writer");
+      const posts = result.requests.filter((request) => request.init.method === "POST");
+      expect(posts).toHaveLength(1);
+      expect(JSON.parse(String(posts[0]!.init.body)).content).toBe("@host 2+2 is 4.");
     });
 
     it("tells the Room when the session could not be resumed, and does not wake for it again", async () => {

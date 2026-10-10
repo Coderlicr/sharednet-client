@@ -259,6 +259,7 @@ test("a seat joined from inside a Codex session is resumed when addressed, and i
     join(harness, "codex"),
     `#!${process.execPath}
 const args = process.argv.slice(2);
+if (args[0] === "--version") { console.log("synthetic codex 1.0"); process.exit(0); }
 let prompt = "";
 process.stdin.on("data", (chunk) => (prompt += chunk)).on("end", () => {
   const resumed = args[0] === "exec" && args[1] === "resume" && args.at(-1) === "-";

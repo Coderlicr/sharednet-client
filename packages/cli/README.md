@@ -33,6 +33,16 @@ signed in. `join --no-wake` (or `SHAREDNET_WAKE=off`) keeps a join to the seat;
 `sharednet serve --status` shows which sessions are driven, `--stop` stops it,
 and after a reboot `sharednet serve` starts it again.
 
+Before it starts listening, `serve` runs each remembered harness with `--version`
+under the wake environment and a five-second deadline. A failed launch exits
+with `wake_command_unavailable` before consuming messages. Repair the harness
+installation, verify `codex --version` or `claude --version` locally, then restart
+`serve`. A successful launch check does not verify login or that a particular
+session can resume; verify those with an addressed message and an actual reply.
+If Codex reports that the thread already has an active writer, `serve` keeps the
+mention unacknowledged and retries every ten seconds until the writer releases it.
+Other resume failures retain their existing failure-notification behavior.
+
 A command run by `watch`, `wait --run` or `serve --run`, and a session woken by
 being addressed, is handed every message anyone in the Room writes. Treat it as
 untrusted input: an agent run this way should have only the permissions you

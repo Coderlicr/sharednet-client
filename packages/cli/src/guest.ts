@@ -2490,6 +2490,25 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     );
   }
 
+  const drive = dependencies.runTurn ?? runTurn;
+  // An executable wrapper can exist on PATH while its native payload is missing. Check the
+  // launch itself before publishing a running connector or consuming any addressed message.
+  const checkWakeCommand = async (wake: SeatWake) => {
+    const spec = turnSpec(wake, "", dependencies.env, "", 5_000);
+    const outcome = await drive({ ...spec, args: ["--version"], input: "" });
+    if (outcome.exitCode === 0 && !outcome.timedOut) return;
+    // Keep the beginning of a Node spawn error, not only its closing stack/argument lines.
+    const detail = outcome.stderr.trim().slice(0, 4_000);
+    if (detail) dependencies.stderr?.(`serve: ${wake.driver} launch check: ${detail}\n`);
+    throw localError(
+      "wake_command_unavailable",
+      `${wake.driver} launch check failed (${outcome.timedOut ? "timed out" : `exit ${outcome.exitCode}`}). Run ${wake.command} --version locally and repair the harness installation before restarting sharednet serve. A successful version check verifies launch only, not login or session resumption.`,
+    );
+  };
+  for (const seat of seats) {
+    if (!command && seat.wake) await checkWakeCommand(seat.wake);
+  }
+
   // One connector per machine. Two would each resume the same session for the same line.
   const started = dependencies.now().toISOString();
   const statusOf = (all: StoredRoomCredential[]): ServeStatus => ({
@@ -2514,8 +2533,6 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
 
   const sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const exec = dependencies.exec ?? defaultExec;
-  const drive = dependencies.runTurn ?? runTurn;
-
   // With --push the seats sit behind a doorbell (wait PR 7): no long-poll, and not one request while
   // nothing is said. Ctrl-C takes the doorbells down before it goes.
   const stopping = new AbortController();
@@ -2539,6 +2556,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   if (base !== null) dependencies.stderr?.(`serve: doorbell at ${base}/sharednet/push/<seat>, listening on 127.0.0.1:${listen}; idle until rung\n`);
 
   const sitIn = async (seat: StoredRoomCredential) => {
+    if (!command && seat.wake && !seats.includes(seat)) await checkWakeCommand(seat.wake);
     const client = new ApiClient(seat.base_url, boundedFetch(dependencies, null, false));
     const me = seat.member_id;
     // A seat taken from inside a Codex or Claude Code session is driven: being addressed resumes
@@ -2625,7 +2643,14 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
             dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name}'s reply was not posted (${error instanceof CliError ? error.code : "error"})\n`);
           });
         }
-        return;
+        return true;
+      }
+      // Desktop and CLI cannot write the same Codex thread concurrently. This is transient,
+      // not a handled request: keep the service cursor so the mention is retried after release.
+      if (wake.driver === "codex" && /thread-store conflict:[^\n]*already has an active writer/.test(`${outcome.stderr}\n${outcome.stdout}`)) {
+        turns.pop(); // No model turn started, so this does not spend the hourly turn allowance.
+        dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} has an active writer; keeping the wake unacknowledged and retrying in 10s\n`);
+        return false;
       }
       // The Room hears the harness's own words, or the exit code; the machine's output stays in the log.
       const why = outcome.timedOut
@@ -2635,6 +2660,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} could not be resumed: ${why}${detail ? ` (${detail})` : ""}\n`);
       // Whoever addressed the seat would otherwise hear nothing at all, and not know why.
       await post(`(${seat.name} was addressed, but its ${wake.driver === "codex" ? "Codex" : "Claude Code"} session could not be resumed: ${why})`).catch(() => undefined);
+      return true;
     };
 
     // Where the long-poll resumes. Without a filter it is the cursor. With one it can run ahead, past
@@ -2686,9 +2712,13 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         }
       }
       if (driving && others.length > 0) {
-        await resumeSession(others, cursor, polled);
-        // Handled only now, so a wake cut short by a crash or a restart is handed over again.
-        await handled(polled);
+        const completed = await resumeSession(others, cursor, polled);
+        // Handled only now, so a wake cut short by a crash, restart or busy writer is handed over again.
+        if (completed) await handled(polled);
+        else {
+          polled = cursor;
+          await sleep(10_000);
+        }
         continue;
       }
       if (polled > cursor) await handled(polled);
