@@ -29,6 +29,10 @@ Run a team of agents (Codex, Claude Code) on one goal in a Room until a check
 passes, a time limit or a token budget, with every trace kept:
 [the goal mode guide](docs/goal-mode.md).
 
+Invite an Agent into a Room and keep it reachable (Always online or
+Temporary Chat, and which of `wait`, `serve` or a harness queue answers):
+[joining and inviting](docs/rooms-join-and-invite.md).
+
 ## Repository layout
 
 ```text

@@ -400,6 +400,8 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   if (!payload.room?.id || !memberId || !memberToken || !Array.isArray(payload.history?.items)) {
     throw invalidServerResponse();
   }
+  // The service hands a guest the Room's oldest page; when there is more, the newest is what to hand over.
+  const history = payload.history.has_more ? await latestHistory(client, payload.room.id, memberToken) : payload.history;
 
   const credential: StoredRoomCredential = {
     schema_version: 1,
@@ -418,7 +420,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     base_url: baseUrl,
     room_id: payload.room.id,
     member_id: memberId,
-    last_sequence: highestSequence(payload.history.items, 0),
+    last_sequence: highestSequence(history.items, 0),
   };
   await writeProjectRoomState(dependencies.cwd, state, {
     anchorKey: await anchorKeyFor(dependencies.env, paths),
@@ -441,7 +443,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     as: "anonymous",
     name,
     last_sequence: state.last_sequence,
-    history: payload.history,
+    history,
     ...(woken ? { wake: woken } : {}),
   };
 }
@@ -517,11 +519,7 @@ async function enterAsSeat(
     { "idempotency-key": randomUUID() },
   );
   if (!payload.room?.id || !payload.membership?.member_id) throw invalidServerResponse();
-  const history = await client.request<PageShape>(
-    "GET",
-    `/rooms/${encodeURIComponent(roomId)}/messages?after=0&limit=100`,
-    seat.member_token,
-  );
+  const history = await latestHistory(client, roomId, seat.member_token);
   if (!Array.isArray(history?.items)) throw invalidServerResponse();
   // The session entering is the one to wake; a seat entered from no session keeps the one it had.
   const { wake: previous, ...held } = seat;
@@ -596,11 +594,7 @@ async function joinAsAccount(
     { "idempotency-key": randomUUID() },
   );
   if (!payload.room?.id || !payload.membership?.member_id) throw invalidServerResponse();
-  const history = await client.request<PageShape>(
-    "GET",
-    `/rooms/${encodeURIComponent(roomId)}/messages?after=0&limit=100`,
-    session.instance_token,
-  );
+  const history = await latestHistory(client, roomId, session.instance_token);
   if (!Array.isArray(history?.items)) throw invalidServerResponse();
 
   // The seat file mirrors the session so say/wait need no second lookup; the
@@ -1044,6 +1038,20 @@ async function everythingSaid(
     from = next;
   }
   return items;
+}
+
+/** How much of a Room a join hands over: its newest lines, at most this many. */
+const JOIN_HISTORY = 100;
+
+/**
+ * The history a join hands over: the newest lines, oldest first, so the seat's place starts at the
+ * Room's end. Its oldest lines would put the place there instead, and the first wake would carry
+ * everything said since, however much that is; `sharednet read` reaches back further on request.
+ */
+async function latestHistory(client: ApiClient, roomId: string, token: string): Promise<PageShape> {
+  const page = await client.request<PageShape>("GET", `/rooms/${encodeURIComponent(roomId)}/messages?order=desc&limit=${JOIN_HISTORY}`, token);
+  if (!Array.isArray(page?.items)) throw invalidServerResponse();
+  return { ...page, items: [...page.items].sort((a, b) => a.sequence - b.sequence) };
 }
 
 /** A join hands over the history it returns, so the seat's place starts after it, as the MCP join's does. */

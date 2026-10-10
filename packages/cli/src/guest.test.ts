@@ -466,6 +466,52 @@ describe("sharednet join", () => {
     expect(result.stderr).not.toContain("No --name");
   });
 
+  it("hands a joining seat the Room's newest lines and starts its place at the end, however long the Room is", async () => {
+    // A Room of 305 lines: the oldest page would have left #101..#305 for the first wake.
+    const newest = Array.from({ length: 100 }, (_, index) => message(305 - index, `line ${305 - index}`));
+    const instance = {
+      id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", agent_id: null, runtime_kind: "claude-code", cli_version: "0.1.3",
+      status: "online", display_name: null, started_at: "2026-09-06T00:00:00.000Z", last_seen_at: "2026-09-06T00:00:00.000Z",
+      lease_expires_at: "2099-09-06T00:01:30.000Z", token_expires_at: "2099-09-07T00:00:00.000Z", ended_at: null, revoked_at: null,
+    };
+    const service = { delivered_through: 0, acked_through: 0 };
+    const account = await run(
+      ["join", PASTED_INVITE, "--name", "reviewer", "--json"],
+      await workspace(),
+      [
+        { status: 201, body: { instance, token: `sni_${"A".repeat(43)}`, heartbeat_after_seconds: 30 } },
+        { status: 200, body: { room: { id: ROOM_ID, name: "Launch review", state: "open" }, membership: { member_id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", kind: "instance", admitted_by: "invite", name: "reviewer", state: "active" } } },
+        { status: 200, body: { items: newest, next_cursor: "206", has_more: true } },
+      ],
+      { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}` },
+      { service },
+    );
+    expect(account.exitCode).toBe(0);
+    const output = JSON.parse(account.stdout);
+    expect(output.last_sequence).toBe(305);
+    expect(output.history.items.map((item: { sequence: number }) => item.sequence)).toEqual(Array.from({ length: 100 }, (_, index) => 206 + index));
+    expect(account.acks).toEqual([305]);
+
+    // A guest is handed the oldest page by the service; with more behind it, the newest is fetched.
+    const guestService = { delivered_through: 0, acked_through: 0 };
+    const oldest = Array.from({ length: 100 }, (_, index) => message(index + 1, `line ${index + 1}`));
+    const guest = await run(
+      ["join", PASTED_INVITE, "--name", "reviewer", "--json"],
+      await workspace(),
+      [
+        { ...joined(oldest), body: { ...joined(oldest).body, history: { items: oldest, next_cursor: "100", has_more: true } } },
+        { status: 200, body: { items: newest, next_cursor: "206", has_more: true } },
+      ],
+      {},
+      { service: guestService },
+    );
+    expect(guest.exitCode).toBe(0);
+    expect(guest.requests[1]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages?order=desc&limit=100`);
+    expect(header(guest.requests[1]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+    expect(JSON.parse(guest.stdout).last_sequence).toBe(305);
+    expect(guest.acks).toEqual([305]);
+  });
+
   it("joins as the account when a credential is present: registers an Instance, joins with the invite, reads history", async () => {
     const space = await workspace();
     const instance = {
@@ -507,7 +553,7 @@ describe("sharednet join", () => {
     expect(result.requests.map((request) => `${request.init.method ?? "GET"} ${request.url}`)).toEqual([
       "POST https://www.sharednet.ai/api/v1/instances",
       `POST https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/join`,
-      `GET https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages?after=0&limit=100`,
+      `GET https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages?order=desc&limit=100`,
     ]);
     expect(header(result.requests[0]!, "authorization")).toBe(`Bearer snk_${"K".repeat(43)}`);
     expect(header(result.requests[1]!, "authorization")).toBe(`Bearer sni_${"A".repeat(43)}`);
@@ -879,7 +925,7 @@ describe("sharednet say and wait", () => {
     expect(entered.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${OTHER_ROOM}/join`);
     expect(header(entered.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
     expect(header(entered.requests[0]!, "idempotency-key")).toMatch(/^[0-9a-f-]{36}$/);
-    expect(entered.requests[1]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${OTHER_ROOM}/messages?after=0&limit=100`);
+    expect(entered.requests[1]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${OTHER_ROOM}/messages?order=desc&limit=100`);
     const output = JSON.parse(entered.stdout);
     expect(output).toMatchObject({ member_id: MEMBER_ID, as: "seat", admitted_by: "added", last_sequence: 2 });
     const state = JSON.parse(await readFile(join(elsewhere.project, ".sharednet", "room.json"), "utf8"));

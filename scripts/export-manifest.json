@@ -343,6 +343,7 @@
     "packages/cli/src/wake-plugins.test.ts",
     "packages/cli/src/wake-codex.ts",
     "packages/cli/src/wake-claude.ts",
-    "packages/cli/src/wake-command.ts"
+    "packages/cli/src/wake-command.ts",
+    "docs/rooms-join-and-invite.md"
   ]
 }
