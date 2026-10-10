@@ -400,9 +400,6 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   if (!payload.room?.id || !memberId || !memberToken || !Array.isArray(payload.history?.items)) {
     throw invalidServerResponse();
   }
-  // The service hands a guest the Room's oldest page; when there is more, the newest is what to hand over.
-  const history = payload.history.has_more ? await historyOrFallback(client, payload.room.id, memberToken, payload.history, dependencies) : payload.history;
-
   const credential: StoredRoomCredential = {
     schema_version: 1,
     base_url: baseUrl,
@@ -414,7 +411,12 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     room_type: payload.room.type === "compiled" ? "compiled" : "board",
     ...(wake ? { wake } : {}),
   };
+  // Saved before anything else can fail: the service has seated this join, and its token is shown once.
   await writeRoomCredential(paths, credential);
+  // The service hands a guest the Room's oldest page; when there is more, the newest is what to hand over.
+  const { history, degraded } = payload.history.has_more
+    ? await readJoinHistory(client, payload.room.id, memberToken, memberId, payload.history, dependencies)
+    : { history: payload.history, degraded: false };
   const state: ProjectRoomState = {
     schema_version: 1,
     base_url: baseUrl,
@@ -444,6 +446,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     name,
     last_sequence: state.last_sequence,
     history,
+    ...(degraded ? { history_degraded: true } : {}),
     ...(woken ? { wake: woken } : {}),
   };
 }
@@ -519,7 +522,6 @@ async function enterAsSeat(
     { "idempotency-key": randomUUID() },
   );
   if (!payload.room?.id || !payload.membership?.member_id) throw invalidServerResponse();
-  const history = await historyOrFallback(client, roomId, seat.member_token, { items: [], next_cursor: null, has_more: false }, dependencies);
   // The session entering is the one to wake; a seat entered from no session keeps the one it had.
   const { wake: previous, ...held } = seat;
   const wake = choice.wakeOff ? null : (choice.wake ?? previous ?? null);
@@ -532,6 +534,7 @@ async function enterAsSeat(
     ...(wake ? { wake } : {}),
   };
   await writeRoomCredential(paths, entered);
+  const { history } = await readJoinHistory(client, payload.room.id, seat.member_token, payload.membership.member_id, null, dependencies);
   const state: ProjectRoomState = {
     schema_version: 1,
     base_url: baseUrl,
@@ -593,8 +596,6 @@ async function joinAsAccount(
     { "idempotency-key": randomUUID() },
   );
   if (!payload.room?.id || !payload.membership?.member_id) throw invalidServerResponse();
-  const history = await historyOrFallback(client, roomId, session.instance_token, { items: [], next_cursor: null, has_more: false }, dependencies);
-
   // The seat file mirrors the session so say/wait need no second lookup; the
   // session file stays the source of a fresh token when the lease is renewed.
   const credential: StoredRoomCredential = {
@@ -609,6 +610,7 @@ async function joinAsAccount(
     ...(wake ? { wake } : {}),
   };
   await writeRoomCredential(paths, credential);
+  const { history } = await readJoinHistory(client, payload.room.id, session.instance_token, session.instance_id, null, dependencies);
   const state: ProjectRoomState = {
     schema_version: 1,
     base_url: baseUrl,
@@ -1052,18 +1054,39 @@ async function latestHistory(client: ApiClient, roomId: string, token: string): 
   return { ...page, items: [...page.items].sort((a, b) => a.sequence - b.sequence) };
 }
 
+/** Transport trouble and 5xx (exit 5) or a rate limit: the next try may work. */
+function temporaryFailure(error: CliError): boolean {
+  return error.exitCode === 5 || error.code === "rate_limited";
+}
+
 /**
- * The newest history, or `fallback` when it cannot be read. By then the service has seated the join,
- * so failing here would leave a seat whose token was never saved; the join is kept, and the next wake
- * carries whatever the fallback did not cover.
+ * The newest history for a seat that is already joined and saved. A temporary failure falls back to
+ * the page the service handed over with the join, when there is one, and says the join is degraded:
+ * its place is that page's end, and the next wake carries the rest. Anything else (a refusal, or no
+ * page to fall back to) fails the join out loud, naming the saved seat to enter again.
  */
-async function historyOrFallback(client: ApiClient, roomId: string, token: string, fallback: PageShape, dependencies: GuestDependencies): Promise<PageShape> {
+async function readJoinHistory(
+  client: ApiClient,
+  roomId: string,
+  token: string,
+  seatId: string,
+  fallback: PageShape | null,
+  dependencies: GuestDependencies,
+): Promise<{ history: PageShape; degraded: boolean }> {
   try {
-    return await latestHistory(client, roomId, token);
+    return { history: await latestHistory(client, roomId, token), degraded: false };
   } catch (error) {
     if (!(error instanceof CliError)) throw error;
-    dependencies.stderr?.(`The Room's newest lines could not be read (${error.code}); joined anyway, and the next wake carries what was said after the history shown.\n`);
-    return fallback;
+    if (fallback !== null && temporaryFailure(error)) {
+      dependencies.stderr?.(`The Room's newest lines could not be read (${error.code}), so this join is degraded: it hands over the service's first page instead, and the next wake carries everything after it.\n`);
+      return { history: fallback, degraded: true };
+    }
+    throw new CliError(
+      error.code,
+      `Joined ${roomId} as ${seatId} and saved the seat, but its history could not be read (${error.code}: ${error.message}). Nothing was marked as read. Enter the seat again with: sharednet join ${roomId} --as ${seatId}`,
+      error.exitCode,
+      error.requestId,
+    );
   }
 }
 
