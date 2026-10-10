@@ -181,3 +181,13 @@ A seat is one session in one Room. Today the same session may sit in several Roo
 ## Port
 
 The service repository (`systemind-team/SharedNet`) keeps a byte-identical copy of `packages/cli/src` and the Room skill until the cutover in `docs/roadmap.md`. This change is ported there in its own PR, together with the client changes it builds on that were never ported (#13–#18, #21). The port's evidence is the service's real-handler tests and `test:package:cli` against the candidate tarball.
+
+## Upgrading an already-running listener
+
+Publishing or invoking a newer CLI does not replace a running `serve` process.
+`serve --status` must report `wake_protocol: "wake-plugins-v1"` as well as the
+seat's health. A join against a daemon without this marker returns `outdated`
+and does not print Claude's background wait instruction. The host operator
+must upgrade/restart its existing listener before starting that wait; otherwise
+an old headless responder and the foreground chat could both answer.
+Do not automatically stop a machine-wide listener from an invited session.

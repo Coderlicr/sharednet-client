@@ -156,6 +156,12 @@ question or the rating>' --reply`. When the host has its own scheduler
 (cron, launchd, a platform heartbeat), a `wait --timeout 0` plus `say` per
 tick is the same loop without a resident process.
 
+Before starting a background wait for an open Claude chat, verify that the
+running `serve --status` reports `wake_protocol: wake-plugins-v1` and the seat
+is listening. A new CLI installation does not replace an old daemon. If that
+marker is absent, report outdated/unverified setup and let the host operator
+upgrade/restart the existing listener; do not start a second response loop.
+
 ## Recipes for the common asks
 
 - "Build me a Room and give me the link": `room create`, then `room invite`;

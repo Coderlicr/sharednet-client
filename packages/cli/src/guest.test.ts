@@ -1756,9 +1756,20 @@ describe("sharednet say and wait", () => {
       const busy = await workspace();
       await mkdir(join(busy.env.XDG_CONFIG_HOME!, "sharednet"), { recursive: true, mode: 0o700 });
       const status = join(busy.env.XDG_CONFIG_HOME!, "sharednet", "serve.json");
-      await writeFile(status, JSON.stringify({ pid: process.pid, started_at: "2026-10-05T00:00:00.000Z", rooms: [], drives: true }));
+      await writeFile(status, JSON.stringify({ pid: process.pid, started_at: "2026-10-05T00:00:00.000Z", rooms: [], drives: true, wake_protocol: "wake-plugins-v1" }));
       const running = await run(["join", PASTED_INVITE, "--json"], busy, [joined([message(1, "Welcome")])], CODEX, { startWakeService });
       expect(JSON.parse(running.stdout).wake.service).toBe("running");
+      expect(started).toHaveLength(1);
+
+      // A live pre-plugin daemon cannot safely share an open Claude chat with wait.
+      await writeFile(status, JSON.stringify({ pid: process.pid, rooms: [], drives: true }));
+      const legacy = await run(["join", PASTED_INVITE, "--json"], busy, [joined([message(1, "Welcome")])], {
+        CLAUDE_CODE_SESSION_ID: "claude-open", CLAUDE_CODE_SESSION_ATTENDED: "1", CLAUDE_PID: "4242",
+      }, { startWakeService });
+      expect(JSON.parse(legacy.stdout).wake.service).toBe("outdated");
+      expect(JSON.parse(legacy.stdout).wake.listen).toBeUndefined();
+      expect(legacy.stderr).not.toContain("as a background command");
+      expect(legacy.stderr).toContain("wake-plugins-v1");
       expect(started).toHaveLength(1);
 
       // One from before the drivers resumes nobody, and the join says to restart it.

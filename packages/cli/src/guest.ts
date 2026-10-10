@@ -652,16 +652,18 @@ async function wakeAfterJoin(
   if (!wake) return null;
   const plugin = pluginFor(wake.driver);
   const harness = plugin.label;
-  const listen = plugin.listen?.(wake, seat.member_id) ?? null;
-  const status = (await readServeStatus(paths).catch(() => ({}))) as { running?: boolean; pid?: number; drives?: boolean };
+  let listen = plugin.listen?.(wake, seat.member_id) ?? null;
+  const status = (await readServeStatus(paths).catch(() => ({}))) as { running?: boolean; pid?: number; drives?: boolean; wake_protocol?: string };
   let service: "running" | "started" | "not_started" | "outdated";
   let how: string;
   let pid: number | null = null;
   if (status.running && status.pid) {
-    service = status.drives ? "running" : "outdated";
-    how = status.drives
+    const compatible = status.drives && status.wake_protocol === "wake-plugins-v1";
+    service = compatible ? "running" : "outdated";
+    if (!compatible) listen = null;
+    how = compatible
       ? `the wake service already running here (pid ${status.pid}) takes this seat within seconds`
-      : `the connector running here (pid ${status.pid}) resumes no sessions, being older or running a --run command; to be woken, stop it (sharednet serve --stop) and run sharednet serve`;
+      : `the connector running here (pid ${status.pid}) has not confirmed wake-plugins-v1; do not start a background wait alongside it. Have the host operator upgrade/restart it (sharednet serve --stop, then sharednet serve) and verify this seat before participating`;
   } else if (sandboxed(dependencies.env)) {
     service = "not_started";
     how = "this session runs in a sandbox, which a background service would inherit, so nothing was started: run `sharednet serve` outside it";
@@ -2516,6 +2518,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     started_at: started,
     rooms: [...new Set(all.map((seat) => seat.room_id))],
     drives: !command,
+    wake_protocol: "wake-plugins-v1",
     seats: all.map((seat) => ({
       room_id: seat.room_id,
       member_id: seat.member_id,
@@ -2877,6 +2880,8 @@ type ServeStatus = {
   rooms: string[];
   /** True for a connector that resumes sessions; one running a --run command, or an older one, does not. */
   drives?: boolean;
+  /** Capability of the running daemon, not the invoking CLI. */
+  wake_protocol?: "wake-plugins-v1";
   seats?: Array<{ room_id: string; member_id: string; name: string; resumes: string | null; state?: string; last_error?: string; updated_at?: string }>;
 };
 
