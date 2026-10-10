@@ -13,7 +13,7 @@ async function fixture() {
   const profile = join(dir, "guard.sh"), held = join(dir, "held");
   await writeFile(profile, TASK_PROFILE);
   const run = (command: string, gate = "1") => spawnSync("/bin/bash", ["--noprofile", "--norc", "-c", 'BASH_EXECUTION_STRING="$TEST_COMMAND"; source "$TEST_PROFILE"; printf allowed'], {
-    encoding: "utf8", env: { PATH: process.env.PATH, SHAREDNET_TASK_GATE: gate, SHAREDNET_TASK_FILE: held, SHAREDNET_TASK_AUDIT: join(dir, "audit"), TEST_COMMAND: command, TEST_PROFILE: profile },
+    encoding: "utf8", env: { NODE_ENV: "test", PATH: process.env.PATH, SHAREDNET_TASK_GATE: gate, SHAREDNET_TASK_FILE: held, SHAREDNET_TASK_AUDIT: join(dir, "audit"), TEST_COMMAND: command, TEST_PROFILE: profile },
   });
   return { held, run };
 }
@@ -46,7 +46,7 @@ it("Claude's hook also refuses direct file tools without a task", async () => {
   await writeFile(profile, TASK_PROFILE);
   const run = (tool_name: string, command = "") => spawnSync(process.execPath, ["-e", TASK_HOOK], {
     encoding: "utf8", input: JSON.stringify({ tool_name, tool_input: { command } }),
-    env: { PATH: process.env.PATH, SHAREDNET_TASK_GATE: "1", SHAREDNET_TASK_FILE: held, SHAREDNET_TASK_PROFILE: profile },
+    env: { NODE_ENV: "test", PATH: process.env.PATH, SHAREDNET_TASK_GATE: "1", SHAREDNET_TASK_FILE: held, SHAREDNET_TASK_PROFILE: profile },
   });
   expect(JSON.parse(run("Write").stdout).hookSpecificOutput.permissionDecision).toBe("deny");
   expect(run("Bash", 'sharednet task claim "Write parser"').stdout).toBe("");
