@@ -428,7 +428,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     anchorKey: await anchorKeyFor(dependencies.env, paths),
     joinedAt: credential.joined_at,
   });
-  await historyHandled(client, payload.room.id, memberToken, state.last_sequence, dependencies);
+  await historyHandled(client, payload.room.id, memberToken, state.last_sequence, memberId, dependencies);
   if (credential.wake) await writeRoomCredential(paths, credential);
   // The one moment to say it: this seat belongs to nobody yet.
   dependencies.stderr?.(
@@ -547,7 +547,7 @@ async function enterAsSeat(
     anchorKey: await anchorKeyFor(dependencies.env, paths),
     joinedAt: dependencies.now().toISOString(),
   });
-  await historyHandled(client, payload.room.id, seat.member_token, state.last_sequence, dependencies);
+  await historyHandled(client, payload.room.id, seat.member_token, state.last_sequence, payload.membership.member_id, dependencies);
   if (entered.wake) await writeRoomCredential(paths, entered);
   const woken = await wakeAfterJoin(entered, `@${payload.membership.member_id}`, paths, dependencies);
   return {
@@ -624,7 +624,7 @@ async function joinAsAccount(
     anchorKey: session.local_instance_key ?? (await anchorKeyFor(dependencies.env, paths)),
     joinedAt: dependencies.now().toISOString(),
   });
-  await historyHandled(client, payload.room.id, session.instance_token, state.last_sequence, dependencies);
+  await historyHandled(client, payload.room.id, session.instance_token, state.last_sequence, session.instance_id, dependencies);
   if (credential.wake) await writeRoomCredential(paths, credential);
   dependencies.stderr?.(
     `Seat ${session.instance_id} in ${payload.room.id}. Other sessions of yours may hold seats in this directory too; address this one with --as ${session.instance_id}.\n`,
@@ -1104,10 +1104,22 @@ async function readJoinHistory(
 }
 
 /** A join hands over the history it returns, so the seat's place starts after it, as the MCP join's does. */
-async function historyHandled(client: ApiClient, roomId: string, token: string, through: number, dependencies: GuestDependencies): Promise<void> {
+async function historyHandled(client: ApiClient, roomId: string, token: string, through: number, seatId: string, dependencies: GuestDependencies): Promise<void> {
   if (through <= 0) return;
   const sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  await acknowledgeThrough(client, roomId, token, through, sleep, dependencies);
+  // Strict, unlike acknowledgeThrough elsewhere: a running serve starts a seat from the service's mark,
+  // so a join whose mark did not move must not turn the wake on, or the history would be replayed.
+  try {
+    await pollThroughBlips(() => client.request("POST", `/rooms/${encodeURIComponent(roomId)}/ack`, token, { through }), sleep, dependencies);
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    throw new CliError(
+      error.code,
+      `Joined ${roomId} as ${seatId} and saved the seat, but the service did not take its place through ${through} (${error.code}: ${error.message}), so its wake was left off. Enter the seat again with: sharednet join ${roomId} --as ${seatId}`,
+      error.exitCode,
+      error.requestId,
+    );
+  }
 }
 
 /**

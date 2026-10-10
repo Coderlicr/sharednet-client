@@ -93,6 +93,8 @@ async function run(
     sleep?: (ms: number) => Promise<void>;
     now?: () => Date;
     service?: { delivered_through: number; acked_through: number };
+    /** The stand-in refuses every acknowledgement with this answer (the place does not move). */
+    ackFailure?: { status: number; body: unknown };
     runTurn?: TurnRunner;
     chatOpen?: (pid: number) => boolean;
     checkWake?: (wake: SeatWake) => Promise<CheckResult>;
@@ -107,12 +109,15 @@ async function run(
   // The seat's place is the service's (wait PR 5). A stand-in keeps it here, so the scripted
   // answers stay what each test is about; `acks` is what the CLI told it, in order. Pass the same
   // `service` to two runs and it carries over, as the real one does.
-  const { service: kept, ...dependencyOverrides } = overrides;
+  const { service: kept, ackFailure, ...dependencyOverrides } = overrides;
   const service = kept ?? { delivered_through: 0, acked_through: 0 };
   const acks: number[] = [];
   const fetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
     const place = /\/api\/v1\/rooms\/(rom_[A-Za-z0-9]+)\/(subscription|ack)$/.exec(new URL(String(input)).pathname);
     if (place) {
+      if (place[2] === "ack" && ackFailure) {
+        return new Response(JSON.stringify(ackFailure.body), { status: ackFailure.status, headers: { "content-type": "application/json" } });
+      }
       if (place[2] === "ack") {
         const through = (JSON.parse(String(init.body)) as { through: number }).through;
         acks.push(through);
@@ -1866,6 +1871,24 @@ describe("sharednet say and wait", () => {
       const saved = await credentialOf(failedSpace);
       expect(saved.member_token).toBe(MEMBER_TOKEN);
       expect(saved.wake).toBeUndefined();
+    });
+
+    it("leaves a joined seat's wake off when the service does not take its first place", async () => {
+      // serve starts a seat from the service's mark; a join whose mark did not move would replay the history.
+      const failures = [
+        { status: 401, body: { error: { code: "invalid_credentials", message: "Credentials are invalid." } } },
+        { status: 403, body: { error: { code: "forbidden", message: "Not allowed." } } },
+        { status: 503, body: { error: { code: "service_unavailable", message: "Try again." } } },
+      ];
+      for (const ackFailure of failures) {
+        const space = await workspace();
+        const result = await run(["join", PASTED_INVITE, "--json"], space, [joined([message(1, "Welcome"), message(2, "Agenda")])], CODEX, { ackFailure });
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stdout + result.stderr).toContain(`its wake was left off. Enter the seat again with: sharednet join ${ROOM_ID} --as ${MEMBER_ID}`);
+        const saved = await credentialOf(space);
+        expect(saved.member_token).toBe(MEMBER_TOKEN);
+        expect(saved.wake).toBeUndefined();
+      }
     });
 
     it("remembers the session at join, and leaves it out with --no-wake or SHAREDNET_WAKE=off", async () => {
