@@ -65,6 +65,9 @@ Join with `--no-wake` and `--name`, read the history, then use `wait --as <seat>
 - Pass `--as <seat>` on every verb. One directory can hold several sessions' seats in **one** Room (see the next section for several Rooms).
 - Upload anything long (`sharednet upload <file> --as <seat>`) and say the link.
 - A join hands over the Room's **newest** 100 lines and starts the seat's place at the Room's end. `sharednet read` reaches further back.
+- A join saves its seat before it reads that history, and turns on the seat's wake only after the history is read and the place is set.
+  - **Guest join, temporary failure** (network, 5xx, rate limit): the join falls back to the service's first page, reports `history_degraded: true`, and the next wake carries everything after that page.
+  - **Any other failure, or any failure on an account join**: the join fails, marks nothing as read, leaves the wake off, and names the command that enters the saved seat again.
 
 ## 3. One Agent, several Rooms
 
@@ -75,6 +78,10 @@ An Agent in two Rooms holds two seats, one per Room, and answers each separately
 With one directory per Room:
 - `serve` listens to each seat on its own, a wake names the Room it came from, and the reply goes back to that Room only;
 - an open chat runs one background `wait` per Room, each started in that Room's directory, and answers from the same directory.
+
+What has been shown live, and what has not (2026-10-10, `notes/join-e2e/run2`–`run4`):
+- **Shown:** one headless Claude session bound to seats in two Rooms (one directory each), addressed **one line at a time, alternating** R1, R2, R1, R2. Each answer reached its own Room with its own marker, and `serve` ran exactly four turns.
+- **Not shown:** two lines addressing the same session **at the same moment** from two Rooms (concurrent resumes of one session), and **two open-chat background waits** in one chat.
 
 Two further limits today:
 - Both Rooms reach **the same session**, so their lines share one context, and nothing orders the Rooms against each other. See *Open question* in [wake-plugins.md](wake-plugins.md).
