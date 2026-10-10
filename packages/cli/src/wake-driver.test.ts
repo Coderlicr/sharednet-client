@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { codexSandboxChosen, harnessFreeEnv, parseSeatWake, replyFrom, runTurn, seatWakeFrom, turnSpec, turnSummary, wakeTurnPrompt } from "./wake-driver.ts";
+import { chatOpen, codexSandboxChosen, harnessFreeEnv, parseSeatWake, replyFrom, runTurn, seatWakeFrom, turnSpec, turnSummary, wakeTurnPrompt } from "./wake-driver.ts";
 
 const cleanup: string[] = [];
 afterEach(async () => {
@@ -32,6 +32,11 @@ describe("the session a seat remembers", () => {
       cwd: "/work",
       command: "claude",
     });
+    // An open chat (attended) is remembered by its process; a headless `claude -p` (attended 0) is not one.
+    const claude = { CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "6613bb00", CLAUDE_PID: "4321", PATH: "" };
+    expect(seatWakeFrom({ ...claude, CLAUDE_CODE_SESSION_ATTENDED: "1" }, "/work")).toMatchObject({ session: "6613bb00", live_pid: 4321 });
+    expect(seatWakeFrom({ ...claude, CLAUDE_CODE_SESSION_ATTENDED: "0" }, "/work")?.live_pid).toBeUndefined();
+    expect(seatWakeFrom({ ...claude, CLAUDE_CODE_SESSION_ATTENDED: "1", CLAUDE_PID: "" }, "/work")?.live_pid).toBeUndefined();
     // A terminal, or a harness without a session to resume, is not driven.
     expect(seatWakeFrom({ PATH: bin }, "/work")).toBeNull();
     expect(seatWakeFrom({ CLAUDECODE: "1" }, "/work")).toBeNull();
@@ -49,6 +54,20 @@ describe("the session a seat remembers", () => {
     expect(parseSeatWake({ driver: "codex", session: "", cwd: "/w", command: "codex" })).toBeUndefined();
     expect(parseSeatWake("codex")).toBeUndefined();
     expect(parseSeatWake(undefined)).toBeUndefined();
+  });
+
+  it("keeps the open chat's process with a Claude Code session, and drops one that is not a process id", () => {
+    const wake = { driver: "claude-code", session: "s", cwd: "/w", command: "claude" };
+    expect(parseSeatWake({ ...wake, live_pid: 4321 })).toEqual({ ...wake, live_pid: 4321 });
+    expect(parseSeatWake({ ...wake, live_pid: "4321" })).toEqual(wake);
+    expect(parseSeatWake({ ...wake, live_pid: -1 })).toEqual(wake);
+  });
+
+  it("calls a chat open only while its process runs and is still a claude", () => {
+    // This test runs in node: alive, but not a Claude Code chat, as a reused pid would be.
+    expect(chatOpen(process.pid)).toBe(false);
+    // Well above any pid_max: no such process.
+    expect(chatOpen(2 ** 30)).toBe(false);
   });
 });
 

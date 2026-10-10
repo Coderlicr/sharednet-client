@@ -12,7 +12,7 @@ import { computeLocalInstanceKey } from "./instance-computation.ts";
 import { detectRuntime, type DetectedRuntime } from "./runtime-detection.ts";
 import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn, triggerTakesParameter, wakeIdentity, type Trigger } from "./triggers.ts";
 import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
-import { replyFrom, runTurn, sandboxed, seatWakeFrom, turnSpec, turnSummary, wakeTurnPrompt, type SeatWake, type TurnRunner } from "./wake-driver.ts";
+import { chatOpen, replyFrom, runTurn, sandboxed, seatWakeFrom, turnSpec, turnSummary, wakeTurnPrompt, type SeatWake, type TurnRunner } from "./wake-driver.ts";
 import {
   getOrCreateInstallationSecret,
   getStoragePaths,
@@ -57,6 +57,8 @@ export interface GuestDependencies {
   signal?: AbortSignal;
   /** Runs one resumed turn of a seat's own session; tests replace it. */
   runTurn?: TurnRunner;
+  /** Whether the Claude Code chat that took a seat is still open; tests replace it. */
+  chatOpen?: (pid: number) => boolean;
   /**
    * Starts `sharednet serve` in the background after a join, so the session that joined is woken
    * when it is addressed. Only the real process supplies it; without it, a join starts nothing.
@@ -669,7 +671,14 @@ async function wakeAfterJoin(
     how = "run `sharednet serve` to be woken";
   }
   dependencies.stderr?.(`Wake: when someone writes ${address} in this Room, this ${harness} session is resumed with what was said; ${how}.\n`);
-  return { driver: wake.driver, session: wake.session, address, service, ...(pid ? { pid } : {}) };
+  if (wake.live_pid !== undefined) {
+    // An open chat is not resumed from outside (the service leaves its lines to it), so it has to
+    // listen itself: Claude Code calls the chat back when a background command ends.
+    dependencies.stderr?.(
+      `While this chat is open, it hears ${address} itself: run \`sharednet wait --on mention --as ${seat.member_id} --json\` as a background command, answer what it returns with \`sharednet say … --as ${seat.member_id}\`, then run it again. Once the chat is closed, the wake service resumes it instead.\n`,
+    );
+  }
+  return { driver: wake.driver, session: wake.session, address, service, ...(pid ? { pid } : {}), ...(wake.live_pid !== undefined ? { live_chat: true, listen: `sharednet wait --on mention --as ${seat.member_id} --json` } : {}) };
 }
 
 async function currentSeat(
@@ -2515,6 +2524,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const exec = dependencies.exec ?? defaultExec;
   const drive = dependencies.runTurn ?? runTurn;
+  const open = dependencies.chatOpen ?? chatOpen;
 
   // With --push the seats sit behind a doorbell (wait PR 7): no long-poll, and not one request while
   // nothing is said. Ctrl-C takes the doorbells down before it goes.
@@ -2641,6 +2651,8 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     // the seat's own matching words, while the cursor stays at what has been handed over.
     let polled = cursor;
     let idle = false;
+    /** The last line already reported as left to an open chat, so the log says it once. */
+    let leftThrough = 0;
     for (;;) {
       if (stopping.signal.aborted) return;
       // Behind a doorbell there is no long-poll: once nothing is left to hand over, the seat waits to
@@ -2686,6 +2698,28 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         }
       }
       if (driving && others.length > 0) {
+        // A chat a person has open answers through its own `sharednet wait`: resuming it here would
+        // be a second writer it never sees. Its wait acknowledges what it handled, and that becomes
+        // this seat's place; whatever it leaves is resumed here once the chat has closed.
+        const wake = (await readRoomCredential(paths, seat.room_id, seat.member_id).catch(() => null))?.wake ?? seat.wake!;
+        if (wake.live_pid !== undefined && open(wake.live_pid)) {
+          if (polled > leftThrough) {
+            dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} addressed while its Claude Code chat is open (pid ${wake.live_pid}); leaving #${cursor + 1}..#${polled} to that chat\n`);
+            leftThrough = polled;
+          }
+          await sleep(10_000);
+          try {
+            const kept = await keptPlace(client, seat.room_id, seat.member_token, cursor, sleep, dependencies);
+            if (kept > cursor) {
+              cursor = kept;
+              await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
+            }
+          } catch (error) {
+            if (!(error instanceof CliError)) throw error;
+          }
+          polled = cursor;
+          continue;
+        }
         await resumeSession(others, cursor, polled);
         // Handled only now, so a wake cut short by a crash or a restart is handed over again.
         await handled(polled);

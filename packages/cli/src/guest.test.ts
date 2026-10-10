@@ -93,6 +93,7 @@ async function run(
     now?: () => Date;
     service?: { delivered_through: number; acked_through: number };
     runTurn?: TurnRunner;
+    chatOpen?: (pid: number) => boolean;
     startWakeService?: (input: { env: Record<string, string | undefined>; logFile: string }) => number | null;
   } = {},
 ) {
@@ -1781,6 +1782,74 @@ describe("sharednet say and wait", () => {
       expect(JSON.parse(String(said.init.body)).content).toBe(
         "(claude-code was addressed, but its Claude Code session could not be resumed: Not logged in · Please run /login)",
       );
+      expect(result.acks).toEqual([2]);
+    });
+
+    // A Claude Code chat a person has open, as its own commands see it.
+    const LIVE_CHAT = { CLAUDE_CODE_SESSION_ATTENDED: "1", CLAUDE_PID: "4321" };
+
+    it("remembers the open Claude Code chat that joined, and tells it to listen itself; a headless one is not a chat", async () => {
+      const space = await workspace();
+      const result = await run(["join", PASTED_INVITE, "--json"], space, [joined([message(1, "Welcome")])], LIVE_CHAT);
+      expect(result.exitCode).toBe(0);
+      expect((await credentialOf(space)).wake).toMatchObject({ driver: "claude-code", session: "claude-session-stays-local", live_pid: 4321 });
+      expect(JSON.parse(result.stdout).wake).toMatchObject({ live_chat: true, listen: `sharednet wait --on mention --as ${MEMBER_ID} --json` });
+      expect(result.stderr).toContain(`run \`sharednet wait --on mention --as ${MEMBER_ID} --json\` as a background command`);
+
+      // `claude -p` runs attended 0: it is resumed as before, and is told nothing about listening.
+      const headless = await workspace();
+      const quiet = await run(["join", PASTED_INVITE, "--json"], headless, [joined([message(1, "Welcome")])], { ...LIVE_CHAT, CLAUDE_CODE_SESSION_ATTENDED: "0" });
+      expect((await credentialOf(headless)).wake.live_pid).toBeUndefined();
+      expect(JSON.parse(quiet.stdout).wake.live_chat).toBeUndefined();
+      expect(quiet.stderr).not.toContain("background command");
+    });
+
+    it("leaves an addressed line to the open chat that took the seat, and takes the chat's acknowledgement as its place", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], LIVE_CHAT)).exitCode).toBe(0);
+      const { turns, runTurn } = turnsOf();
+      const service = { delivered_through: 1, acked_through: 1 };
+      const asked: number[] = [];
+      // The chat's own `sharednet wait` takes the line and acknowledges it while serve stands back.
+      const chatOpen = (pid: number) => {
+        asked.push(pid);
+        service.delivered_through = 2;
+        service.acked_through = 2;
+        return true;
+      };
+      const result = await run(["serve", "--json"], space, [
+        page([addressed(2, "@claude-code are you there?")]),
+        page([addressed(2, "@claude-code are you there?")]),
+        revoked(),
+      ], {}, { service, runTurn, chatOpen });
+
+      expect(result.exitCode).toBe(0);
+      expect(asked).toEqual([4321]);
+      expect(turns).toHaveLength(0);
+      // Nothing posted, nothing acknowledged by serve: the line was the chat's.
+      expect(result.requests.filter((request) => request.init.method === "POST")).toHaveLength(0);
+      expect(result.acks).toEqual([]);
+      expect(await serveCursorOf(space)).toBe(2);
+      expect(result.stderr).toContain("addressed while its Claude Code chat is open (pid 4321); leaving #2..#2 to that chat");
+      // The next look starts after what the chat handled.
+      expect(new URL(result.requests[2]!.url).searchParams.get("after")).toBe("2");
+    });
+
+    it("resumes the session as usual once the chat that took the seat has closed", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], LIVE_CHAT)).exitCode).toBe(0);
+      const { turns, runTurn } = turnsOf({ stdout: JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "@host here." }) });
+      const service = { delivered_through: 1, acked_through: 1 };
+      const result = await run(["serve", "--json"], space, [
+        page([addressed(2, "@claude-code are you there?")]),
+        page([addressed(2, "@claude-code are you there?")]),
+        { status: 201, body: { message: own(3, "@host here.") } },
+        revoked(),
+      ], {}, { service, runTurn, chatOpen: () => false });
+
+      expect(result.exitCode).toBe(0);
+      expect([turns[0]!.command, ...turns[0]!.args]).toEqual(["claude", "-p", "--resume", "claude-session-stays-local", "--output-format", "json"]);
+      expect(JSON.parse(String(result.requests[2]!.init.body))).toEqual({ content: "@host here." });
       expect(result.acks).toEqual([2]);
     });
 

@@ -41,6 +41,8 @@ export interface CliDependencies {
   signal?: AbortSignal;
   /** Runs one resumed turn of a seat's own session in `serve`; tests replace it. */
   runTurn?: TurnRunner;
+  /** Whether the Claude Code chat that took a seat is still open, in `serve`; tests replace it. */
+  chatOpen?: (pid: number) => boolean;
   /** Starts `serve` in the background after a join; only the real process (main.ts) supplies it. */
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
 }
@@ -58,6 +60,7 @@ interface ResolvedDependencies {
   cliEntry?: string;
   signal?: AbortSignal;
   runTurn?: TurnRunner;
+  chatOpen?: (pid: number) => boolean;
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
 }
 
@@ -749,6 +752,7 @@ export async function runCli(
     ...(supplied.cliEntry ? { cliEntry: supplied.cliEntry } : {}),
     ...(supplied.signal ? { signal: supplied.signal } : {}),
     ...(supplied.runTurn ? { runTurn: supplied.runTurn } : {}),
+    ...(supplied.chatOpen ? { chatOpen: supplied.chatOpen } : {}),
     ...(supplied.startWakeService ? { startWakeService: supplied.startWakeService } : {}),
   };
   let json = argv.includes("--json");
