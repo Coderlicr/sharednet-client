@@ -90,6 +90,7 @@ async function run(
   environment: Record<string, string> = {},
   overrides: {
     exec?: CommandRunner;
+    sleep?: (ms: number) => Promise<void>;
     now?: () => Date;
     service?: { delivered_through: number; acked_through: number };
     runTurn?: TurnRunner;
@@ -1336,6 +1337,77 @@ describe("sharednet say and wait", () => {
     expect(new URL(second.requests[0]!.url).searchParams.get("after")).toBe("7");
   });
 
+  it.each([500, 502, 503])("keeps serving after HTTP %s with a structured internal_error", async (status) => {
+    const space = await joinedSpace();
+    await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+    const { calls, exec } = recorder({ exitCode: 0, stdout: "" });
+    const result = await run(["serve", "--run", "handle", "--json"], space, [
+      { status, body: { error: { code: "internal_error" } } },
+      page([message(2, "after the outage")]),
+      { status, body: { error: { code: "internal_error" } } },
+      page([message(3, "after another outage")]),
+      revoked(),
+    ], {}, { exec, service: { delivered_through: 1, acked_through: 1 } });
+    expect(calls.map((call) => (call.input as { messages: unknown[] }).messages)).toEqual([[message(2, "after the outage")], [message(3, "after another outage")]]);
+    expect(result.acks).toEqual([2, 3]);
+    expect(new URL(result.requests[3]!.url).searchParams.get("after")).toBe("2");
+    expect(new URL(result.requests[1]!.url).searchParams.get("after")).toBe("1");
+  });
+
+  it("retries a failed startup without abandoning the seat", async () => {
+    const space = await joinedSpace();
+    const { writeFile } = await import("node:fs/promises");
+    const file = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, `${MEMBER_ID}.json`);
+    const credential = JSON.parse(await readFile(file, "utf8"));
+    delete credential.room_type;
+    await writeFile(file, JSON.stringify(credential));
+    await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+    const { calls, exec } = recorder({ exitCode: 0, stdout: "" });
+    const result = await run(["serve", "--run", "handle", "--json"], space, [
+      { status: 500, body: { error: { code: "internal_error" } } },
+      roomState("open"), page([message(2, "after startup recovered")]), revoked(),
+    ], {}, { exec, service: { delivered_through: 1, acked_through: 1 } });
+    expect(calls).toHaveLength(1);
+    expect(result.acks).toEqual([2]);
+  });
+
+  it("reports a stopped seat while another seat is still listening", async () => {
+    const space = await joinedSpace();
+    await seatIn(space, "rom_SecondRoom", "i_AbCdEfGhIj");
+    const { writeFile } = await import("node:fs/promises");
+    const file = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", "rom_SecondRoom", "i_AbCdEfGhIj.json");
+    await writeFile(file, JSON.stringify({ ...JSON.parse(await readFile(file, "utf8")), room_type: "board" }));
+    await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+    await seatCursor(space, "rom_SecondRoom", "i_AbCdEfGhIj", 1);
+    let release!: () => void;
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    const serving = run(["serve", "--run", "handle", "--json"], space, [revoked(), { ...revoked(), wait }]);
+    try {
+      await vi.waitFor(async () => {
+        const status = JSON.parse((await run(["serve", "--status", "--json"], space, [])).stdout);
+        expect(status.running).toBe(true);
+        expect(status.seats).toEqual(expect.arrayContaining([
+          expect.objectContaining({ state: "stopped", last_error: "invalid_credentials" }),
+          expect.objectContaining({ state: "listening" }),
+        ]));
+      });
+    } finally { release(); await serving; }
+  });
+
+  it("keeps serving and releases ownership when status persistence fails", async () => {
+    const space = await joinedSpace();
+    await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+    const fs = await import("node:fs/promises");
+    // A directory at the atomic temp-file path models a local status-write failure.
+    await fs.mkdir(join(space.env.XDG_CONFIG_HOME!, "sharednet", `serve.json.${process.pid}.tmp`));
+    const { exec, calls } = recorder({ exitCode: 0, stdout: "" });
+    const result = await run(["serve", "--run", "handle", "--json"], space, [page([message(2, "still work")]), revoked()], {}, { exec });
+    expect(result.exitCode).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(result.stderr).toContain("could not update seat status");
+    expect(JSON.parse((await run(["serve", "--status", "--json"], space, [])).stdout).running).toBe(false);
+  });
+
   it("reports whether a connector is actually running, not merely that one once was", async () => {
     const space = await joinedSpace();
     const cold = await run(["serve", "--status", "--json"], space, []);
@@ -1467,7 +1539,7 @@ describe("sharednet say and wait", () => {
       ], {}, { exec });
 
       expect(result.exitCode).toBe(0);
-      expect(result.stderr).toContain("could not read what came before the match");
+      expect(result.stderr).toContain("retrying in 10s: service_unavailable");
       expect(new URL(result.requests[2]!.url).searchParams.get("after")).toBe("1");
       expect(calls).toHaveLength(1);
       expect((calls[0]!.input as { messages: { sequence: number }[] }).messages.map((m) => m.sequence)).toEqual([2, 3]);
@@ -1782,6 +1854,29 @@ describe("sharednet say and wait", () => {
         "(claude-code was addressed, but its Claude Code session could not be resumed: Not logged in · Please run /login)",
       );
       expect(result.acks).toEqual([2]);
+    });
+
+    it("reports a timed-out turn accurately and still handles the next mention", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const turns: TurnSpec[] = [];
+      const runTurn: TurnRunner = async (spec) => {
+        turns.push(spec);
+        return turns.length === 1
+          ? { exitCode: 143, stdout: "", stderr: "", timedOut: true }
+          : { exitCode: 0, stdout: '{"type":"turn.completed","usage":{}}', stderr: "", timedOut: false };
+      };
+      const result = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex long task")]), page([addressed(2, "@codex long task")]),
+        { status: 201, body: { message: own(3, "timeout notice") } },
+        page([addressed(4, "@codex next task")]), page([own(3, "timeout notice"), addressed(4, "@codex next task")]),
+        revoked(),
+      ], CODEX, { service: { delivered_through: 1, acked_through: 1 }, runTurn });
+      const notice = result.requests.find((request) => request.init.method === "POST")!;
+      expect(JSON.parse(String(notice.init.body)).content).toContain("turn was stopped");
+      expect(JSON.parse(String(notice.init.body)).content).not.toContain("could not be resumed");
+      expect(turns).toHaveLength(2);
+      expect(result.acks).toEqual([2, 4]);
     });
 
     it("leaves alone a seat no session took, unless --run gives it a command", async () => {
@@ -2786,6 +2881,43 @@ it("includes obligations in a compiled serve command's JSON input", async () => 
   expect(result.exitCode).toBe(0);
   expect(calls).toHaveLength(1);
   expect(calls[0]!.input).toMatchObject({ compiled: state });
+});
+
+it("keeps a compiled command wake pending until its state is available", async () => {
+  const space = await workspace();
+  const admission = joined();
+  Object.assign(admission.body.room, { type: "compiled" });
+  await run(["join", PASTED_INVITE, "--no-wake"], space, [admission]);
+  const state = { protocol_version: "rac/1", sequence: 1, digest: "abc", projection: {}, obligations: "Accept W", events: [] };
+  const { exec, calls } = recorder({ exitCode: 0, stdout: "" });
+  const result = await run(["serve", "--run", "driver", "--json"], space, [
+    page([message(2, "act admitted")]), { status: 500, body: { error: { code: "internal_error" } } },
+    page([message(2, "act admitted")]), { body: state }, revoked(),
+  ], {}, { exec, service: { delivered_through: 1, acked_through: 1 } });
+  expect(new URL(result.requests[2]!.url).searchParams.get("after")).toBe("1");
+  expect(calls).toHaveLength(1);
+  expect(result.acks).toEqual([2]);
+});
+
+it("does not spend the turn allowance on unavailable compiled state", async () => {
+  const space = await workspace();
+  const admission = joined([message(1, "Welcome")]);
+  Object.assign(admission.body.room, { type: "compiled" });
+  const env = { CLAUDE_SESSION_ID: "", CODEX_SESSION_ID: "compiled-driver-thread", CODEX_HOME: "/codex-home", PATH: "" };
+  await run(["join", PASTED_INVITE], space, [admission], env);
+  const addressed = { ...message(2, "@codex review"), mentions: [MEMBER_ID] };
+  const state = { protocol_version: "rac/1", sequence: 1, digest: "abc", projection: {}, obligations: "Review W", events: [] };
+  const responses = Array.from({ length: 31 }, () => [page([addressed]), page([addressed]), { status: 500, body: { error: { code: "internal_error" } } }]).flat();
+  const sleeps: number[] = [];
+  let turns = 0;
+  const result = await run(["serve", "--json"], space, [...responses, page([addressed]), page([addressed]), { status: 200, body: state }, revoked()], env, {
+    service: { delivered_through: 1, acked_through: 1 }, now: () => new Date("2026-10-10T00:00:00Z"),
+    sleep: async (ms) => { sleeps.push(ms); },
+    runTurn: async () => { turns += 1; return { exitCode: 0, stdout: '{"type":"turn.completed","usage":{}}', stderr: "", timedOut: false }; },
+  });
+  expect(turns).toBe(1);
+  expect(Math.max(...sleeps)).toBe(10_000);
+  expect(result.acks).toEqual([2]);
 });
 
 it("reads personal compiled state before resuming a seat's own session", async () => {

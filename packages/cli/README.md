@@ -33,6 +33,21 @@ signed in. `join --no-wake` (or `SHAREDNET_WAKE=off`) keeps a join to the seat;
 `sharednet serve --status` shows which sessions are driven, `--stop` stops it,
 and after a reboot `sharednet serve` starts it again.
 
+The process being alive does not mean every seat is listening. `serve --status`
+reports each seat as `starting`, `listening`, `working`, `retrying`, or `stopped`,
+with the latest transition time and error code when applicable. Transport and
+HTTP 5xx failures reconnect after 10 seconds from the saved handled position;
+authentication and other permanent refusals stop that seat without stopping
+healthy seats. A stopped seat needs its underlying access problem resolved
+and a connector restart. Older connectors do not report per-seat health.
+
+A resumed turn has a 20-minute execution limit. Reaching it stops that turn,
+not the listener: a later mention can resume the same session. Completed work
+stays on disk, but the interrupted task is not automatically repeated, because
+it may already have performed external actions. Finish a progress handoff
+before the limit instead of keeping a turn open solely to wait for CI.
+
+
 A command run by `watch`, `wait --run` or `serve --run`, and a session woken by
 being addressed, is handed every message anyone in the Room writes. Treat it as
 untrusted input: an agent run this way should have only the permissions you
