@@ -6,7 +6,10 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { codexSandboxChosen, harnessFreeEnv, parseSeatWake, replyFrom, runTurn, seatWakeFrom, turnSpec, turnSummary, wakeTurnPrompt } from "./wake-driver.ts";
+import { chatOpen, claudeResume, claudeSummary } from "./wake-claude.ts";
+import { codexResume, codexSandboxChosen, codexSummary } from "./wake-codex.ts";
+import { harnessFreeEnv, replyFrom, runTurn, wakeTurnPrompt } from "./wake-driver.ts";
+import { parseSeatWake, seatWakeFrom } from "./wake-plugins.ts";
 
 const cleanup: string[] = [];
 afterEach(async () => {
@@ -32,6 +35,11 @@ describe("the session a seat remembers", () => {
       cwd: "/work",
       command: "claude",
     });
+    // An open chat (attended) is remembered by its process; a headless `claude -p` (attended 0) is not one.
+    const claude = { CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "6613bb00", CLAUDE_PID: "4321", PATH: "" };
+    expect(seatWakeFrom({ ...claude, CLAUDE_CODE_SESSION_ATTENDED: "1" }, "/work")).toMatchObject({ session: "6613bb00", live_pid: 4321 });
+    expect(seatWakeFrom({ ...claude, CLAUDE_CODE_SESSION_ATTENDED: "0" }, "/work")?.live_pid).toBeUndefined();
+    expect(seatWakeFrom({ ...claude, CLAUDE_CODE_SESSION_ATTENDED: "1", CLAUDE_PID: "" }, "/work")?.live_pid).toBeUndefined();
     // A terminal, or a harness without a session to resume, is not driven.
     expect(seatWakeFrom({ PATH: bin }, "/work")).toBeNull();
     expect(seatWakeFrom({ CLAUDECODE: "1" }, "/work")).toBeNull();
@@ -49,6 +57,20 @@ describe("the session a seat remembers", () => {
     expect(parseSeatWake({ driver: "codex", session: "", cwd: "/w", command: "codex" })).toBeUndefined();
     expect(parseSeatWake("codex")).toBeUndefined();
     expect(parseSeatWake(undefined)).toBeUndefined();
+  });
+
+  it("keeps the open chat's process with a Claude Code session, and drops one that is not a process id", () => {
+    const wake = { driver: "claude-code", session: "s", cwd: "/w", command: "claude" };
+    expect(parseSeatWake({ ...wake, live_pid: 4321 })).toEqual({ ...wake, live_pid: 4321 });
+    expect(parseSeatWake({ ...wake, live_pid: "4321" })).toEqual(wake);
+    expect(parseSeatWake({ ...wake, live_pid: -1 })).toEqual(wake);
+  });
+
+  it("calls a chat open only while its process runs and is still a claude", () => {
+    // This test runs in node: alive, but not a Claude Code chat, as a reused pid would be.
+    expect(chatOpen(process.pid)).toBe(false);
+    // Well above any pid_max: no such process.
+    expect(chatOpen(2 ** 30)).toBe(false);
   });
 });
 
@@ -84,14 +106,14 @@ describe("a resumed turn", () => {
     const home = await mkdtemp(join(tmpdir(), "sharednet-codex-home-"));
     cleanup.push(home);
     const wake = { driver: "codex" as const, session: "019a-thread", cwd: "/work", command: "codex", codex_home: home };
-    expect(turnSpec(wake, "p", {}, "i_SeatSeatSe", 1_000).args).toEqual(["exec", "resume", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "019a-thread", "-"]);
-    expect(turnSpec(wake, "p", {}, "i_SeatSeatSe", 1_000).env).toMatchObject({ CODEX_HOME: home, SHAREDNET_SEAT: "i_SeatSeatSe" });
+    expect(codexResume(wake, "p", {}, "i_SeatSeatSe", 1_000).args).toEqual(["exec", "resume", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "019a-thread", "-"]);
+    expect(codexResume(wake, "p", {}, "i_SeatSeatSe", 1_000).env).toMatchObject({ CODEX_HOME: home, SHAREDNET_SEAT: "i_SeatSeatSe" });
 
     await writeFile(join(home, "config.toml"), 'model = "gpt-6-luna"\n[profiles.safe]\nsandbox_mode = "read-only"\n');
     expect(codexSandboxChosen(home)).toBe(false);
     await writeFile(join(home, "config.toml"), 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n');
     expect(codexSandboxChosen(home)).toBe(true);
-    expect(turnSpec(wake, "p", {}, "i_SeatSeatSe", 1_000).args).toEqual(["exec", "resume", "--json", "--skip-git-repo-check", "019a-thread", "-"]);
+    expect(codexResume(wake, "p", {}, "i_SeatSeatSe", 1_000).args).toEqual(["exec", "resume", "--json", "--skip-git-repo-check", "019a-thread", "-"]);
   });
 
   it("posts the turn's last words as the reply, unless it chose to say nothing", () => {
@@ -106,7 +128,7 @@ describe("a resumed turn", () => {
   });
 
   it("resumes Claude Code by its session, with the prompt on standard input", () => {
-    const spec = turnSpec({ driver: "claude-code", session: "6613bb00", cwd: "/work", command: "/usr/local/bin/claude" }, "the prompt", { PATH: "/bin" }, "i_SeatSeatSe", 60_000);
+    const spec = claudeResume({ driver: "claude-code", session: "6613bb00", cwd: "/work", command: "/usr/local/bin/claude" }, "the prompt", { PATH: "/bin" }, "i_SeatSeatSe", 60_000);
     expect([spec.command, ...spec.args]).toEqual(["/usr/local/bin/claude", "-p", "--resume", "6613bb00", "--output-format", "json"]);
     expect(spec).toMatchObject({ cwd: "/work", input: "the prompt", timeoutMs: 60_000, env: { PATH: "/bin", SHAREDNET_SEAT: "i_SeatSeatSe" } });
   });
@@ -131,11 +153,11 @@ describe("a resumed turn", () => {
       '{"type":"item.completed","item":{"type":"agent_message","text":"Answered in the Room."}}',
       '{"type":"turn.completed","usage":{}}',
     ].join("\n");
-    expect(turnSummary("codex", codex)).toEqual({ ok: true, said: "Answered in the Room." });
-    expect(turnSummary("codex", '{"type":"thread.started","thread_id":"t"}\n{"type":"turn.failed","error":{"message":"x"}}')).toEqual({ ok: false, said: null });
-    expect(turnSummary("codex", "")).toEqual({ ok: false, said: null });
-    expect(turnSummary("claude-code", '{"type":"result","subtype":"success","is_error":false,"result":"Done."}')).toEqual({ ok: true, said: "Done." });
-    expect(turnSummary("claude-code", '{"type":"result","is_error":true,"result":"Not logged in · Please run /login"}')).toEqual({
+    expect(codexSummary(codex)).toEqual({ ok: true, said: "Answered in the Room." });
+    expect(codexSummary('{"type":"thread.started","thread_id":"t"}\n{"type":"turn.failed","error":{"message":"x"}}')).toEqual({ ok: false, said: null });
+    expect(codexSummary("")).toEqual({ ok: false, said: null });
+    expect(claudeSummary('{"type":"result","subtype":"success","is_error":false,"result":"Done."}')).toEqual({ ok: true, said: "Done." });
+    expect(claudeSummary('{"type":"result","is_error":true,"result":"Not logged in · Please run /login"}')).toEqual({
       ok: false,
       said: "Not logged in · Please run /login",
     });
