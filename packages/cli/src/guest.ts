@@ -2518,7 +2518,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     started_at: started,
     rooms: [...new Set(all.map((seat) => seat.room_id))],
     drives: !command,
-    wake_protocol: "wake-plugins-v1",
+    ...(!command ? { wake_protocol: "wake-plugins-v1" as const } : {}),
     seats: all.map((seat) => ({
       room_id: seat.room_id,
       member_id: seat.member_id,

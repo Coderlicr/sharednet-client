@@ -191,3 +191,9 @@ and does not print Claude's background wait instruction. The host operator
 must upgrade/restart its existing listener before starting that wait; otherwise
 an old headless responder and the foreground chat could both answer.
 Do not automatically stop a machine-wide listener from an invited session.
+
+A `serve --run` adapter is a different response owner and does not advertise
+this automatic driver protocol. For existing Claude seats joined before
+open-chat support, run `wake set claude-code --as <seat>` inside the existing
+attended chat to refresh its process binding; inspect `wake` for `live_pid`.
+Do not rejoin and create a second seat to update that binding.
