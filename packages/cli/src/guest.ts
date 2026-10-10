@@ -2629,7 +2629,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     const post = (content: string) =>
       client.request("POST", `/rooms/${encodeURIComponent(seat.room_id)}/messages`, seat.member_token, { content }, { "idempotency-key": randomUUID() });
     /** One wake of a driven seat, delivered by its plugin. What that means for the Room is decided here. */
-    const deliverWake = async (said: MessageShape[], from: number, through: number): Promise<Delivery> => {
+    const deliverWake = async (said: MessageShape[], from: number, through: number): Promise<Delivery | null> => {
       const hour = dependencies.now().getTime() - 3_600_000;
       while (turns.length > 0 && turns[0]! <= hour) turns.shift();
       if (turns.length >= MAX_TURNS_PER_HOUR) {
@@ -2638,7 +2638,9 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         await sleep(Math.max(wait, 0));
       }
       // The seat file names the session; a later join or `wake set` replaces it.
-      const wake = (await readRoomCredential(paths, seat.room_id, seat.member_id).catch(() => null))?.wake ?? seat.wake!;
+      const wake = (await readRoomCredential(paths, seat.room_id, seat.member_id))?.wake;
+      // `wake off` may have run while the poll or turn backstop was waiting.
+      if (!wake) return null;
       const about = { roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through };
       let prompt = wakeTurnPrompt(about);
       if (seat.room_type === "compiled") {
@@ -2682,6 +2684,12 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     let reported = 0;
     for (;;) {
       if (stopping.signal.aborted) return;
+      if (driving && !(await readRoomCredential(paths, seat.room_id, seat.member_id))?.wake) {
+        // Keep this loop available for a later `wake set`, but leave the seat's messages unread.
+        await setHealth(seat, "stopped");
+        await sleep(RESCAN_MS);
+        continue;
+      }
       // Behind a doorbell there is no long-poll: once nothing is left to hand over, the seat waits to
       // be rung, and looks once when it is.
       if (doorbell !== null && idle && !(await doorbell.rung(seat.member_id))) return;
@@ -2702,6 +2710,10 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       if (driving && others.length > 0) {
         await setHealth(seat, "working");
         const delivery = await deliverWake(others, cursor, polled);
+        if (delivery === null) {
+          polled = cursor;
+          continue;
+        }
         if (delivery.kind === "left" || delivery.kind === "busy") {
           // Not this seat's to acknowledge yet. A session that answers for itself acknowledges what it
           // handled, and that becomes the place; what it leaves comes round again.

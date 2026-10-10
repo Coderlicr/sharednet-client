@@ -2064,6 +2064,42 @@ describe("sharednet say and wait", () => {
       expect(result.acks).toEqual([2]);
     });
 
+    it("leaves an in-flight mention unread after wake off, and uses a later wake set without restarting", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const service = { delivered_through: 1, acked_through: 1 };
+      const { turns, runTurn } = answersOf({ stdout: "(no reply)" });
+      let finishOff!: () => void;
+      const offWritten = new Promise<void>((resolve) => { finishOff = resolve; });
+      let parked = 0;
+      const result = await run(["serve", "--json"], space, [
+        {
+          ...page([addressed(2, "@codex answer after being enabled")]),
+          entered: () => { void run(["wake", "off", "--json"], space, []).then(() => finishOff()); },
+          wait: offWritten,
+        },
+        page([addressed(2, "@codex answer after being enabled")]),
+        page([addressed(2, "@codex answer after being enabled")]),
+        page([addressed(2, "@codex answer after being enabled")]),
+        revoked(),
+      ], CODEX, {
+        service,
+        runTurn,
+        sleep: async () => {
+          parked += 1;
+          expect(turns).toHaveLength(0);
+          expect(service.acked_through).toBe(1);
+          expect((await run(["wake", "set", "command", "--command", "/opt/bots/replacement", "--json"], space, [])).exitCode).toBe(0);
+        },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(parked).toBe(1);
+      expect(turns.map((turn) => turn.command)).toEqual(["/opt/bots/replacement"]);
+      expect(result.acks).toEqual([2]);
+      expect(result.requests.filter((request) => request.init.method === "POST")).toHaveLength(0);
+    });
+
     it("shows, sets, checks and removes a seat's wake by hand", async () => {
       const space = await workspace();
       expect((await run(["join", PASTED_INVITE, "--no-wake"], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
