@@ -222,6 +222,14 @@ function parseInvite(
   return { roomId, token, baseUrl };
 }
 
+/**
+ * Said once, after a join that named nobody: the Room has no way to tell this
+ * seat from the next one, so the Agent should pick a name for itself.
+ */
+function unnamedSeatHint(shownAs: string): string {
+  return `No --name was given, so the Room shows this seat ${shownAs}. Pick a short name of your own (e.g. reviewer, backend-codex) and pass it as --name when you join; the person can rename this seat by double-clicking it in the Dashboard.\n`;
+}
+
 function defaultGuestName(runtime: DetectedRuntime): string {
   return runtime.kind === "custom" ? "agent" : runtime.kind;
 }
@@ -312,7 +320,11 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   // declaration cannot spend a claim and then fail.
   const runtimeFlag = stringOption(parsed, "runtime");
   const runtime = resolveRuntime(dependencies.env, runtimeFlag);
-  const name = stringOption(parsed, "name") ?? defaultGuestName(runtime);
+  // The name the Room will call this seat. Chosen by the Agent, it says who
+  // is speaking; left out, a guest falls back to its driver's name (the same
+  // as every other session of that driver) and an account seat to its id.
+  const chosenName = stringOption(parsed, "name");
+  const name = chosenName ?? defaultGuestName(runtime);
   // --private: strangers who know this seat's Instance id have to ask before
   // seating it in another Room. Omitted, the seat is public.
   const reach = parsed.options.get("private") === true ? ("private" as const) : undefined;
@@ -367,7 +379,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   // Instance of the account and the invite only admits it; without one, the
   // join provisions an anonymous Principal.
   if (await hasAccountCredential(dependencies.env, paths, baseUrl)) {
-    return joinAsAccount(roomId, token, name, baseUrl, paths, client, dependencies, reach, agent, wake, runtimeFlag);
+    return joinAsAccount(roomId, token, name, chosenName, baseUrl, paths, client, dependencies, reach, agent, wake, runtimeFlag);
   }
   if (agent !== undefined) {
     throw localError(
@@ -417,6 +429,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   dependencies.stderr?.(
     `Joined ${payload.room.id} as ${memberId}, an anonymous seat. Run \`sharednet login\` on this machine to make it yours; it binds every seat this machine holds.\n`,
   );
+  if (chosenName === undefined) dependencies.stderr?.(unnamedSeatHint(`"${name}", like every other ${name} seat`));
   const woken = await wakeAfterJoin(credential, `@${name}`, paths, dependencies);
 
   // Everything the Agent should report, and nothing it should not: the tokens
@@ -551,6 +564,8 @@ async function joinAsAccount(
   roomId: string,
   invite: string,
   name: string,
+  /** Sent only when the Agent chose it; the server keeps the seat's existing name otherwise. */
+  chosenName: string | undefined,
   baseUrl: string,
   paths: ReturnType<typeof getStoragePaths>,
   client: ApiClient,
@@ -577,7 +592,7 @@ async function joinAsAccount(
     "POST",
     `/rooms/${encodeURIComponent(roomId)}/join`,
     session.instance_token,
-    { invite },
+    { invite, ...(chosenName === undefined ? {} : { name: chosenName }) },
     { "idempotency-key": randomUUID() },
   );
   if (!payload.room?.id || !payload.membership?.member_id) throw invalidServerResponse();
@@ -617,6 +632,7 @@ async function joinAsAccount(
   dependencies.stderr?.(
     `Seat ${session.instance_id} in ${payload.room.id}. Other sessions of yours may hold seats in this directory too; address this one with --as ${session.instance_id}.\n`,
   );
+  if (chosenName === undefined) dependencies.stderr?.(unnamedSeatHint(`by its id, ${session.instance_id}`));
   // An account's seat answers to its tag's @handle when it has one, and always to its Instance id.
   const woken = await wakeAfterJoin(credential, agent !== undefined && !agent.startsWith("a_") ? `@${agent} or @${session.instance_id}` : `@${session.instance_id}`, paths, dependencies);
   return {
