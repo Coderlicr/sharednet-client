@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { accessSync, closeSync, constants, mkdirSync, openSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
@@ -38,6 +38,13 @@ export interface SeatWake {
   command: string;
   /** Codex finds a session only under the CODEX_HOME it was started with. */
   codex_home?: string;
+  /**
+   * The Claude Code process of a chat a person has open (CLAUDE_PID, when CLAUDE_CODE_SESSION_ATTENDED
+   * is 1). While it runs, `claude -p --resume` would be a second writer to the chat's transcript that
+   * the open chat never sees, so the seat's lines are left to the chat's own `sharednet wait`; once
+   * it has closed, the session is resumed as usual. A headless `claude -p` is attended 0 and has none.
+   */
+  live_pid?: number;
 }
 
 function onPath(name: string, env: Environment): string | null {
@@ -63,7 +70,14 @@ export function seatWakeFrom(env: Environment, cwd: string): SeatWake | null {
     return { driver: "codex", session: detected.anchor, cwd, command: onPath("codex", env) ?? "codex", ...(home ? { codex_home: home } : {}) };
   }
   if (detected.kind === "claude-code") {
-    return { driver: "claude-code", session: detected.anchor, cwd, command: onPath("claude", env) ?? "claude" };
+    const pid = env.CLAUDE_CODE_SESSION_ATTENDED?.trim() === "1" ? Number(env.CLAUDE_PID?.trim()) : NaN;
+    return {
+      driver: "claude-code",
+      session: detected.anchor,
+      cwd,
+      command: onPath("claude", env) ?? "claude",
+      ...(Number.isSafeInteger(pid) && pid > 0 ? { live_pid: pid } : {}),
+    };
   }
   return null;
 }
@@ -79,7 +93,30 @@ export function parseSeatWake(value: unknown): SeatWake | undefined {
   const command = text(record.command);
   if (!driver || !session || !cwd || !command) return undefined;
   const home = text(record.codex_home);
-  return { driver, session, cwd, command, ...(home ? { codex_home: home } : {}) };
+  const live = record.live_pid;
+  return {
+    driver,
+    session,
+    cwd,
+    command,
+    ...(home ? { codex_home: home } : {}),
+    ...(typeof live === "number" && Number.isSafeInteger(live) && live > 0 ? { live_pid: live } : {}),
+  };
+}
+
+/**
+ * Whether the Claude Code chat with this process id is still open. The pid alone is not enough: once
+ * the chat has closed the number can be handed to any other process, so the process must also still
+ * be a `claude`. Where `ps` cannot say, the chat is taken as closed and the session is resumed.
+ */
+export function chatOpen(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
+  }
+  const named = spawnSync("ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000 });
+  return named.status === 0 && /claude/i.test(named.stdout);
 }
 
 // The variables a harness sets for the commands it runs. Handed on, they would make the resumed
