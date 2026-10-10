@@ -437,6 +437,35 @@ describe("sharednet join", () => {
     expect(malformed.requests).toHaveLength(0);
   });
 
+  it("takes the name an Agent chose for itself into the Room as the seat's nickname", async () => {
+    const space = await workspace();
+    const instance = {
+      id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", agent_id: null, runtime_kind: "claude-code", cli_version: "0.1.3",
+      status: "online", display_name: null, started_at: "2026-09-06T00:00:00.000Z", last_seen_at: "2026-09-06T00:00:00.000Z",
+      lease_expires_at: "2099-09-06T00:01:30.000Z", token_expires_at: "2099-09-07T00:00:00.000Z", ended_at: null, revoked_at: null,
+    };
+    const result = await run(
+      ["join", PASTED_INVITE, "--name", "reviewer", "--json"],
+      space,
+      [
+        { status: 201, body: { instance, token: `sni_${"A".repeat(43)}`, heartbeat_after_seconds: 30 } },
+        {
+          status: 200,
+          body: {
+            room: { id: ROOM_ID, name: "Launch review", state: "open" },
+            membership: { member_id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", kind: "instance", admitted_by: "invite", name: "reviewer", state: "active" },
+          },
+        },
+        { status: 200, body: { items: [], next_cursor: "0", has_more: false } },
+      ],
+      { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}` },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(String(result.requests[1]!.init.body))).toEqual({ invite: INVITE_TOKEN, name: "reviewer" });
+    expect(result.stderr).not.toContain("No --name");
+  });
+
   it("joins as the account when a credential is present: registers an Instance, joins with the invite, reads history", async () => {
     const space = await workspace();
     const instance = {
@@ -483,7 +512,9 @@ describe("sharednet join", () => {
     expect(header(result.requests[0]!, "authorization")).toBe(`Bearer snk_${"K".repeat(43)}`);
     expect(header(result.requests[1]!, "authorization")).toBe(`Bearer sni_${"A".repeat(43)}`);
     // The invite admits the Instance; the runtime went with the registration, not the join.
+    // No --name, so no name: the server keeps whatever the seat had, and the Agent is told.
     expect(JSON.parse(String(result.requests[1]!.init.body))).toEqual({ invite: INVITE_TOKEN });
+    expect(result.stderr).toContain("No --name was given, so the Room shows this seat by its id, i_AccountSeat1.");
     expect(JSON.parse(String(result.requests[0]!.init.body)).runtime_kind).toBe("claude-code");
     expect(header(result.requests[1]!, "idempotency-key")).toMatch(/^[0-9a-f-]{36}$/);
 
