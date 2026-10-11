@@ -12,7 +12,7 @@ import type { SeatWake, TurnRunner } from "./wake-driver.ts";
 const roots: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 const room = "rom_AbCdEfGhIj", seat = "i_AbCdEfGhIj", source = "msg_AbCdEfGhIj";
-const wake = { id: "wak_AbCdEfGhIj", room_id: room, target_instance_id: seat, source_message_id: source, source_instance_id: "i_HumanHuman", source_sequence: 7, state: "pending", reasons: [{ kind: "mention" }], created_at: "2026-10-11T00:00:00.000Z" };
+const wake = { id: "wak_AbCdEfGhIj", room_id: room, target_instance_id: seat, source_message_id: source, source_instance_id: "i_HumanHuman", source_sequence: 7, state: "pending", source_is_human: true, reasons: [{ kind: "mention" }], created_at: "2026-10-11T00:00:00.000Z" };
 async function fixture(driver: SeatWake = { driver: "command", command: "/bin/cat", cwd: "/tmp" }) {
   const root = await mkdtemp(join(tmpdir(), "sharednet-trigger-")); roots.push(root);
   const env = { HOME: root, XDG_CONFIG_HOME: join(root, "config"), XDG_STATE_HOME: join(root, "state") };
@@ -21,19 +21,22 @@ async function fixture(driver: SeatWake = { driver: "command", command: "/bin/ca
   await writeProjectRoomState(root, { schema_version: 1, base_url: credential.base_url, room_id: room, member_id: seat, last_sequence: 0 });
   const requests: { path: string; body: Record<string, unknown>; headers: Headers }[] = [];
   let failedPost = false, failedComplete = false;
-  const state = { launches: 0, failPost: false, failComplete: false, throwTurn: false, reply: "answer", startDenied: false, startReplay: false, claimReplay: false, terminalPage: false };
+  const state = { launches: 0, failPost: false, failComplete: false, throwTurn: false, reply: "answer", startDenied: false, startReplay: false, claimReplay: false, terminalPage: false, cancelAt: "" as "" | "claim" | "start", refusal: "wake_cancelled", inboxCalls: 0, agentSource: false };
   const fetch: typeof globalThis.fetch = async (input, init) => {
     const path = new URL(String(input)).pathname.replace(`/api/v1/rooms/${room}`, "");
     const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
     requests.push({ path, body, headers: new Headers(init?.headers) });
     const query = new URL(String(input)).searchParams;
+    if (path === "/wakes") state.inboxCalls++;
+    const currentWake = { ...wake, source_is_human: !state.agentSource, ...(state.cancelAt && state.inboxCalls > 1 ? { id: "wak_NextValid1" } : {}) };
+    if (state.cancelAt && state.inboxCalls === 1 && path.endsWith(`/${state.cancelAt}`)) return Response.json({ error: { code: state.refusal } }, { status: state.refusal === "invalid_token" ? 401 : 409 });
     if (query.has("after") && query.has("before")) return Response.json({ error: { code: "invalid_request" } }, { status: 400 });
     let response: unknown = {};
     if (path === "/wake-mode") response = { protocol: "trigger-wakes-v1", executor_epoch: 1 };
     if (path === "/wakes") response = state.terminalPage && !new URL(String(input)).searchParams.has("after")
       ? { items: Array.from({ length: 50 }, (_, index) => ({ ...wake, id: `wak_${String(index).padStart(10, "0")}`, state: "completed" })), next_cursor: "page-one" }
-      : { items: [wake], next_cursor: null };
-    if (path.endsWith("/claim") || path.endsWith("/start")) response = { wake: { ...wake, state: path.endsWith("/claim") ? "claimed" : "start_authorized" }, receipt: "test-receipt" };
+      : { items: [currentWake], next_cursor: null };
+    if (path.endsWith("/claim") || path.endsWith("/start")) response = { wake: { ...currentWake, state: path.endsWith("/claim") ? "claimed" : "start_authorized" }, receipt: "test-receipt" };
     if (path.endsWith("/claim") && state.claimReplay) response = { wake: { ...wake, state: "start_authorized" }, receipt: "test-receipt" };
     if (path.endsWith("/start") && state.startReplay) response = { wake: { ...wake, state: "completed" }, receipt: "test-receipt" };
     if (path === "/messages" && init?.method === "GET") response = { items: [{ id: source, sequence: 7, content: "please answer", sender: { member_id: "i_HumanHuman", kind: "instance", name: "owner" } }], has_more: false };
@@ -102,7 +105,7 @@ describe("opt-in trigger commands", () => {
   });
   it("does not launch after the server refuses start authorization", async () => {
     const f = await fixture(); f.state.startDenied = true;
-    expect((await f.run(["serve", "--headless", "--once"])).code).not.toBe(0);
+    expect((await f.run(["serve", "--headless", "--once"])).code).toBe(0);
     expect(f.state.launches).toBe(0);
   });
   it.each(["startReplay", "claimReplay"] as const)("does not launch on an incompatible %s response", async replay => {
@@ -115,6 +118,30 @@ describe("opt-in trigger commands", () => {
       expect(retry.text).toContain("needs_reconciliation");
       expect(f.state.launches).toBe(0);
     }
+  });
+  it.each(["claim", "start"] as const)("keeps serving after cancellation at %s and executes the next wake once", async cancelAt => {
+    const f = await fixture(); f.state.cancelAt = cancelAt;
+    const result = await f.run(["serve", "--headless"]);
+    expect(result.code, result.text).toBe(0);
+    expect(f.state.inboxCalls).toBe(2);
+    expect(f.state.launches).toBe(1);
+    expect(f.requests.filter(r => r.path.endsWith("/complete"))).toHaveLength(1);
+    expect(f.requests.find(r => r.path.endsWith("/complete"))?.path).toContain("wak_NextValid1");
+    // Reopen persisted terminal cancellation without resurrecting either execution.
+    expect((await f.run(["serve", "--headless", "--once"])).code).toBe(0);
+    expect(f.state.launches).toBe(1);
+  });
+  it.each(["executor_fenced", "invalid_token", "wake_conflict"])("stops on %s instead of mistaking it for cancellation", async refusal => {
+    const f = await fixture(); f.state.cancelAt = "start"; f.state.refusal = refusal;
+    expect((await f.run(["serve", "--headless"])).code).not.toBe(0);
+    expect(f.state.inboxCalls).toBe(1); expect(f.state.launches).toBe(0);
+  });
+  it("replies to an agent mention without arming a human continuation", async () => {
+    const f = await fixture(); f.state.agentSource = true;
+    const result = await f.run(["serve", "--headless", "--once"]);
+    expect(result.code, result.text).toBe(0);
+    expect(f.requests.find(r => r.body.content)?.body).toEqual({ content: "answer", reply_to_message_id: source });
+    expect(f.requests.at(-1)?.body.outcome).toBe("completed");
   });
   it("drains past a full page of terminal wakes without starving new work", async () => {
     const f = await fixture(); f.state.terminalPage = true;

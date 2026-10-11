@@ -20,6 +20,7 @@ interface Wake {
   target_instance_id: string;
   source_message_id: string;
   source_sequence: number;
+  source_is_human: boolean;
   state: string;
   reasons?: { kind: "mention" | "continuation" }[];
 }
@@ -28,7 +29,7 @@ interface Execution {
   base_url: string;
   execution_key: string;
   executor_epoch: number;
-  stage: "reserved" | "claimed" | "starting" | "output" | "published" | "completed";
+  stage: "reserved" | "claimed" | "starting" | "output" | "published" | "completed" | "cancelled";
   receipt?: string;
   reply?: string | null;
   outcome?: "completed" | "failed";
@@ -48,8 +49,8 @@ function parseJournal(raw: string | null): Journal {
   if (!value || value.version !== 1 || !UUID.test(value.executor_id) || !value.executions || typeof value.executions !== "object" || Array.isArray(value.executions)) return journalError();
   if (!value.cursors || typeof value.cursors !== "object" || Array.isArray(value.cursors) || !Object.values(value.cursors).every(cursor => typeof cursor === "string")) return journalError();
   for (const entry of Object.values(value.executions)) {
-    if (!entry || !UUID.test(entry.execution_key) || !validWake(entry.wake) || typeof entry.base_url !== "string" || typeof entry.continuation !== "boolean" || !Number.isSafeInteger(entry.executor_epoch) || !["reserved", "claimed", "starting", "output", "published", "completed"].includes(entry.stage)) return journalError();
-    if (entry.stage !== "reserved" && typeof entry.receipt !== "string") return journalError();
+    if (!entry || !UUID.test(entry.execution_key) || !validWake(entry.wake) || typeof entry.base_url !== "string" || typeof entry.continuation !== "boolean" || !Number.isSafeInteger(entry.executor_epoch) || !["reserved", "claimed", "starting", "output", "published", "completed", "cancelled"].includes(entry.stage)) return journalError();
+    if (!["reserved", "cancelled"].includes(entry.stage) && typeof entry.receipt !== "string") return journalError();
     if (["output", "published", "completed"].includes(entry.stage) && (!(entry.reply === null || typeof entry.reply === "string") || !["completed", "failed"].includes(entry.outcome ?? ""))) return journalError();
   }
   return value;
@@ -57,7 +58,7 @@ function parseJournal(raw: string | null): Journal {
 function validWake(value: unknown): value is Wake {
   if (!value || typeof value !== "object") return false;
   const w = value as Wake;
-  return /^wak_[A-Za-z0-9]{10}$/.test(w.id) && /^rom_[A-Za-z0-9]{10}$/.test(w.room_id) && /^i_[A-Za-z0-9]{10}$/.test(w.target_instance_id) && /^msg_[A-Za-z0-9]{10}$/.test(w.source_message_id) && Number.isSafeInteger(w.source_sequence) && w.source_sequence > 0 && ["pending", "claimed", "start_authorized", "completed", "failed", "interrupted", "cancelled"].includes(w.state);
+  return /^wak_[A-Za-z0-9]{10}$/.test(w.id) && /^rom_[A-Za-z0-9]{10}$/.test(w.room_id) && /^i_[A-Za-z0-9]{10}$/.test(w.target_instance_id) && /^msg_[A-Za-z0-9]{10}$/.test(w.source_message_id) && Number.isSafeInteger(w.source_sequence) && w.source_sequence > 0 && typeof w.source_is_human === "boolean" && ["pending", "claimed", "start_authorized", "completed", "failed", "interrupted", "cancelled"].includes(w.state);
 }
 function uncertain(): never { throw localError("needs_reconciliation", "A turn may already have started in this session. Reconcile its execution journal before serving again; it will not be relaunched."); }
 function processExists(pid: number): boolean {
@@ -120,6 +121,14 @@ export async function runTriggerCommand(args: string[], dependencies: GuestDepen
         const mode = await client.request<{ protocol: string; executor_epoch: number }>("POST", `${path}/wake-mode`, credential.member_token, { protocol: PROTOCOL, executor_id: journal.executor_id }, HEADERS);
         if (mode.protocol !== PROTOCOL || !Number.isSafeInteger(mode.executor_epoch) || mode.executor_epoch < 1) throw localError("invalid_server_response", "Wake enrollment did not return a valid fencing epoch.");
         const request = <T>(method: string, suffix: string, body?: unknown, headers = {}) => client.request<T>(method, `${path}${suffix}`, credential.member_token, body, { ...HEADERS, ...headers });
+        const cancelledBeforeStart = async (entry: Execution, error: unknown) => {
+          if (!(error instanceof CliError) || error.code !== "wake_cancelled" || error.exitCode !== 4) return false;
+          // Only this definitive pre-start refusal ends one delivery. Fencing,
+          // revoked auth and unknown starts must still stop the consumer.
+          entry.stage = "cancelled"; entry.wake.state = "cancelled";
+          await save();
+          return true;
+        };
         const finish = async (entry: Execution) => {
           const identity = { execution_key: entry.execution_key, executor_id: journal.executor_id, executor_epoch: entry.executor_epoch, receipt: entry.receipt };
           if (entry.stage === "output") {
@@ -146,15 +155,17 @@ export async function runTriggerCommand(args: string[], dependencies: GuestDepen
             if (["completed", "failed", "interrupted", "cancelled"].includes(wake.state)) continue;
             const key = `${client.baseUrl}/${credential.room_id}/${wake.id}`;
             let entry = journal.executions[key];
-            if (entry?.stage === "completed") continue;
+            if (entry?.stage === "completed" || entry?.stage === "cancelled") continue;
             if (!entry && wake.state === "start_authorized") { journal.blocked = true; await save(); uncertain(); }
             if (!entry) {
-              entry = { wake, base_url: client.baseUrl, execution_key: randomUUID(), executor_epoch: mode.executor_epoch, stage: "reserved", continuation: !flags.has("--no-continuation") };
+              entry = { wake, base_url: client.baseUrl, execution_key: randomUUID(), executor_epoch: mode.executor_epoch, stage: "reserved", continuation: wake.source_is_human && !flags.has("--no-continuation") };
               journal.executions[key] = entry; await save();
             }
             const identity = { execution_key: entry.execution_key, executor_id: journal.executor_id, executor_epoch: entry.executor_epoch };
             if (entry.stage === "reserved") {
-              const claimed = await request<{ receipt: string; wake: Wake }>("POST", `/wakes/${wake.id}/claim`, identity);
+              let claimed: { receipt: string; wake: Wake };
+              try { claimed = await request("POST", `/wakes/${wake.id}/claim`, identity); }
+              catch (error) { if (await cancelledBeforeStart(entry, error)) continue; throw error; }
               if (!validWake(claimed.wake) || claimed.wake.id !== wake.id || claimed.wake.state !== "claimed") { journal.blocked = true; await save(); uncertain(); }
               if (typeof claimed.receipt !== "string" || !claimed.receipt) throw localError("invalid_server_response", "The wake claim has no receipt.");
               entry.receipt = claimed.receipt; entry.stage = "claimed"; await save();
@@ -171,7 +182,8 @@ export async function runTriggerCommand(args: string[], dependencies: GuestDepen
                 if (!validWake(started.wake) || started.wake.id !== wake.id || started.wake.state !== "start_authorized" || started.receipt !== entry.receipt) uncertain();
               }
               catch (error) {
-                // A definitive refusal never started a model. Preserve the claim for inspection/retry.
+                if (await cancelledBeforeStart(entry, error)) continue;
+                // Other definitive refusals preserve the claim and stop for inspection.
                 if (error instanceof CliError && error.exitCode !== 5 && error.code !== "needs_reconciliation") { entry.stage = "claimed"; await save(); }
                 throw error;
               }

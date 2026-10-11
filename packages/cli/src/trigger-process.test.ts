@@ -26,7 +26,7 @@ it.each([false, true])("serializes real consumers across Rooms and refuses uncer
     }
     const room = req.url?.match(/\/rooms\/(rom_[A-Za-z0-9]+)/)?.[1];
     const index = rooms.indexOf(room ?? "");
-    const wake = { id: `wak_${String(index).padStart(10, "0")}`, room_id: room, target_instance_id: seat, source_message_id: "msg_AbCdEfGhIj", source_sequence: 1, state: "pending", reasons: [{ kind: "mention" }], created_at: "2026-10-11T00:00:00Z" };
+    const wake = { id: `wak_${String(index).padStart(10, "0")}`, room_id: room, target_instance_id: seat, source_message_id: "msg_AbCdEfGhIj", source_sequence: 1, source_is_human: true, state: "pending", reasons: [{ kind: "mention" }], created_at: "2026-10-11T00:00:00Z" };
     let body: unknown = {};
     if (req.url?.endsWith("/wake-mode")) { enrollments++; body = { protocol: "trigger-wakes-v1", executor_epoch: 1 }; }
     if (req.url?.includes("/wakes?")) body = { items: [wake], next_cursor: null };
