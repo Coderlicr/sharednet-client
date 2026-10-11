@@ -85,7 +85,8 @@
       "sourceSha256": "9062dc6877d203ad5aa23ac6568567d4d55efe8b8f1a5c25fc63b76557966ac2",
       "changes": [
         "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 0c43b38027c8ee5039a14e0f324897e7da46b2592becbe7c4eec12ff0d06dca8.",
-        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary.",
+        "Port opt-in durable trigger continuation from SharedNet 4e38117; preserve existing public-client behavior and private-service test boundary."
       ]
     },
     "packages/cli/src/errors.ts": {
@@ -116,7 +117,8 @@
       "changes": [
         "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is a143227d6f7e0ff9c81c6639330cd600e94cec4e8d626fa4a40d769336c07e7b.",
         "Port hosted runtime declarations and Muse detection from SharedNet #163; real handler coverage remains in the service repository.",
-        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary.",
+        "Port opt-in durable trigger continuation from SharedNet 4e38117; preserve existing public-client behavior and private-service test boundary."
       ]
     },
     "packages/cli/src/instance-computation.ts": {
@@ -155,7 +157,8 @@
       "sourceSha256": "963c046a4bfdf7fac66900321eb24282a38ad3d03534bc8c516066df09ca7031",
       "changes": [
         "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 997d20b8d94032a786c4f0adf85482d3149b8020b5c8ef35528ecd7a2b22e63e.",
-        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary.",
+        "Port opt-in durable trigger continuation from SharedNet 4e38117; preserve existing public-client behavior and private-service test boundary."
       ]
     },
     "packages/cli/src/triggers.ts": {
@@ -168,7 +171,9 @@
       "source": "packages/cli/src/wake-driver.ts",
       "sourceCommit": "3d66c5ebdd3d6ea0f08d3806ad442a10699445e6",
       "sourceSha256": "0ff3e83e092d9354f40373a2ff5cd8136c1af13c7784c8100caaba7df87ada47",
-      "changes": []
+      "changes": [
+        "Port opt-in durable trigger continuation from SharedNet 4e38117; preserve existing public-client behavior and private-service test boundary."
+      ]
     },
     "packages/cli/bin/sharednet.js": {
       "source": "packages/cli/bin/sharednet.js",
@@ -193,7 +198,8 @@
       "sourceSha256": "ab8a773826d0bae882364d6b8581357b09957543df9f7ec3b70c2b5270713762",
       "changes": [
         "Client-side additions not in the source: the one wait (`wait --on`, `serve`, the filter rule, untrusted input) since the one-wait port, and being woken when addressed since the wake port.",
-        "Document SHAREDNET_RUNTIME and declared runtime diagnostics for 0.1.12."
+        "Document SHAREDNET_RUNTIME and declared runtime diagnostics for 0.1.12.",
+        "Port opt-in durable trigger continuation from SharedNet 4e38117; preserve existing public-client behavior and private-service test boundary."
       ]
     },
     "packages/cli/LICENSE": {
@@ -265,6 +271,24 @@
         "Compiled Room command help and wire state; imported with the compiled Rooms integration."
       ],
       "sourceCommit": "a145d587528d32bf0b658b3a3a4617990f5ae137"
+    },
+    "packages/cli/src/trigger-consumer.ts": {
+      "source": "packages/cli/src/trigger-consumer.ts",
+      "sourceCommit": "4e3811752bdcb018f3a47a66c86c66a6fe0764e0",
+      "sourceSha256": "0f425eec295209d77051a470129163a852f25cdb138161c9972ed21a99f9129c",
+      "changes": []
+    },
+    "packages/cli/src/trigger-consumer.test.ts": {
+      "source": "packages/cli/src/trigger-consumer.test.ts",
+      "sourceCommit": "4e3811752bdcb018f3a47a66c86c66a6fe0764e0",
+      "sourceSha256": "69a38ac5ca51cff65013d3a093088e06e6e588f0d919a4d223cc66548a426e76",
+      "changes": []
+    },
+    "packages/cli/src/trigger-process.test.ts": {
+      "source": "packages/cli/src/trigger-process.test.ts",
+      "sourceCommit": "4e3811752bdcb018f3a47a66c86c66a6fe0764e0",
+      "sourceSha256": "50f963354a18f00b181100807a5580f5555ff9ec374af04224c5e1f755846537",
+      "changes": []
     }
   },
   "privateTestsRetainedAtSource": [

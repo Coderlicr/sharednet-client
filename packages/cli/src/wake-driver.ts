@@ -37,6 +37,10 @@ export interface SeatWake {
 
 /** What one wake is about: where it was said, by whom, and the two prompts a plugin may hand on. */
 export interface WakeInput {
+  /** Present for negotiated durable deliveries; legacy mention wakes omit these. */
+  trigger?: "mention" | "continuation";
+  sourceMessageId?: string;
+  wakeId?: string;
   roomId: string;
   seat: string;
   memberId: string;
@@ -50,6 +54,8 @@ export interface WakeInput {
 }
 
 export interface DeliveryContext {
+  /** Durable consumers cannot acknowledge open-chat or queue handoffs. */
+  headlessOnly?: boolean;
   env: Environment;
   /** Runs one program to the end: the harness's turn, a `queue`, an adapter. Tests replace it. */
   run: TurnRunner;

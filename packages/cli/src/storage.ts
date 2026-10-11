@@ -167,7 +167,7 @@ async function ensureSecureDirectory(path: string): Promise<void> {
   }
 }
 
-async function readSecureFile(path: string): Promise<string | null> {
+export async function readSecureFile(path: string): Promise<string | null> {
   let info;
   try {
     info = await lstat(path);
@@ -205,7 +205,7 @@ async function readSecureFile(path: string): Promise<string | null> {
   }
 }
 
-async function writeSecureJson(path: string, value: unknown): Promise<void> {
+export async function writeSecureJson(path: string, value: unknown): Promise<void> {
   const parent = dirname(path);
   await ensureSecureDirectory(parent);
 

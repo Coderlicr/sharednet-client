@@ -688,7 +688,7 @@ async function execute(
   }
   throw localError(
     "unknown_command",
-    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, wake/wake set/off/check, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/watch/export, and decision list/approve/deny.",
+    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, trigger list/continuation/cancel/serve, wake/wake set/off/check, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/watch/export, and decision list/approve/deny.",
   );
 }
 

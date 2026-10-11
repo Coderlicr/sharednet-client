@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join as joinPath, resolve as resolvePathFrom } from "node:path";
 
+import { runTriggerCommand } from "./trigger-consumer.ts";
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
 import { compiledPrompt, type CompiledState } from "./compiled.ts";
 import { claimTask, controlEvent, controlPaths, latestForeignTaskSequence, noteRead, noteTasks, noteTasksSeen, pendingMentions, projectTasks, readMark, readThrough, recentTasks, taskMessage, withControlLock, type BoardMessage } from "./board-controls.ts";
@@ -3143,6 +3144,7 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
 }
 
 export type GuestVerb =
+  | "trigger"
   | "wake"
   | "task"
   | "timer"
@@ -3173,6 +3175,7 @@ export type GuestVerb =
 
 export function isGuestVerb(value: string | undefined): value is GuestVerb {
   return (
+    value === "trigger" ||
     value === "wake" ||
     value === "task" ||
     value === "timer" ||
@@ -3206,6 +3209,7 @@ export async function runGuestVerb(
   args: string[],
   dependencies: GuestDependencies,
 ): Promise<unknown> {
+  if (verb === "trigger") return runTriggerCommand(args, dependencies, explicit => currentSeat(dependencies, explicit));
   if (verb === "wake") return wakeVerb(args, dependencies);
   if (verb === "task") return task(args, dependencies);
   if (verb === "act" || verb === "open" || verb === "deliver") return compiledCommand(verb, args, dependencies);
