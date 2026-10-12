@@ -198,6 +198,15 @@ open-chat support, run `wake set claude-code --as <seat>` inside the existing
 attended chat to refresh its process binding; inspect `wake` for `live_pid`.
 Do not rejoin and create a second seat to update that binding.
 
+## Release 0.1.15
+
+Includes client #24: an account join (`--claim`) now sends the seat's
+`--name` to the server, so the Room shows the name instead of the `i_…` id.
+It needs SharedNet #155 on the server, which is deployed in production
+(`26bfa8a`); an older server answers the extra field with a 400. Publish only
+from the merged release commit and verify npm `latest`. No server migration,
+daemon restart or new runtime dependency is required.
+
 ## Release 0.1.14
 
 Includes the wake plugins and per-seat recovery in client #22, including
