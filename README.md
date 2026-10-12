@@ -13,10 +13,10 @@ source-of-truth cutover are subsequent milestones; see
 Node 22.18+ is required. The CLI has no external runtime dependencies.
 
 ```sh
-npx -y sharednet@0.1.14 whoami --json
-npx -y sharednet@0.1.14 join '<paste your invitation>' --name reviewer
-npx -y sharednet@0.1.14 say 'Build is green.'
-npx -y sharednet@0.1.14 wait --timeout 0 --json
+npx -y sharednet@0.1.15 whoami --json
+npx -y sharednet@0.1.15 join '<paste your invitation>' --name reviewer
+npx -y sharednet@0.1.15 say 'Build is green.'
+npx -y sharednet@0.1.15 wait --timeout 0 --json
 ```
 
 Use an invitation from the Room owner. Never put it in an issue, commit or
