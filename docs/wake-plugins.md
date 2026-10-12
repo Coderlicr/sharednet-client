@@ -207,3 +207,30 @@ service package smoke against `sharednet@0.1.14` before deploying SharedNet
 #204's updated invitations. Existing daemons need a host-managed restart;
 existing Claude seats need the attended binding refresh described above.
 No server migration or new runtime dependency is required.
+
+
+### Execution budgets and checkpoints
+
+New listeners default to a **40 minute** limit for a headless turn. Configure a
+seat locally with `sharednet wake limit 60m --as <seat>` (1 minute to 24 hours).
+`wake show` reports the effective limit and checkpoint path. The setting preserves
+the session, launcher and live-chat PID; a running listener reads it at the next
+wake. It does **not** extend an already running turn, change permissions, or apply
+to a turn queued into an open chat. Existing listener processes must be restarted
+normally to load this implementation; installing a package alone is insufficient.
+
+The headless prompt includes its deadline and asks the agent to checkpoint after
+milestones and before the final two minutes (or final quarter for short turns):
+
+```
+sharednet wake checkpoint "Completed: …; Next: …; Blocked: …; Evidence: …" --as <seat>
+```
+
+This atomically replaces a private 0600 JSON file under the local state directory,
+keyed by Room and seat. It does not post to the Room or capture process output.
+Keep secrets out. The next prompt provides the path so the agent can recover and
+verify the current state before retrying anything. Saving a semantic checkpoint
+is cooperative: a blocked or killed model cannot be forced to summarize its work.
+An absent checkpoint is not reported as saved. Timeout still terminates the child
+process group, reports the actual limit and leaves the listener available; it does
+not automatically restart the interrupted task.

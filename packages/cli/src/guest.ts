@@ -13,7 +13,7 @@ import { detectRuntime, type DetectedRuntime } from "./runtime-detection.ts";
 import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn, triggerTakesParameter, wakeIdentity, type Trigger } from "./triggers.ts";
 import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
 import { chatOpen } from "./wake-claude.ts";
-import { livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
+import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
 import { describeWake, isWakeDriver, pluginFor, seatWakeFrom } from "./wake-plugins.ts";
 import {
   getOrCreateInstallationSecret,
@@ -2464,8 +2464,18 @@ async function doorbellAddress(option: string, port: number, dependencies: Guest
 
 /** How often a running `serve` looks for seats joined since it started. */
 const RESCAN_MS = 5_000;
-/** One resumed turn may run this long before it is stopped. */
-const TURN_LIMIT_MS = 20 * 60_000;
+// Checkpoints contain agent-written progress, never captured process output or credentials.
+function checkpointPath(stateDir: string, room: string, member: string): string {
+  return joinPath(stateDir, "wake-progress", `${createHash("sha256").update(`${room}/${member}`).digest("hex")}.json`);
+}
+async function saveWakeProgress(path: string, value: unknown): Promise<void> {
+  await mkdir(resolvePathFrom(path, ".."), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    await rename(temporary, path);
+  } finally { await unlink(temporary).catch(() => undefined); }
+}
 /**
  * A backstop, not a budget: two seats that keep addressing each other would otherwise wake each
  * other for ever. Past this many turns in an hour a seat's next wake waits for the hour to pass,
@@ -2658,14 +2668,18 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       // `wake off` may have run while the poll or turn backstop was waiting.
       if (!wake) return null;
       const about = { roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through };
-      let prompt = wakeTurnPrompt(about);
+      const timeoutMs = wake.turn_limit_ms ?? DEFAULT_TURN_LIMIT_MS;
+      const checkpoint = checkpointPath(paths.stateDir, seat.room_id, seat.member_id);
+      const deadline = dependencies.now().getTime() + timeoutMs;
+      const checkpointAt = deadline - Math.min(120_000, timeoutMs / 4);
+      let prompt = wakeTurnPrompt(about) + `\n\nExecution budget: ${timeoutMs / 60_000} minutes; deadline ${new Date(deadline).toISOString()}. Save progress by ${new Date(checkpointAt).toISOString()} and after each significant milestone: sharednet wake checkpoint "completed; next step; blockers; evidence paths" --as ${seat.member_id}. Keep secrets out. Previous checkpoint (if any): ${checkpoint}. Read it to recover context, then verify current state before repeating actions. A checkpoint does not authorize automatic retries. You can set the NEXT turn's limit with sharednet wake limit 60m --as ${seat.member_id}; this does not extend this running turn. This budget applies to headless execution, not a handoff into an open chat.`;
       if (seat.room_type === "compiled") {
         const state = await client.request<CompiledState>("GET", `/rooms/${encodeURIComponent(seat.room_id)}/state`, seat.member_token);
         prompt += `\n\n${compiledPrompt(state)}`;
       }
       const plugin = pluginFor(wake.driver);
       const started = dependencies.now().getTime();
-      const delivery = await plugin.deliver(wake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs: TURN_LIMIT_MS });
+      const delivery = await plugin.deliver(wake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs });
       // The backstop counts turns that ran; a wake handed on, left or put off ran none.
       if (delivery.kind === "replied" || delivery.kind === "failed") turns.push(started);
       const span = `#${from + 1}..#${through}`;
@@ -2685,7 +2699,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} could not be resumed: ${delivery.why}${delivery.detail ? ` (${delivery.detail})` : ""}\n`);
         // Whoever addressed the seat would otherwise hear nothing at all, and not know why.
         const notice = delivery.timedOut
-          ? `(${seat.name}'s turn was stopped after ${TURN_LIMIT_MS / 60_000} minutes. The listener remains available for the next mention; this task was not automatically retried.)`
+          ? `(${seat.name}'s turn was stopped after ${timeoutMs / 60_000} minutes. The listener remains available for the next mention; this task was not automatically retried.)`
           : `(${seat.name} was addressed, but its ${plugin.label} session could not be resumed: ${delivery.why})`;
         await post(notice).catch(() => undefined);
       }
@@ -3007,7 +3021,7 @@ async function timer(args: string[], dependencies: GuestDependencies): Promise<u
 }
 
 const WAKE_USAGE =
-  "Usage: sharednet wake [--as <i_…>], sharednet wake set codex|claude-code|command [--command <path>] [--resume <session>] [--as <i_…>], sharednet wake off [--as <i_…>], or sharednet wake check [--as <i_…>]";
+  "Usage: sharednet wake [--as <i_…>], sharednet wake set codex|claude-code|command [--command <path>] [--resume <session>] [--as <i_…>], sharednet wake off [--as <i_…>], sharednet wake check [--as <i_…>], sharednet wake limit <1m..24h> [--as <i_…>], or sharednet wake checkpoint <progress> [--as <i_…>]";
 
 /**
  * A seat's wake, by hand (docs/wake-plugins.md): which plugin delivers it, what it resumes, the
@@ -3017,7 +3031,7 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
   const parsed = parseGuestArguments(args);
   assertOnlyOptions(parsed, ["as", "command", "resume"]);
   const [action = "show", driver, ...extra] = parsed.positionals;
-  if (extra.length > 0 || !["show", "set", "off", "check"].includes(action) || (action === "set") !== (driver !== undefined)) {
+  if (extra.length > 0 || !["show", "set", "off", "check", "limit", "checkpoint"].includes(action) || ["set", "limit", "checkpoint"].includes(action) !== (driver !== undefined)) {
     throw localError("invalid_arguments", WAKE_USAGE);
   }
   const paths = getStoragePaths(dependencies.env);
@@ -3030,9 +3044,23 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
   const credential = await readRoomCredential(paths, state.room_id, state.member_id);
   if (!credential) throw localError("room_credential_missing", "The member token for this Room is not on this machine. Join again with a new invite.");
   const seat = { room_id: credential.room_id, member_id: credential.member_id, name: credential.name };
-  const shown = (wake: SeatWake | undefined) => ({ ...seat, wake: wake ?? null, ...(wake ? { wakes: describeWake(wake), address: `@${credential.member_id}` } : {}) });
+  const shown = (wake: SeatWake | undefined) => ({ ...seat, wake: wake ?? null, ...(wake ? { turn_limit_ms: wake.turn_limit_ms ?? DEFAULT_TURN_LIMIT_MS, checkpoint_path: checkpointPath(paths.stateDir, credential.room_id, credential.member_id), wakes: describeWake(wake), address: `@${credential.member_id}` } : {}) });
 
   if (action === "show") return shown(credential.wake);
+  if (action === "limit") {
+    if (!credential.wake) throw localError("not_driven", "Set a wake before setting its execution limit.");
+    const duration = parseDuration(driver!, "wake limit");
+    if (!validTurnLimit(duration)) throw localError("invalid_arguments", "The turn limit must be between 1m and 24h.");
+    const wake = { ...credential.wake, turn_limit_ms: duration };
+    await writeRoomCredential(paths, { ...credential, wake });
+    return { ...shown(wake), applies: "next headless turn; does not extend a running turn" };
+  }
+  if (action === "checkpoint") {
+    if (!driver?.trim() || Buffer.byteLength(driver, "utf8") > 32_768) throw localError("invalid_arguments", "Progress must contain 1–32768 bytes of text.");
+    const path = checkpointPath(paths.stateDir, credential.room_id, credential.member_id);
+    await saveWakeProgress(path, { room_id: credential.room_id, member_id: credential.member_id, saved_at: dependencies.now().toISOString(), progress: driver });
+    return { ...seat, checkpoint_path: path, saved: true };
+  }
   if (action === "off") {
     const { wake: _dropped, ...kept } = credential;
     await writeRoomCredential(paths, kept);
@@ -3064,6 +3092,7 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
     driver,
     ...(driver === "command" ? {} : { session: session! }),
     cwd: before?.cwd ?? dependencies.cwd,
+    ...(credential.wake?.turn_limit_ms !== undefined ? { turn_limit_ms: credential.wake.turn_limit_ms } : {}),
     command: command ?? (driver === "codex" ? (onPath("codex", dependencies.env) ?? "codex") : (onPath("claude", dependencies.env) ?? "claude")),
     ...(driver === "codex" && home ? { codex_home: home } : {}),
     ...(driver === "claude-code" && live !== undefined ? { live_pid: live } : {}),
