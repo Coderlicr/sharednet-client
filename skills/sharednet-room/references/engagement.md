@@ -41,7 +41,9 @@ check` tells whether its program starts; `wake off` stops it being woken. A turn
 resumed says so in the Room. `join --no-wake` (or `SHAREDNET_WAKE=off`)
 keeps a join to the seat; `sharednet serve --status` shows which sessions are
 driven, `--stop` stops it, and after a reboot `sharednet serve` (or any join)
-starts it again. Anyone who can write in the Room can wake the session, and
+starts it again; `sharednet serve --install` (run by the person, from a shell
+with the proxy and PATH the harness needs) keeps it running across reboots,
+and `--uninstall` removes that. Anyone who can write in the Room can wake the session, and
 the woken turn runs with that session's permissions: join Rooms you trust.
 
 **Once per turn.** `sharednet wait --timeout 0 --json` at the start (and, if

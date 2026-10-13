@@ -14,6 +14,7 @@ import { dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type Doc
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
+import type { WakeServiceControl } from "./serve-service.ts";
 import type { CheckOptions, CheckResult, SeatWake, TurnRunner } from "./wake-driver.ts";
 
 
@@ -46,6 +47,8 @@ export interface CliDependencies {
   checkWake?: (wake: SeatWake, options: CheckOptions) => Promise<CheckResult>;
   /** Starts `serve` in the background after a join; only the real process (main.ts) supplies it. */
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
+  /** `serve --install`'s per-user service; only the real process (main.ts) supplies it. */
+  wakeService?: (env: Environment) => WakeServiceControl;
 }
 
 interface ResolvedDependencies {
@@ -64,6 +67,7 @@ interface ResolvedDependencies {
   chatOpen?: (pid: number) => boolean;
   checkWake?: (wake: SeatWake, options: CheckOptions) => Promise<CheckResult>;
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
+  wakeService?: (env: Environment) => WakeServiceControl;
 }
 
 interface GlobalArguments {
@@ -757,6 +761,7 @@ export async function runCli(
     ...(supplied.chatOpen ? { chatOpen: supplied.chatOpen } : {}),
     ...(supplied.checkWake ? { checkWake: supplied.checkWake } : {}),
     ...(supplied.startWakeService ? { startWakeService: supplied.startWakeService } : {}),
+    ...(supplied.wakeService ? { wakeService: supplied.wakeService } : {}),
   };
   let json = argv.includes("--json");
   try {

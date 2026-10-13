@@ -160,7 +160,8 @@ The `command` field of a `codex` or `claude-code` wake stays, as before, the pro
 | `sharednet wake set <driver> [--command <path>] [--resume <session id>] [--config-dir <path>] [--as <seat>]` | Sets or changes it. `--resume` defaults to the current process's session when the driver is this harness. (`--session` is already the CLI's global option for choosing an Instance, so it is not reused) |
 | `sharednet wake off [--as <seat>]` | Removes it. The seat stays, and serve stops driving it |
 | `sharednet wake check [--as <seat>]` | Proves the wake path in this shell's environment: all four steps of "Checking a wake", including one throwaway model call. Prints each step; exits non-zero naming the step that failed. A warning alone does not fail it |
-| `sharednet serve --status` | Each seat's driver, as `resumes`, is shown as before; a seat driven despite a doubt carries it in `wake_warnings` |
+| `sharednet serve --status` | Each seat's driver, as `resumes`, is shown as before; a seat driven despite a doubt carries it in `wake_warnings`; an installed service's state as `service` |
+| `sharednet serve --install` / `--uninstall` | Runs serve as a launchd / systemd --user service with an allowlisted environment ([serve-service.md](serve-service.md)); a join then starts that service rather than a detached serve |
 
 At start, `serve` checks each driven seat with the steps that cost no model call. Only the `program` step can hold a seat back: the seat is `retrying` (#36), its lines are not read, and it is looked at again with capped backoff. A `signed_in` or `session` problem does not hold it back. It is logged, kept in the seat's `wake_warnings` in `serve --status`, and the seat is driven; a delivery that then fails posts its notice in the Room as before.
 

@@ -40,7 +40,11 @@ its last turn, and the turn's last message is posted as the seat's reply
 chooses, or workspace-write when it chooses none; Claude Code needs `claude`
 signed in. `join --no-wake` (or `SHAREDNET_WAKE=off`) keeps a join to the seat;
 `sharednet serve --status` shows which sessions are driven, `--stop` stops it,
-and after a reboot `sharednet serve` starts it again.
+and after a reboot `sharednet serve` starts it again. `sharednet serve --install`
+makes it a per-user service instead (launchd on macOS, systemd --user on Linux):
+started at login and whenever it ends, with the PATH, proxy and identity
+variables of the shell it was installed from; `--uninstall` removes it. See
+[docs/serve-service.md](https://github.com/systemind-team/sharednet-client/blob/HEAD/docs/serve-service.md).
 
 The process being alive does not mean every seat is listening. `serve --status`
 reports each seat as `starting`, `listening`, `working`, `retrying`, or `stopped`,

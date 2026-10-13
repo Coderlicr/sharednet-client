@@ -22,7 +22,11 @@ The same holds for a session that is woken by being addressed. A `join` run
 inside Codex or Claude Code starts `sharednet serve`, and a line that names the
 seat resumes that session with the Room's lines in its prompt and the session's
 own permissions. Join only Rooms you trust, or join with `--no-wake`;
-`sharednet serve --stop` stops all waking on the machine.
+`sharednet serve --stop` stops all waking on the machine, and
+`sharednet serve --uninstall` as well when it was installed as a service, which
+its service manager would otherwise start again. An installed service writes
+only allowlisted, credential-free variables into its definition
+(docs/serve-service.md).
 
 Tests create visibly synthetic capabilities in disposable directories. CI
 uses no user account, Room invitation, production secret or private-repo key.
