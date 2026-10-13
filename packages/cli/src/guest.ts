@@ -54,6 +54,8 @@ export interface GuestDependencies {
   now: () => Date;
   /** Sleeps between server long-polls that time out. Tests shorten it. */
   sleep?: (ms: number) => Promise<void>;
+  /** Waits out a bounded rate-limit backoff in `trigger serve`; tests shorten it. */
+  backoff?: (ms: number) => Promise<void>;
   /** Runs the `watch --run` command; the default shells out. Tests capture it. */
   exec?: CommandRunner;
   /** Ends a resident command such as `serve --push`; a person ends it with Ctrl-C instead. */

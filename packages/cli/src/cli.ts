@@ -29,6 +29,8 @@ export interface CliDependencies {
   cwd?: string;
   /** Pause between empty long-polls in `wait`; tests shorten it. */
   sleep?: (ms: number) => Promise<void>;
+  /** Bounded rate-limit backoff in `trigger serve`; tests shorten it. */
+  backoff?: (ms: number) => Promise<void>;
   /** Opens the approve page during `login`; tests capture the URL instead. */
   openBrowser?: (url: string) => Promise<boolean>;
   /** Runs the `watch --run` command; tests capture it instead of shelling out. */
@@ -56,6 +58,7 @@ interface ResolvedDependencies {
   now: () => Date;
   cwd: string;
   sleep?: (ms: number) => Promise<void>;
+  backoff?: (ms: number) => Promise<void>;
   openBrowser?: (url: string) => Promise<boolean>;
   docker?: DockerRunner;
   cliEntry?: string;
@@ -748,6 +751,7 @@ export async function runCli(
     now: supplied.now ?? (() => new Date()),
     cwd: supplied.cwd ?? process.cwd(),
     ...(supplied.sleep ? { sleep: supplied.sleep } : {}),
+    ...(supplied.backoff ? { backoff: supplied.backoff } : {}),
     ...(supplied.openBrowser ? { openBrowser: supplied.openBrowser } : {}),
     ...(supplied.exec ? { exec: supplied.exec } : {}),
     ...(supplied.docker ? { docker: supplied.docker } : {}),

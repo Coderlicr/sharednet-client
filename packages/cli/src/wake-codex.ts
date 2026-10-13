@@ -117,7 +117,8 @@ export const codexPlugin: WakePlugin = {
     const summary = codexSummary(outcome.stdout);
     if (summary.ok && outcome.exitCode === 0) return { kind: "replied", reply: summary.said };
     if (!outcome.timedOut && ACTIVE_WRITER.test(`${outcome.stderr}\n${outcome.stdout}`)) {
-      if (context.headlessOnly) return { kind: "failed", why: "trigger_headless_required", detail: "The session has an active writer; queued delivery is unsupported.", timedOut: false };
+      if (context.headlessOnly && !context.beforeQueue) return { kind: "failed", why: "trigger_headless_required", detail: "The session has an active writer; queued delivery is unsupported.", timedOut: false };
+      await context.beforeQueue?.();
       const queued = await context.run(codexQueue(wake, input.livePrompt, context.env, input.memberId));
       if (queued.exitCode === 0 && !queued.timedOut) return { kind: "handed", note: `queued into its open Codex chat (thread ${wake.session})` };
       return {

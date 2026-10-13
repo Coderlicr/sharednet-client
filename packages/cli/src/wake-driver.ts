@@ -56,6 +56,12 @@ export interface WakeInput {
 export interface DeliveryContext {
   /** Durable consumers cannot acknowledge open-chat or queue handoffs. */
   headlessOnly?: boolean;
+  /**
+   * A durable consumer that tracks queued turns by receipt records its queue intent here, before the
+   * queue call: a lost answer is then known to be unknown and is never queued again. With it, a
+   * headless-only delivery may still queue.
+   */
+  beforeQueue?: () => Promise<void>;
   env: Environment;
   /** Runs one program to the end: the harness's turn, a `queue`, an adapter. Tests replace it. */
   run: TurnRunner;
