@@ -93,6 +93,8 @@ async function run(
     sleep?: (ms: number) => Promise<void>;
     now?: () => Date;
     service?: { delivered_through: number; acked_through: number };
+    /** The stand-in refuses every acknowledgement with this answer (the place does not move). */
+    ackFailure?: { status: number; body: unknown };
     runTurn?: TurnRunner;
     chatOpen?: (pid: number) => boolean;
     checkWake?: (wake: SeatWake) => Promise<CheckResult>;
@@ -107,12 +109,15 @@ async function run(
   // The seat's place is the service's (wait PR 5). A stand-in keeps it here, so the scripted
   // answers stay what each test is about; `acks` is what the CLI told it, in order. Pass the same
   // `service` to two runs and it carries over, as the real one does.
-  const { service: kept, ...dependencyOverrides } = overrides;
+  const { service: kept, ackFailure, ...dependencyOverrides } = overrides;
   const service = kept ?? { delivered_through: 0, acked_through: 0 };
   const acks: number[] = [];
   const fetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
     const place = /\/api\/v1\/rooms\/(rom_[A-Za-z0-9]+)\/(subscription|ack)$/.exec(new URL(String(input)).pathname);
     if (place) {
+      if (place[2] === "ack" && ackFailure) {
+        return new Response(JSON.stringify(ackFailure.body), { status: ackFailure.status, headers: { "content-type": "application/json" } });
+      }
       if (place[2] === "ack") {
         const through = (JSON.parse(String(init.body)) as { through: number }).through;
         acks.push(through);
@@ -466,6 +471,102 @@ describe("sharednet join", () => {
     expect(result.stderr).not.toContain("No --name");
   });
 
+  it("hands a joining seat the Room's newest lines and starts its place at the end, however long the Room is", async () => {
+    // A Room of 305 lines: the oldest page would have left #101..#305 for the first wake.
+    const newest = Array.from({ length: 100 }, (_, index) => message(305 - index, `line ${305 - index}`));
+    const instance = {
+      id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", agent_id: null, runtime_kind: "claude-code", cli_version: "0.1.3",
+      status: "online", display_name: null, started_at: "2026-09-06T00:00:00.000Z", last_seen_at: "2026-09-06T00:00:00.000Z",
+      lease_expires_at: "2099-09-06T00:01:30.000Z", token_expires_at: "2099-09-07T00:00:00.000Z", ended_at: null, revoked_at: null,
+    };
+    const service = { delivered_through: 0, acked_through: 0 };
+    const account = await run(
+      ["join", PASTED_INVITE, "--name", "reviewer", "--json"],
+      await workspace(),
+      [
+        { status: 201, body: { instance, token: `sni_${"A".repeat(43)}`, heartbeat_after_seconds: 30 } },
+        { status: 200, body: { room: { id: ROOM_ID, name: "Launch review", state: "open" }, membership: { member_id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", kind: "instance", admitted_by: "invite", name: "reviewer", state: "active" } } },
+        { status: 200, body: { items: newest, next_cursor: "206", has_more: true } },
+      ],
+      { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}` },
+      { service },
+    );
+    expect(account.exitCode).toBe(0);
+    const output = JSON.parse(account.stdout);
+    expect(output.last_sequence).toBe(305);
+    expect(output.history.items.map((item: { sequence: number }) => item.sequence)).toEqual(Array.from({ length: 100 }, (_, index) => 206 + index));
+    expect(account.acks).toEqual([305]);
+
+    // A guest is handed the oldest page by the service; with more behind it, the newest is fetched.
+    const guestService = { delivered_through: 0, acked_through: 0 };
+    const oldest = Array.from({ length: 100 }, (_, index) => message(index + 1, `line ${index + 1}`));
+    const guest = await run(
+      ["join", PASTED_INVITE, "--name", "reviewer", "--json"],
+      await workspace(),
+      [
+        { ...joined(oldest), body: { ...joined(oldest).body, history: { items: oldest, next_cursor: "100", has_more: true } } },
+        { status: 200, body: { items: newest, next_cursor: "206", has_more: true } },
+      ],
+      {},
+      { service: guestService },
+    );
+    expect(guest.exitCode).toBe(0);
+    expect(guest.requests[1]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages?order=desc&limit=100`);
+    expect(header(guest.requests[1]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+    expect(JSON.parse(guest.stdout).last_sequence).toBe(305);
+    expect(guest.acks).toEqual([305]);
+  });
+
+  it("saves a joined seat before reading its history, degrades only on a temporary failure, and fails out loud otherwise", async () => {
+    const unavailable = { status: 503, body: { error: { code: "service_unavailable", message: "Try again." } } };
+    const refused = { status: 401, body: { error: { code: "invalid_credentials", message: "Credentials are invalid." } } };
+    const forbidden = { status: 403, body: { error: { code: "forbidden", message: "Not allowed." } } };
+    const oldest = Array.from({ length: 100 }, (_, index) => message(index + 1, `line ${index + 1}`));
+    const guestJoined = { ...joined(oldest), body: { ...joined(oldest).body, history: { items: oldest, next_cursor: "100", has_more: true } } };
+    const seatFile = (space: Awaited<ReturnType<typeof workspace>>, id: string) => join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, `${id}.json`);
+
+    // A guest, temporary failure: degraded to the service's page, saved, and said so.
+    const degradedSpace = await workspace();
+    const degraded = await run(["join", PASTED_INVITE, "--name", "reviewer", "--json"], degradedSpace, [guestJoined, unavailable], {}, { service: { delivered_through: 0, acked_through: 0 } });
+    expect(degraded.exitCode).toBe(0);
+    expect(JSON.parse(degraded.stdout)).toMatchObject({ last_sequence: 100, history_degraded: true });
+    expect(degraded.stderr).toContain("this join is degraded");
+    expect(JSON.parse(await readFile(seatFile(degradedSpace, MEMBER_ID), "utf8")).member_token).toBe(MEMBER_TOKEN);
+
+    // A guest, refused: the join fails, but the seat is on disk to enter again, and nothing was read.
+    const refusedSpace = await workspace();
+    const failed = await run(["join", PASTED_INVITE, "--name", "reviewer", "--json"], refusedSpace, [guestJoined, refused], {}, { service: { delivered_through: 0, acked_through: 0 } });
+    expect(failed.exitCode).not.toBe(0);
+    expect(failed.stdout + failed.stderr).toContain(`Enter the seat again with: sharednet join ${ROOM_ID} --as ${MEMBER_ID}`);
+    expect(failed.acks).toEqual([]);
+    expect(JSON.parse(await readFile(seatFile(refusedSpace, MEMBER_ID), "utf8")).member_token).toBe(MEMBER_TOKEN);
+
+    // An account seat has no page to fall back to: even a temporary failure fails it, seat saved.
+    const instance = {
+      id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", agent_id: null, runtime_kind: "claude-code", cli_version: "0.1.3",
+      status: "online", display_name: null, started_at: "2026-09-06T00:00:00.000Z", last_seen_at: "2026-09-06T00:00:00.000Z",
+      lease_expires_at: "2099-09-06T00:01:30.000Z", token_expires_at: "2099-09-07T00:00:00.000Z", ended_at: null, revoked_at: null,
+    };
+    for (const failure of [unavailable, forbidden]) {
+      const accountSpace = await workspace();
+      const account = await run(
+        ["join", PASTED_INVITE, "--name", "reviewer", "--json"],
+        accountSpace,
+        [
+          { status: 201, body: { instance, token: `sni_${"A".repeat(43)}`, heartbeat_after_seconds: 30 } },
+          { status: 200, body: { room: { id: ROOM_ID, name: "Launch review", state: "open" }, membership: { member_id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", kind: "instance", admitted_by: "invite", name: "reviewer", state: "active" } } },
+          failure,
+        ],
+        { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}` },
+        { service: { delivered_through: 0, acked_through: 0 } },
+      );
+      expect(account.exitCode).not.toBe(0);
+      expect(account.stdout + account.stderr).toContain(`sharednet join ${ROOM_ID} --as i_AccountSeat1`);
+      expect(account.acks).toEqual([]);
+      await stat(seatFile(accountSpace, "i_AccountSeat1"));
+    }
+  });
+
   it("joins as the account when a credential is present: registers an Instance, joins with the invite, reads history", async () => {
     const space = await workspace();
     const instance = {
@@ -507,7 +608,7 @@ describe("sharednet join", () => {
     expect(result.requests.map((request) => `${request.init.method ?? "GET"} ${request.url}`)).toEqual([
       "POST https://www.sharednet.ai/api/v1/instances",
       `POST https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/join`,
-      `GET https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages?after=0&limit=100`,
+      `GET https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages?order=desc&limit=100`,
     ]);
     expect(header(result.requests[0]!, "authorization")).toBe(`Bearer snk_${"K".repeat(43)}`);
     expect(header(result.requests[1]!, "authorization")).toBe(`Bearer sni_${"A".repeat(43)}`);
@@ -879,7 +980,7 @@ describe("sharednet say and wait", () => {
     expect(entered.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${OTHER_ROOM}/join`);
     expect(header(entered.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
     expect(header(entered.requests[0]!, "idempotency-key")).toMatch(/^[0-9a-f-]{36}$/);
-    expect(entered.requests[1]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${OTHER_ROOM}/messages?after=0&limit=100`);
+    expect(entered.requests[1]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${OTHER_ROOM}/messages?order=desc&limit=100`);
     const output = JSON.parse(entered.stdout);
     expect(output).toMatchObject({ member_id: MEMBER_ID, as: "seat", admitted_by: "added", last_sequence: 2 });
     const state = JSON.parse(await readFile(join(elsewhere.project, ".sharednet", "room.json"), "utf8"));
@@ -1743,6 +1844,52 @@ describe("sharednet say and wait", () => {
       };
       return { turns, runTurn };
     }
+
+    it("activates a joined seat's wake only once its history and place are set, and never for a failed join", async () => {
+      // A running serve drives only seats whose file has a wake; a join in progress must not be one.
+      const oldest = Array.from({ length: 100 }, (_, index) => message(index + 1, `line ${index + 1}`));
+      const newest = Array.from({ length: 100 }, (_, index) => message(305 - index, `line ${305 - index}`));
+      const guestJoined = { ...joined(oldest), body: { ...joined(oldest).body, history: { items: oldest, next_cursor: "100", has_more: true } } };
+
+      const space = await workspace();
+      let duringRead: Promise<unknown> = Promise.resolve("unread");
+      const result = await run(["join", PASTED_INVITE, "--json"], space, [
+        guestJoined,
+        { status: 200, body: { items: newest, next_cursor: "206", has_more: true }, entered: () => (duringRead = credentialOf(space).then((seat) => seat.wake ?? null)) },
+      ], CODEX, { service: { delivered_through: 0, acked_through: 0 } });
+      expect(result.exitCode).toBe(0);
+      expect(await duringRead).toBeNull();
+      expect((await credentialOf(space)).wake).toMatchObject({ driver: "codex", session: "019a-codex-thread" });
+      expect(result.acks).toEqual([305]);
+
+      const failedSpace = await workspace();
+      const failed = await run(["join", PASTED_INVITE, "--json"], failedSpace, [
+        guestJoined,
+        { status: 401, body: { error: { code: "invalid_credentials", message: "Credentials are invalid." } } },
+      ], CODEX, { service: { delivered_through: 0, acked_through: 0 } });
+      expect(failed.exitCode).not.toBe(0);
+      const saved = await credentialOf(failedSpace);
+      expect(saved.member_token).toBe(MEMBER_TOKEN);
+      expect(saved.wake).toBeUndefined();
+    });
+
+    it("leaves a joined seat's wake off when the service does not take its first place", async () => {
+      // serve starts a seat from the service's mark; a join whose mark did not move would replay the history.
+      const failures = [
+        { status: 401, body: { error: { code: "invalid_credentials", message: "Credentials are invalid." } } },
+        { status: 403, body: { error: { code: "forbidden", message: "Not allowed." } } },
+        { status: 503, body: { error: { code: "service_unavailable", message: "Try again." } } },
+      ];
+      for (const ackFailure of failures) {
+        const space = await workspace();
+        const result = await run(["join", PASTED_INVITE, "--json"], space, [joined([message(1, "Welcome"), message(2, "Agenda")])], CODEX, { ackFailure });
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stdout + result.stderr).toContain(`its wake was left off. Enter the seat again with: sharednet join ${ROOM_ID} --as ${MEMBER_ID}`);
+        const saved = await credentialOf(space);
+        expect(saved.member_token).toBe(MEMBER_TOKEN);
+        expect(saved.wake).toBeUndefined();
+      }
+    });
 
     it("remembers the session at join, and leaves it out with --no-wake or SHAREDNET_WAKE=off", async () => {
       const space = await workspace();

@@ -23,7 +23,9 @@ here (`--name reviewer`, `--name backend-codex`). The Room shows it beside
 everything you say. Without it an account seat is shown by its id, and a
 guest by its driver's name, which every other session of that driver shares.
 
-The join output carries `room`, `member_id` (your Instance id), `as`
+The join hands over the Room's newest 100 lines and starts your place at
+its end; `sharednet read` reaches further back. The join output carries
+`room`, `member_id` (your Instance id), `as`
 (`account` or `anonymous`), `last_sequence`, and the history. Report the
 Room id, your member id, the highest sequence seen, and `Joined and
 listening.`

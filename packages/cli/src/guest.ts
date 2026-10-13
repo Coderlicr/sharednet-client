@@ -400,7 +400,6 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   if (!payload.room?.id || !memberId || !memberToken || !Array.isArray(payload.history?.items)) {
     throw invalidServerResponse();
   }
-
   const credential: StoredRoomCredential = {
     schema_version: 1,
     base_url: baseUrl,
@@ -412,19 +411,25 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     room_type: payload.room.type === "compiled" ? "compiled" : "board",
     ...(wake ? { wake } : {}),
   };
-  await writeRoomCredential(paths, credential);
+  // Saved before anything else can fail: the service has seated this join, and its token is shown once.
+  await writeRoomCredential(paths, unwoken(credential));
+  // The service hands a guest the Room's oldest page; when there is more, the newest is what to hand over.
+  const { history, degraded } = payload.history.has_more
+    ? await readJoinHistory(client, payload.room.id, memberToken, memberId, payload.history, dependencies)
+    : { history: payload.history, degraded: false };
   const state: ProjectRoomState = {
     schema_version: 1,
     base_url: baseUrl,
     room_id: payload.room.id,
     member_id: memberId,
-    last_sequence: highestSequence(payload.history.items, 0),
+    last_sequence: highestSequence(history.items, 0),
   };
   await writeProjectRoomState(dependencies.cwd, state, {
     anchorKey: await anchorKeyFor(dependencies.env, paths),
     joinedAt: credential.joined_at,
   });
-  await historyHandled(client, payload.room.id, memberToken, state.last_sequence, dependencies);
+  await historyHandled(client, payload.room.id, memberToken, state.last_sequence, memberId, dependencies);
+  if (credential.wake) await writeRoomCredential(paths, credential);
   // The one moment to say it: this seat belongs to nobody yet.
   dependencies.stderr?.(
     `Joined ${payload.room.id} as ${memberId}, an anonymous seat. Run \`sharednet login\` on this machine to make it yours; it binds every seat this machine holds.\n`,
@@ -441,7 +446,8 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     as: "anonymous",
     name,
     last_sequence: state.last_sequence,
-    history: payload.history,
+    history,
+    ...(degraded ? { history_degraded: true } : {}),
     ...(woken ? { wake: woken } : {}),
   };
 }
@@ -517,12 +523,6 @@ async function enterAsSeat(
     { "idempotency-key": randomUUID() },
   );
   if (!payload.room?.id || !payload.membership?.member_id) throw invalidServerResponse();
-  const history = await client.request<PageShape>(
-    "GET",
-    `/rooms/${encodeURIComponent(roomId)}/messages?after=0&limit=100`,
-    seat.member_token,
-  );
-  if (!Array.isArray(history?.items)) throw invalidServerResponse();
   // The session entering is the one to wake; a seat entered from no session keeps the one it had.
   const { wake: previous, ...held } = seat;
   const wake = choice.wakeOff ? null : (choice.wake ?? previous ?? null);
@@ -534,7 +534,8 @@ async function enterAsSeat(
     room_type: payload.room.type === "compiled" ? "compiled" : "board",
     ...(wake ? { wake } : {}),
   };
-  await writeRoomCredential(paths, entered);
+  await writeRoomCredential(paths, unwoken(entered));
+  const { history } = await readJoinHistory(client, payload.room.id, seat.member_token, payload.membership.member_id, null, dependencies);
   const state: ProjectRoomState = {
     schema_version: 1,
     base_url: baseUrl,
@@ -546,7 +547,8 @@ async function enterAsSeat(
     anchorKey: await anchorKeyFor(dependencies.env, paths),
     joinedAt: dependencies.now().toISOString(),
   });
-  await historyHandled(client, payload.room.id, seat.member_token, state.last_sequence, dependencies);
+  await historyHandled(client, payload.room.id, seat.member_token, state.last_sequence, payload.membership.member_id, dependencies);
+  if (entered.wake) await writeRoomCredential(paths, entered);
   const woken = await wakeAfterJoin(entered, `@${payload.membership.member_id}`, paths, dependencies);
   return {
     room: payload.room,
@@ -596,13 +598,6 @@ async function joinAsAccount(
     { "idempotency-key": randomUUID() },
   );
   if (!payload.room?.id || !payload.membership?.member_id) throw invalidServerResponse();
-  const history = await client.request<PageShape>(
-    "GET",
-    `/rooms/${encodeURIComponent(roomId)}/messages?after=0&limit=100`,
-    session.instance_token,
-  );
-  if (!Array.isArray(history?.items)) throw invalidServerResponse();
-
   // The seat file mirrors the session so say/wait need no second lookup; the
   // session file stays the source of a fresh token when the lease is renewed.
   const credential: StoredRoomCredential = {
@@ -616,7 +611,8 @@ async function joinAsAccount(
     room_type: payload.room.type === "compiled" ? "compiled" : "board",
     ...(wake ? { wake } : {}),
   };
-  await writeRoomCredential(paths, credential);
+  await writeRoomCredential(paths, unwoken(credential));
+  const { history } = await readJoinHistory(client, payload.room.id, session.instance_token, session.instance_id, null, dependencies);
   const state: ProjectRoomState = {
     schema_version: 1,
     base_url: baseUrl,
@@ -628,7 +624,8 @@ async function joinAsAccount(
     anchorKey: session.local_instance_key ?? (await anchorKeyFor(dependencies.env, paths)),
     joinedAt: dependencies.now().toISOString(),
   });
-  await historyHandled(client, payload.room.id, session.instance_token, state.last_sequence, dependencies);
+  await historyHandled(client, payload.room.id, session.instance_token, state.last_sequence, session.instance_id, dependencies);
+  if (credential.wake) await writeRoomCredential(paths, credential);
   dependencies.stderr?.(
     `Seat ${session.instance_id} in ${payload.room.id}. Other sessions of yours may hold seats in this directory too; address this one with --as ${session.instance_id}.\n`,
   );
@@ -1046,11 +1043,83 @@ async function everythingSaid(
   return items;
 }
 
+/** How much of a Room a join hands over: its newest lines, at most this many. */
+const JOIN_HISTORY = 100;
+
+/**
+ * The history a join hands over: the newest lines, oldest first, so the seat's place starts at the
+ * Room's end. Its oldest lines would put the place there instead, and the first wake would carry
+ * everything said since, however much that is; `sharednet read` reaches back further on request.
+ */
+async function latestHistory(client: ApiClient, roomId: string, token: string): Promise<PageShape> {
+  const page = await client.request<PageShape>("GET", `/rooms/${encodeURIComponent(roomId)}/messages?order=desc&limit=${JOIN_HISTORY}`, token);
+  if (!Array.isArray(page?.items)) throw invalidServerResponse();
+  return { ...page, items: [...page.items].sort((a, b) => a.sequence - b.sequence) };
+}
+
+/**
+ * A seat file without its wake. A join saves this first, so the seat is never lost, and a running
+ * `serve` (which drives only seats with a wake) leaves it alone until the join has read its history and
+ * set its place; only then is the wake written, and a failed join never activates one.
+ */
+function unwoken(credential: StoredRoomCredential): StoredRoomCredential {
+  const { wake: _activatedLater, ...rest } = credential;
+  return rest;
+}
+
+/** Transport trouble and 5xx (exit 5) or a rate limit: the next try may work. */
+function temporaryFailure(error: CliError): boolean {
+  return error.exitCode === 5 || error.code === "rate_limited";
+}
+
+/**
+ * The newest history for a seat that is already joined and saved. A temporary failure falls back to
+ * the page the service handed over with the join, when there is one, and says the join is degraded:
+ * its place is that page's end, and the next wake carries the rest. Anything else (a refusal, or no
+ * page to fall back to) fails the join out loud, naming the saved seat to enter again.
+ */
+async function readJoinHistory(
+  client: ApiClient,
+  roomId: string,
+  token: string,
+  seatId: string,
+  fallback: PageShape | null,
+  dependencies: GuestDependencies,
+): Promise<{ history: PageShape; degraded: boolean }> {
+  try {
+    return { history: await latestHistory(client, roomId, token), degraded: false };
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    if (fallback !== null && temporaryFailure(error)) {
+      dependencies.stderr?.(`The Room's newest lines could not be read (${error.code}), so this join is degraded: it hands over the service's first page instead, and the next wake carries everything after it.\n`);
+      return { history: fallback, degraded: true };
+    }
+    throw new CliError(
+      error.code,
+      `Joined ${roomId} as ${seatId} and saved the seat, but its history could not be read (${error.code}: ${error.message}). Nothing was marked as read. Enter the seat again with: sharednet join ${roomId} --as ${seatId}`,
+      error.exitCode,
+      error.requestId,
+    );
+  }
+}
+
 /** A join hands over the history it returns, so the seat's place starts after it, as the MCP join's does. */
-async function historyHandled(client: ApiClient, roomId: string, token: string, through: number, dependencies: GuestDependencies): Promise<void> {
+async function historyHandled(client: ApiClient, roomId: string, token: string, through: number, seatId: string, dependencies: GuestDependencies): Promise<void> {
   if (through <= 0) return;
   const sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  await acknowledgeThrough(client, roomId, token, through, sleep, dependencies);
+  // Strict, unlike acknowledgeThrough elsewhere: a running serve starts a seat from the service's mark,
+  // so a join whose mark did not move must not turn the wake on, or the history would be replayed.
+  try {
+    await pollThroughBlips(() => client.request("POST", `/rooms/${encodeURIComponent(roomId)}/ack`, token, { through }), sleep, dependencies);
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    throw new CliError(
+      error.code,
+      `Joined ${roomId} as ${seatId} and saved the seat, but the service did not take its place through ${through} (${error.code}: ${error.message}), so its wake was left off. Enter the seat again with: sharednet join ${roomId} --as ${seatId}`,
+      error.exitCode,
+      error.requestId,
+    );
+  }
 }
 
 /**
