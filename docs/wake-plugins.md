@@ -203,16 +203,25 @@ Do not rejoin and create a second seat to update that binding.
 
 ## Release 0.1.16
 
-Includes client #25 and #27. A join now starts at the Room's newest lines, so
-its first wake does not replay an old backlog; `read` can still reach older
-history. New listeners give headless turns 40 minutes by default. A local
+Includes client #25, #27, #36, and #37. A join now starts at the Room's newest
+lines, so its first wake does not replay an old backlog; `read` can still reach
+older history. New listeners give headless turns 40 minutes by default. A local
 operator can set a per-seat limit with `sharednet wake limit`, inspect it with
 `wake show`, and save private recovery notes with
-`sharednet wake checkpoint`. See [joining and
-inviting](rooms-join-and-invite.md) and the execution-budget section below for
-failure and recovery details. Existing listeners need a
+`sharednet wake checkpoint`.
+
+An open Codex chat keeps each handed-over wake in local pending state until the
+chat explicitly settles it with `sharednet handed settle`; `sharednet handed
+--json` lists unresolved hand-overs for monitoring. If a wake-program check
+fails, `serve` now reports the seat as `retrying` and probes again with bounded
+backoff instead of leaving the seat stopped until restart. It does not read or
+acknowledge that seat's Room messages before the check succeeds.
+
+See [joining and inviting](rooms-join-and-invite.md) and the execution-budget
+section below for failure and recovery details. Existing listeners need a
 host-managed restart to load the new behavior. Publish only from the merged
-release commit and verify npm `latest`; no server migration or new runtime
+release commit and verify npm `latest`. The handed-over wake state and command
+are local only; no server migration, minimum-server change, or new runtime
 dependency is required.
 
 ## Release 0.1.15
