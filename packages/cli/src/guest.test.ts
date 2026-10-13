@@ -98,6 +98,7 @@ async function run(
     runTurn?: TurnRunner;
     chatOpen?: (pid: number) => boolean;
     checkWake?: (wake: SeatWake) => Promise<CheckResult>;
+    signal?: AbortSignal;
     startWakeService?: (input: { env: Record<string, string | undefined>; logFile: string }) => number | null;
   } = {},
 ) {
@@ -2351,19 +2352,77 @@ describe("sharednet say and wait", () => {
       expect(result.acks).toEqual([2]);
     });
 
-    it("does not drive a seat whose wake program does not start, and reads none of its lines", async () => {
+    it("reads none of a seat's lines while its wake program does not start, and looks again until it does", async () => {
       const space = await workspace();
       expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
       const { turns, runTurn } = answersOf();
-      const result = await run(["serve", "--json"], space, [], CODEX, {
+      const looks = [
+        { ok: false, message: "codex --version did not answer within 5s" },
+        { ok: false, message: "codex --version exited 1: Error: spawn ENOENT" },
+        { ok: true },
+      ];
+      const slept: number[] = [];
+      const result = await run(["serve", "--json"], space, [revoked()], CODEX, {
         runTurn,
-        checkWake: async () => ({ ok: false, message: "codex --version exited 1: Error: spawn ENOENT" }),
+        checkWake: async () => looks.shift() as CheckResult,
+        sleep: async (ms) => {
+          slept.push(ms);
+        },
       });
 
-      expect(result.requests).toHaveLength(0);
+      // Two failed looks, 30 s then 60 s apart; nothing was read or acknowledged meanwhile.
+      expect(slept.slice(0, 2)).toEqual([30_000, 60_000]);
+      expect(result.stderr).toContain(`not driven: codex --version did not answer within 5s. Looking again in 30s; repair it and check with \`sharednet wake check --as ${MEMBER_ID}\``);
+      expect(result.stderr).toContain("Looking again in 60s");
+      // The third look passed, so the seat was listened to (and the service then refused it).
+      expect(result.stderr).toContain("wakes codex 019a-codex-thread when addressed");
+      expect(result.requests.length).toBeGreaterThan(0);
       expect(turns).toHaveLength(0);
       expect(result.acks).toEqual([]);
-      expect(result.stderr).toContain(`not driven: codex --version exited 1: Error: spawn ENOENT. Repair it, check with \`sharednet wake check --as ${MEMBER_ID}\``);
+    });
+
+    it("parks a wake turned off during startup retry, then checks its replacement without restarting serve", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const checked: string[] = [];
+      let slept = 0;
+      const result = await run(["serve", "--json"], space, [revoked()], CODEX, {
+        checkWake: async (wake) => {
+          checked.push(wake.command);
+          return checked.length === 1 ? { ok: false, message: "codex is temporarily unavailable" } : { ok: true };
+        },
+        sleep: async () => {
+          slept += 1;
+          if (slept === 1) expect((await run(["wake", "off", "--json"], space, [])).exitCode).toBe(0);
+          if (slept === 2) expect((await run(["wake", "set", "command", "--command", "/opt/bots/replacement", "--json"], space, [])).exitCode).toBe(0);
+        },
+      });
+
+      expect(checked).toEqual(["codex", "/opt/bots/replacement"]);
+      expect(result.stderr).toContain("wakes command /opt/bots/replacement when addressed");
+    });
+
+    it("stops promptly when startup retry is cancelled during its backoff", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const controller = new AbortController();
+      let retrying!: () => void;
+      const enteredRetry = new Promise<void>((resolve) => (retrying = resolve));
+      const serving = run(["serve", "--json"], space, [], CODEX, {
+        signal: controller.signal,
+        checkWake: async () => ({ ok: false, message: "codex is unavailable" }),
+        sleep: async () => {
+          retrying();
+          await new Promise<void>(() => undefined);
+        },
+      });
+      await enteredRetry;
+      controller.abort();
+
+      const result = await serving;
+      expect(result.exitCode).toBe(0);
+      expect(result.requests).toHaveLength(0);
+      expect(result.stderr).toContain("Looking again in 30s");
     });
 
     it("drives a seat with any adapter a person set, and says back what it prints", async () => {

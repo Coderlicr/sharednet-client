@@ -2588,6 +2588,9 @@ async function saveWakeProgress(path: string, value: unknown): Promise<void> {
  * and still carries everything said meanwhile.
  */
 const MAX_TURNS_PER_HOUR = 30;
+/** A wake program that did not start is looked at again after this, doubling up to the cap. */
+const CHECK_RETRY_MS = 30_000;
+const CHECK_RETRY_MAX_MS = 600_000;
 /** The service takes a message of at most this many bytes. */
 const MAX_MESSAGE_BYTES = 32_768;
 
@@ -2689,6 +2692,30 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const stopping = new AbortController();
   const stop = () => stopping.abort();
   dependencies.signal?.addEventListener("abort", stop, { once: true });
+  /** A startup retry must not keep an installed service alive for the full backoff after shutdown. */
+  const retryDelay = async (ms: number): Promise<void> => {
+    if (stopping.signal.aborted) return;
+    if (dependencies.sleep) {
+      let stopped!: () => void;
+      const aborted = new Promise<void>((resolve) => (stopped = resolve));
+      stopping.signal.addEventListener("abort", stopped, { once: true });
+      try {
+        await Promise.race([sleep(ms), aborted]);
+      } finally {
+        stopping.signal.removeEventListener("abort", stopped);
+      }
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(done, ms);
+      function done() {
+        clearTimeout(timer);
+        stopping.signal.removeEventListener("abort", done);
+        resolve();
+      }
+      stopping.signal.addEventListener("abort", done, { once: true });
+    });
+  };
   let doorbell: Awaited<ReturnType<typeof openDoorbell>> | null = null;
   let base: string | null = null;
   try {
@@ -2717,11 +2744,28 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     if (driving) {
       // A program that cannot start would take every wake and answer none (#20): look once, first,
       // and leave the seat's lines unread when it does not start.
-      const checked = await checkWake(seat.wake!);
-      if (!checked.ok) {
-        dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} (${me}) not driven: ${checked.message}. Repair it, check with \`sharednet wake check --as ${me}\`, and restart serve.\n`);
-        await setHealth(seat, "stopped", "wake_command_unavailable");
-        return;
+      // A failed look is often passing (a slow `--version`, a busy machine), so it is tried again,
+      // backing off to every 10 minutes, rather than leaving the seat unheard until serve restarts.
+      for (let attempt = 0; ; attempt += 1) {
+        const wake = (await readRoomCredential(paths, seat.room_id, seat.member_id))?.wake;
+        if (!wake) {
+          await setHealth(seat, "stopped");
+          await retryDelay(RESCAN_MS);
+          if (stopping.signal.aborted) return;
+          attempt = -1;
+          continue;
+        }
+        const checked = await checkWake(wake);
+        if (checked.ok) {
+          // The repair may have replaced the command or session while serve was retrying.
+          seat.wake = wake;
+          break;
+        }
+        const delay = Math.min(CHECK_RETRY_MS * 2 ** attempt, CHECK_RETRY_MAX_MS);
+        dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} (${me}) not driven: ${checked.message}. Looking again in ${Math.round(delay / 1000)}s; repair it and check with \`sharednet wake check --as ${me}\`.\n`);
+        await setHealth(seat, "retrying", "wake_command_unavailable");
+        await retryDelay(delay);
+        if (stopping.signal.aborted) return;
       }
       dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} (${me}) wakes ${describeWake(seat.wake!)} when addressed\n`);
     }
