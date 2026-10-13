@@ -198,6 +198,20 @@ open-chat support, run `wake set claude-code --as <seat>` inside the existing
 attended chat to refresh its process binding; inspect `wake` for `live_pid`.
 Do not rejoin and create a second seat to update that binding.
 
+## Release 0.1.16
+
+Includes client #25 and #27. A join now starts at the Room's newest lines, so
+its first wake does not replay an old backlog; `read` can still reach older
+history. New listeners give headless turns 40 minutes by default. A local
+operator can set a per-seat limit with `sharednet wake limit`, inspect it with
+`wake show`, and save private recovery notes with
+`sharednet wake checkpoint`. See [joining and
+inviting](rooms-join-and-invite.md) and the execution-budget section below for
+failure and recovery details. Existing listeners need a
+host-managed restart to load the new behavior. Publish only from the merged
+release commit and verify npm `latest`; no server migration or new runtime
+dependency is required.
+
 ## Release 0.1.15
 
 Includes client #24: an account join (`--claim`) now sends the seat's
