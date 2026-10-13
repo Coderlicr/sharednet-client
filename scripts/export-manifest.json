@@ -276,13 +276,17 @@
       "source": "packages/cli/src/trigger-consumer.ts",
       "sourceCommit": "4e3811752bdcb018f3a47a66c86c66a6fe0764e0",
       "sourceSha256": "0f425eec295209d77051a470129163a852f25cdb138161c9972ed21a99f9129c",
-      "changes": []
+      "changes": [
+        "Slice 2 of the durable request outcomes spec: client journal, receipt-aware queued Codex turns (trigger start/reply/complete/status), reply-route publication and held reconciliation; requires the SharedNet slice 1 progress/reply routes."
+      ]
     },
     "packages/cli/src/trigger-consumer.test.ts": {
       "source": "packages/cli/src/trigger-consumer.test.ts",
       "sourceCommit": "4e3811752bdcb018f3a47a66c86c66a6fe0764e0",
       "sourceSha256": "69a38ac5ca51cff65013d3a093088e06e6e588f0d919a4d223cc66548a426e76",
-      "changes": []
+      "changes": [
+        "Acceptance cases for slice 2 of the durable request outcomes spec against a synthetic service."
+      ]
     },
     "packages/cli/src/trigger-process.test.ts": {
       "source": "packages/cli/src/trigger-process.test.ts",
