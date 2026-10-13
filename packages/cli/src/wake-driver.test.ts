@@ -53,7 +53,7 @@ describe("the session a seat remembers", () => {
       command: "codex",
       codex_home: "/h",
     });
-    expect(parseSeatWake({ driver: "cursor", session: "s", cwd: "/w", command: "x" })).toBeUndefined();
+    expect(parseSeatWake({ driver: "gemini-cli", session: "s", cwd: "/w", command: "x" })).toBeUndefined();
     expect(parseSeatWake({ driver: "codex", session: "", cwd: "/w", command: "codex" })).toBeUndefined();
     expect(parseSeatWake("codex")).toBeUndefined();
     expect(parseSeatWake(undefined)).toBeUndefined();

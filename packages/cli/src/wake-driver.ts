@@ -11,7 +11,7 @@ import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
  * `sharednet serve` hands the wake to the seat's plugin, which delivers it: resumes the session, hands
  * it to the session that is open, or leaves it to that session. The plugin says which as a Delivery;
  * serve alone decides what that means for the Room (post, acknowledge, retry). Plugins: wake-codex.ts,
- * wake-claude.ts, wake-command.ts; the registry is wake-plugins.ts.
+ * wake-claude.ts, wake-cursor.ts, wake-command.ts; the registry is wake-plugins.ts.
  */
 
 export type Environment = Record<string, string | undefined>;
@@ -21,11 +21,11 @@ export function validTurnLimit(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 60_000 && value <= 24 * 60 * 60_000;
 }
 
-export type WakeDriver = "codex" | "claude-code" | "codebuddy" | "command";
+export type WakeDriver = "codex" | "claude-code" | "codebuddy" | "cursor" | "command";
 
 export interface SeatWake {
   driver: WakeDriver;
-  /** The harness's own session id: what `codex exec resume` and `claude --resume` take. A command has none. */
+  /** The harness's own session id: what `codex exec resume`, `claude --resume` and `agent --resume` take. A command has none. */
   session?: string;
   /** Where the session worked when it joined; a delivery runs there. */
   cwd: string;

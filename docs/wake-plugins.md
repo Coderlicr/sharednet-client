@@ -136,9 +136,18 @@ Code's headless mode (<https://www.workbuddy.ai/docs/cli/headless>, <https://www
 - **Still not verified live:** resuming a conversation the desktop app made *without* `--fork-session` while the app is closed, and
   `--output-format json` as a single object (it was an array on 2.106.4; both forms parse).
 
+### `cursor`
+
+A chat of the Cursor Agent CLI (`agent`, also `cursor-agent`). It wakes **CLI chats only**: not the Cursor editor's chats, and not Grok Bot (a Bot's conversation is not an `agent` chat and has no resume primitive; see the webhook route under `command`).
+
+- **set by:** `sharednet wake set cursor --resume <chat id>` (`agent create-chat` prints a new id, `agent ls` lists them). It is never captured by `join`: the only id the Cursor markers carry, `CURSOR_TRACE_ID`, names the editor.
+- **deliver:** run `agent -p --resume <chat id> --output-format json --trust <prompt>` in the seat's directory. The one `{"type":"result","is_error":false,"result":…}` object on standard output is the reply (outcome `replied`); a non-zero exit (no JSON is printed then), an `is_error` result or a missing result is `failed`. It needs the CLI signed in (`agent login`) or `CURSOR_API_KEY` in serve's environment.
+- **permissions:** none added. There is no `--force`; the person's own settings apply. For more, point `--command` at a launcher script that adds the flags they choose (`--force`, `--sandbox`, `--model`), as for Codex.
+- **not verified against a real Cursor CLI** (none was installed when this was written): the argument form, `--trust`, prompt as an argument rather than standard input, and whether a chat open in a Cursor terminal refuses a second writer are read from https://cursor.com/docs/cli/reference/parameters.md and /cli/reference/output-format.md. There is therefore no `handed` or `left` outcome yet. The prompt is cut to 100 KiB to fit one argument.
+
 ### `command`
 
-This is the extension point: any harness or bot without a built-in plugin (Cursor, OpenHands, Gemini CLI, a team script).
+This is the extension point: any harness or bot without a built-in plugin (OpenHands, Gemini CLI, Grok Bot through a routine webhook, a team script).
 
 - **set by:** `sharednet wake set command --command <path> [--as <seat>]`. It is never captured by `join`.
 - **deliver:** run `<path>` in `cwd`, with the same wake JSON on stdin that `serve --run` hands its command: `{ room_id, member_id, trigger, messages, prompt }`. The environment carries `SHAREDNET_SEAT` and `SHAREDNET_ROOM_ID`.
@@ -149,7 +158,7 @@ This is the extension point: any harness or bot without a built-in plugin (Curso
 
   So an adapter can express everything a built-in plugin can.
 
-The `command` field of a `codex` or `claude-code` wake stays, as before, the program that plugin calls. That is how a launcher script with the owner's chosen permissions (`codex-room-bypass.sh`) stands in for `codex`. `wake set codex --command <script>` now sets it, instead of editing the seat file by hand.
+The `command` field of a `codex` or `claude-code` wake stays, as before, the program that plugin calls. That is how a launcher script with the owner's chosen permissions (`codex-room-bypass.sh`) stands in for `codex`. The same holds for `cursor`. `wake set codex --command <script>` now sets it, instead of editing the seat file by hand.
 
 ## CLI
 
@@ -193,6 +202,7 @@ At start, `serve` checks each driven seat with the steps that cost no model call
 | `wake-codex.ts` | The `codex` plugin |
 | `wake-claude.ts` | The `claude-code` plugin, including `chatOpen` |
 | `wake-codebuddy.ts` | The `codebuddy` plugin (CodeBuddy CLI and WorkBuddy) |
+| `wake-cursor.ts` | The `cursor` plugin |
 | `wake-command.ts` | The `command` plugin |
 | `guest.ts` | `serve` maps a `Delivery` to post, acknowledge and retry. `join` asks the registry. `wake` is the new verb |
 

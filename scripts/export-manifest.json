@@ -71,7 +71,9 @@
       "source": "packages/cli/src/wake-driver.test.ts",
       "sourceCommit": "3d66c5ebdd3d6ea0f08d3806ad442a10699445e6",
       "sourceSha256": "51c6c2cc8e93f4fbc95edac16723872625ff89f8c9276c89b4f448becef22781",
-      "changes": []
+      "changes": [
+        "Client-only: add the `cursor` wake driver (wake-cursor.ts); to be ported to the service repository in its own PR."
+      ]
     },
     "packages/cli/src/api-client.ts": {
       "source": "packages/cli/src/api-client.ts",
@@ -116,7 +118,8 @@
       "changes": [
         "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is a143227d6f7e0ff9c81c6639330cd600e94cec4e8d626fa4a40d769336c07e7b.",
         "Port hosted runtime declarations and Muse detection from SharedNet #163; real handler coverage remains in the service repository.",
-        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary.",
+        "Client-only: add the `cursor` wake driver (wake-cursor.ts); to be ported to the service repository in its own PR."
       ]
     },
     "packages/cli/src/instance-computation.ts": {
@@ -168,7 +171,9 @@
       "source": "packages/cli/src/wake-driver.ts",
       "sourceCommit": "3d66c5ebdd3d6ea0f08d3806ad442a10699445e6",
       "sourceSha256": "0ff3e83e092d9354f40373a2ff5cd8136c1af13c7784c8100caaba7df87ada47",
-      "changes": []
+      "changes": [
+        "Client-only: add the `cursor` wake driver (wake-cursor.ts); to be ported to the service repository in its own PR."
+      ]
     },
     "packages/cli/bin/sharednet.js": {
       "source": "packages/cli/bin/sharednet.js",
@@ -346,6 +351,8 @@
     "packages/cli/src/wake-command.ts",
     "docs/rooms-join-and-invite.md",
     "packages/cli/src/wake-codebuddy.ts",
-    "packages/cli/src/wake-codebuddy.test.ts"
+    "packages/cli/src/wake-codebuddy.test.ts",
+    "packages/cli/src/wake-cursor.ts",
+    "packages/cli/src/wake-cursor.test.ts"
   ]
 }

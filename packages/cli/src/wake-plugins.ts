@@ -3,13 +3,14 @@ import { codebuddyPlugin } from "./wake-codebuddy.ts";
 import { codexPlugin } from "./wake-codex.ts";
 import { commandPlugin } from "./wake-command.ts";
 import { validTurnLimit } from "./wake-driver.ts";
+import { cursorPlugin } from "./wake-cursor.ts";
 import type { Environment, SeatWake, WakeDriver, WakePlugin } from "./wake-driver.ts";
 
 /**
  * The wake plugins (docs/wake-plugins.md). A harness is one module and one line here; `serve` and
  * `join` only ever ask the registry.
  */
-export const wakePlugins: readonly WakePlugin[] = [codexPlugin, claudePlugin, codebuddyPlugin, commandPlugin];
+export const wakePlugins: readonly WakePlugin[] = [codexPlugin, claudePlugin, codebuddyPlugin, cursorPlugin, commandPlugin];
 
 export function pluginFor(driver: WakeDriver): WakePlugin {
   const plugin = wakePlugins.find((candidate) => candidate.driver === driver);

@@ -3427,7 +3427,7 @@ async function timer(args: string[], dependencies: GuestDependencies): Promise<u
 }
 
 const WAKE_USAGE =
-  "Usage: sharednet wake [--as <i_…>], sharednet wake set codex|claude-code|codebuddy|command [--command <path>] [--resume <session>] [--config-dir <path>] [--as <i_…>], sharednet wake off [--as <i_…>], sharednet wake check [--as <i_…>], sharednet wake limit <1m..24h> [--as <i_…>], or sharednet wake checkpoint <progress> [--as <i_…>]";
+  "Usage: sharednet wake [--as <i_…>], sharednet wake set codex|claude-code|codebuddy|cursor|command [--command <path>] [--resume <session>] [--config-dir <path>] [--as <i_…>], sharednet wake off [--as <i_…>], sharednet wake check [--as <i_…>], sharednet wake limit <1m..24h> [--as <i_…>], or sharednet wake checkpoint <progress> [--as <i_…>]";
 
 /**
  * A seat's wake, by hand (docs/wake-plugins.md): which plugin delivers it, what it resumes, the
@@ -3485,7 +3485,7 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
     return { ...shown(wake), check: checked.message, ...(checked.steps ? { steps: checked.steps } : {}) };
   }
 
-  if (!isWakeDriver(driver)) throw localError("invalid_arguments", `The wake drivers are codex, claude-code, codebuddy and command. ${WAKE_USAGE}`);
+  if (!isWakeDriver(driver)) throw localError("invalid_arguments", `The wake drivers are codex, claude-code, codebuddy, cursor and command. ${WAKE_USAGE}`);
   // What this process is, when it is the harness being set: its session, its program, its open chat.
   const here = pluginFor(driver).capture(dependencies.env, dependencies.cwd);
   const before = credential.wake?.driver === driver ? credential.wake : undefined;
@@ -3505,7 +3505,15 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
     ...(driver === "command" ? {} : { session: session! }),
     cwd: before?.cwd ?? dependencies.cwd,
     ...(credential.wake?.turn_limit_ms !== undefined ? { turn_limit_ms: credential.wake.turn_limit_ms } : {}),
-    command: command ?? (driver === "codex" ? (onPath("codex", dependencies.env) ?? "codex") : driver === "codebuddy" ? codebuddyProgram(dependencies.env) : (onPath("claude", dependencies.env) ?? "claude")),
+    command:
+      command ??
+      (driver === "codex"
+        ? (onPath("codex", dependencies.env) ?? "codex")
+        : driver === "codebuddy"
+          ? codebuddyProgram(dependencies.env)
+          : driver === "cursor"
+            ? (onPath("cursor-agent", dependencies.env) ?? onPath("agent", dependencies.env) ?? "cursor-agent")
+            : (onPath("claude", dependencies.env) ?? "claude")),
     ...(driver === "codex" && home ? { codex_home: home } : {}),
     ...(driver === "codebuddy" && configDir ? { config_dir: configDir } : {}),
     ...(driver === "claude-code" && live !== undefined ? { live_pid: live } : {}),

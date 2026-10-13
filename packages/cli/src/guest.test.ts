@@ -2594,10 +2594,20 @@ describe("sharednet say and wait", () => {
       expect(broken.stderr).toContain("wake check: program ok: claude 2.1.285");
       expect(broken.stderr).toContain("wake check: model call skipped: not signed in");
 
+      // A Cursor chat is never captured: the chat id is given, and the program is the CLI on PATH or its default name.
+      const cursorMissing = await run(["wake", "set", "cursor", "--json"], space, []);
+      expect(cursorMissing.exitCode).not.toBe(0);
+      expect(cursorMissing.stdout + cursorMissing.stderr).toContain("--resume <session id>");
+      const cursor = await run(["wake", "set", "cursor", "--resume", "8f1c0d6e-2b7a", "--json"], space, [], { CURSOR_AGENT: "1", CURSOR_TRACE_ID: "editor-trace" });
+      expect(JSON.parse(cursor.stdout).wake).toEqual({ driver: "cursor", session: "8f1c0d6e-2b7a", cwd: space.project, command: "cursor-agent" });
+      expect(JSON.parse(cursor.stdout).wakes).toBe("cursor 8f1c0d6e-2b7a");
+
       expect(JSON.parse((await run(["wake", "off", "--json"], space, [])).stdout).wake).toBeNull();
       expect((await credentialOf(space)).wake).toBeUndefined();
       expect((await run(["wake", "check", "--json"], space, [])).exitCode).not.toBe(0);
-      expect((await run(["wake", "set", "cursor", "--json"], space, [])).exitCode).not.toBe(0);
+      const unknown = await run(["wake", "set", "gemini-cli", "--json"], space, []);
+      expect(unknown.exitCode).not.toBe(0);
+      expect(unknown.stdout + unknown.stderr).toContain("The wake drivers are codex, claude-code, cursor and command");
     });
 
     it("binds a seat to a CodeBuddy or WorkBuddy conversation, remembering which config directory holds it", async () => {
