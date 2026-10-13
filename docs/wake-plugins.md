@@ -60,7 +60,7 @@ interface WakePlugin {
 | Outcome | Meaning | serve posts | serve acknowledges | then |
 | --- | --- | --- | --- | --- |
 | `replied` | A turn ran and finished. `reply` is its last words, or null for `(no reply)` | the reply, if any | yes | next wake |
-| `handed` | The wake was put into the open session (Codex `queue`), which will answer in the Room itself | nothing | yes. The harness's queue is durable, and a session that closes first drains it at its next resume | next wake |
+| `handed` | The wake was put into the open session (Codex `queue`), which will answer in the Room itself | nothing | yes, and it is written down as unanswered until the session settles that one hand-over (`sharednet handed settle`) | next wake |
 | `left` | The open session listens for itself (Claude Code chat with a background `wait`) | nothing | no. The session acknowledges what it handles, and serve takes that as its place | look again in 10 s |
 | `busy` | It could not be delivered now, and nothing was lost | nothing | no | retry in `retryMs` |
 | `failed` | It could not be delivered (not signed in, program missing, past the turn limit) | a notice, so whoever addressed the seat knows | yes | next wake |
@@ -77,7 +77,10 @@ Every case of "the session is open" becomes `handed` or `left`; neither is an er
   2. If it fails with *active writer*, the thread is open in a chat. Run `codex queue --thread <thread> --message <live prompt>`, and the outcome is `handed`. The open chat runs the message after its current turn and posts its own answer. The live prompt says so, and gives `sharednet say … --as <seat>`.
   3. If `queue` also fails (an older Codex, or a non-zero exit), the outcome is `busy`, retried in 10 s.
 - **Verified on Codex 0.162.0:**
-  - `codex queue` stores the message in `~/.codex/queue_1.sqlite` and returns at once. An idle thread does not run it by itself, but the next `exec resume` turn delivers it first ("Other user message received since my last reply: …"). So a handed wake is never lost.
+  - `codex queue` stores the message in `~/.codex/queue_1.sqlite` and returns at once. An idle thread does not run it by itself, but the next `exec resume` turn delivers it first ("Other user message received since my last reply: …"). A queued message waits there until the thread takes it, but **once a turn takes it, Codex removes it from the queue**: a session interrupted at that moment (#834, reproduced on 2026-10-13 with Codex 0.162) never runs it again.
+  - So serve writes every hand-over to `<rooms>/<room>/<seat>.handed.json` before the cursor moves on. It stays **unanswered** until the session runs `sharednet handed settle <room> <through> --as <seat>` (the queued prompt names it), whether it replied or not. Other words from the seat do not settle it: "still working on it" is not handling it. Adding and settling read and write the file under one lock, and a settle names one Room, seat and through.
+  - `sharednet handed --json` lists what is left and only reads, for a person or a monitor to follow up.
+  - Not covered: a connector that crashes after writing a hand-over and before moving its cursor queues the same lines again on restart, so a session can see a request twice.
   - **Only an interactive Codex holds the writer lock** (the TUI, or the desktop app through its background server). Two `exec resume` turns on the same thread run side by side without an error. So `handed` happens exactly when a person has the thread open, which is the case it exists for.
   - An open, idle TUI runs a queued wake at once; a busy one runs it after its current turn.
 

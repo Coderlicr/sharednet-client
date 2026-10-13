@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -2209,6 +2209,119 @@ describe("sharednet say and wait", () => {
       expect(result.requests.filter((request) => request.init.method === "POST")).toHaveLength(0);
       expect(result.acks).toEqual([2]);
       expect(result.stderr).toContain("queued into its open Codex chat (thread 019a-codex-thread); it answers in the Room itself");
+    });
+
+    it("keeps a hand-over unanswered when the open chat drops it, so it is not lost (#834)", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const { turns, runTurn } = answersOf({ exitCode: 1, stderr: ACTIVE_WRITER }, { stdout: "Queued message m1 for thread 019a-codex-thread." });
+      const served = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex what is 2+2?")]),
+        page([addressed(2, "@codex what is 2+2?")]),
+        revoked(),
+      ], CODEX, { service: { delivered_through: 1, acked_through: 1 }, runTurn });
+      expect(served.exitCode).toBe(0);
+      // The cursor moved on, as before: the same lines are not queued twice.
+      expect(served.acks).toEqual([2]);
+      // The queued prompt names the one settle that clears this hand-over: Room, seat and through.
+      expect(turns[1]!.args.at(-1)).toContain(`sharednet handed settle ${ROOM_ID} 2 --as ${MEMBER_ID}`);
+
+      // The chat was interrupted and never answered: the hand-over is still there. Listing only reads.
+      const listed = await run(["handed", "--json"], space, [], CODEX);
+      expect(listed.exitCode).toBe(0);
+      expect(listed.requests).toHaveLength(0);
+      const unanswered = JSON.parse(listed.stdout).unanswered;
+      expect(unanswered).toHaveLength(1);
+      expect(unanswered[0]).toMatchObject({ room_id: ROOM_ID, member_id: MEMBER_ID, from: 1, through: 2, addressed: [2] });
+    });
+
+    it("does not count the seat's other words as handling a hand-over", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const queued = () => answersOf({ exitCode: 1, stderr: ACTIVE_WRITER }, { stdout: "Queued message m1 for thread 019a-codex-thread." }).runTurn;
+      await run(["serve", "--json"], space, [page([addressed(2, "@codex prepare the report")]), page([addressed(2, "@codex prepare the report")]), revoked()], CODEX, {
+        service: { delivered_through: 1, acked_through: 1 }, runTurn: queued(),
+      });
+      // "I am online, the report is not finished" (#3) is read on the way to the next wake (#4); #2 stays.
+      await run(["serve", "--json"], space, [page([addressed(4, "@codex two")]), page([own(3, "I am online. The report is not finished."), addressed(4, "@codex two")]), revoked()], CODEX, {
+        service: { delivered_through: 2, acked_through: 2 }, runTurn: queued(),
+      });
+      const listed = await run(["handed", "--json"], space, [], CODEX);
+      expect(JSON.parse(listed.stdout).unanswered.map((item: { through: number }) => item.through)).toEqual([2, 4]);
+    });
+
+    it("settles exactly one hand-over, named by Room, seat and through", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const queued = () => answersOf({ exitCode: 1, stderr: ACTIVE_WRITER }, { stdout: "Queued message m1 for thread 019a-codex-thread." }).runTurn;
+      await run(["serve", "--json"], space, [page([addressed(2, "@codex report")]), page([addressed(2, "@codex report")]), revoked()], CODEX, {
+        service: { delivered_through: 1, acked_through: 1 }, runTurn: queued(),
+      });
+      // The same seat holds a hand-over through #2 in another Room too.
+      const { getStoragePaths, readRoomCredential, writeRoomCredential } = await import("./storage.ts");
+      const paths = getStoragePaths(space.env);
+      const other = "rom_ZyXwVuTsRq";
+      await writeRoomCredential(paths, { ...(await readRoomCredential(paths, ROOM_ID, MEMBER_ID))!, room_id: other });
+      await writeFile(join(paths.roomsDir, other, `${MEMBER_ID}.handed.json`), await readFile(join(paths.roomsDir, ROOM_ID, `${MEMBER_ID}.handed.json`)), { mode: 0o600 });
+
+      // A settle must name the Room and the seat, and a hand-over that exists.
+      expect((await run(["handed", "settle", "2", "--as", MEMBER_ID, "--json"], space, [], CODEX)).exitCode).not.toBe(0);
+      expect((await run(["handed", "settle", ROOM_ID, "9", "--as", MEMBER_ID, "--json"], space, [], CODEX)).exitCode).not.toBe(0);
+      const settled = await run(["handed", "settle", ROOM_ID, "2", "--as", MEMBER_ID, "--json"], space, [], CODEX);
+      expect(JSON.parse(settled.stdout)).toEqual({ settled: { room_id: ROOM_ID, member_id: MEMBER_ID, through: 2 } });
+      const listed = await run(["handed", "--json"], space, [], CODEX);
+      expect(JSON.parse(listed.stdout).unanswered.map((item: { room_id: string; through: number }) => [item.room_id, item.through])).toEqual([[other, 2]]);
+    });
+
+    it("loses no change when many hand-overs are recorded and settled at once", async () => {
+      const space = await workspace();
+      const { getStoragePaths } = await import("./storage.ts");
+      const { updateHanded } = await import("./guest.ts");
+      const paths = getStoragePaths(space.env);
+      await mkdir(join(paths.roomsDir, ROOM_ID), { recursive: true });
+      const item = (through: number) => ({ from: through - 1, through, addressed: [through], handed_at: "2026-10-13T00:00:00.000Z" });
+      await Promise.all(Array.from({ length: 20 }, (_, index) => updateHanded(paths, ROOM_ID, MEMBER_ID, (handed) => [...handed, item(index + 1)])));
+      await Promise.all(Array.from({ length: 10 }, (_, index) => updateHanded(paths, ROOM_ID, MEMBER_ID, (handed) => handed.filter((entry) => entry.through !== 2 * (index + 1)))));
+      const listed = JSON.parse(await readFile(join(paths.roomsDir, ROOM_ID, `${MEMBER_ID}.handed.json`), "utf8")).handed;
+      expect(listed.map((entry: { through: number }) => entry.through).sort((a: number, b: number) => a - b)).toEqual([1, 3, 5, 7, 9, 11, 13, 15, 17, 19]);
+    });
+
+    it("fails closed instead of hiding or overwriting a damaged hand-over file", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const { getStoragePaths } = await import("./storage.ts");
+      const { updateHanded } = await import("./guest.ts");
+      const paths = getStoragePaths(space.env);
+      const file = join(paths.roomsDir, ROOM_ID, `${MEMBER_ID}.handed.json`);
+      const damaged = '{"schema_version":1,"handed":[{"through":"2"}]}\n';
+      await writeFile(file, damaged, { mode: 0o600 });
+
+      const listed = await run(["handed", "--as", MEMBER_ID, "--json"], space, [], CODEX);
+      expect(listed.exitCode).toBe(2);
+      expect(JSON.parse(listed.stderr).error.code).toBe("invalid_local_state");
+      await expect(updateHanded(paths, ROOM_ID, MEMBER_ID, (handed) => [...handed, {
+        from: 2, through: 3, addressed: [3], handed_at: "2026-10-13T00:00:00.000Z",
+      }])).rejects.toMatchObject({ code: "invalid_local_state" });
+      expect(await readFile(file, "utf8")).toBe(damaged);
+    });
+
+    it("keeps both changes when serve records a hand-over while a settle runs", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const queued = () => answersOf({ exitCode: 1, stderr: ACTIVE_WRITER }, { stdout: "Queued message m1 for thread 019a-codex-thread." }).runTurn;
+      await run(["serve", "--json"], space, [page([addressed(2, "@codex first")]), page([addressed(2, "@codex first")]), revoked()], CODEX, {
+        service: { delivered_through: 1, acked_through: 1 }, runTurn: queued(),
+      });
+      const [settledRun] = await Promise.all([
+        run(["handed", "settle", ROOM_ID, "2", "--as", MEMBER_ID, "--json"], space, [], CODEX),
+        run(["serve", "--json"], space, [page([addressed(4, "@codex second")]), page([addressed(4, "@codex second")]), revoked()], CODEX, {
+          service: { delivered_through: 2, acked_through: 2 }, runTurn: queued(),
+        }),
+      ]);
+      expect(settledRun.stderr).toBe("");
+      expect(settledRun.exitCode).toBe(0);
+      const listed = await run(["handed", "--json"], space, [], CODEX);
+      expect(JSON.parse(listed.stdout).unanswered.map((item: { through: number }) => item.through)).toEqual([4]);
     });
 
     it("tries a line again, unacknowledged, while the open thread cannot take it, and delivers it once it can", async () => {

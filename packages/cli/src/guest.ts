@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join as joinPath, resolve as resolvePathFrom } from "node:path";
 
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
@@ -1875,6 +1875,43 @@ async function ackWake(args: string[], dependencies: GuestDependencies): Promise
   return { wake_id: wakeId, room_id: state.room_id, member_id: state.member_id, last_sequence: lastSequence };
 }
 
+/**
+ * `sharednet handed`: the wakes this machine's connector handed to an open session that the session
+ * has not settled. Listing only reads. `sharednet handed settle <rom_…> <through> --as <seat>` records
+ * that the session handled that one hand-over, whether or not it replied.
+ */
+async function handedVerb(args: string[], dependencies: GuestDependencies): Promise<unknown> {
+  const parsed = parseGuestArguments(args);
+  assertOnlyOptions(parsed, ["as"]);
+  const as = stringOption(parsed, "as");
+  const [action, roomId, through] = parsed.positionals;
+  const settling = action === "settle";
+  if (
+    (parsed.positionals.length !== 0 && !settling) ||
+    (settling && (parsed.positionals.length !== 3 || !ROOM_ID_PATTERN.test(roomId!) || !/^\d+$/.test(through!) || as === undefined))
+  ) {
+    throw localError("invalid_arguments", "Usage: sharednet handed [--as <member_id>], or sharednet handed settle <rom_…> <through> --as <member_id>");
+  }
+  const paths = getStoragePaths(dependencies.env);
+  const seats = (await heldSeats(paths)).filter((seat) => (as === undefined || seat.member_id === as) && (!settling || seat.room_id === roomId));
+  if (as !== undefined && seats.length === 0) throw localError("not_in_a_room", "This machine holds no such seat.");
+  if (settling) {
+    const seat = seats[0]!;
+    let found = false;
+    await updateHanded(paths, seat.room_id, seat.member_id, (handed) => {
+      found = handed.some((item) => item.through === Number(through));
+      return handed.filter((item) => item.through !== Number(through));
+    });
+    if (!found) throw localError("invalid_arguments", `Seat ${seat.member_id} has no unsettled hand-over through #${through} in ${seat.room_id}.`);
+    return { settled: { room_id: seat.room_id, member_id: seat.member_id, through: Number(through) } };
+  }
+  const unanswered: Array<HandedWake & { room_id: string; member_id: string; name: string }> = [];
+  for (const seat of seats) {
+    unanswered.push(...(await readHanded(paths, seat.room_id, seat.member_id)).map((item) => ({ ...item, room_id: seat.room_id, member_id: seat.member_id, name: seat.name })));
+  }
+  return { unanswered };
+}
+
 /** The read flags, as a query string: filter, order, window. `--last K` is newest-first, K of them. */
 export function messageQueryFrom(options: Map<string, string | true>): URLSearchParams {
   const value = (name: string): string | undefined => {
@@ -2763,6 +2800,12 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         }
       } else if (delivery.kind === "handed") {
         dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} addressed; ${span} ${delivery.note}; it answers in the Room itself\n`);
+        // Written before the cursor moves past it: a session that never answers leaves it unanswered.
+        const addressed = said.filter((item) => item.mentions?.includes(me)).map((item) => item.sequence);
+        await updateHanded(paths, seat.room_id, me, (earlier) => [
+          ...earlier.filter((item) => item.through !== through),
+          { from, through, addressed: addressed.length > 0 ? addressed : said.map((item) => item.sequence), handed_at: dependencies.now().toISOString() },
+        ]);
       } else if (delivery.kind === "failed") {
         // The Room hears the harness's own words, or the exit code; the machine's output stays in the log.
         dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} could not be resumed: ${delivery.why}${delivery.detail ? ` (${delivery.detail})` : ""}\n`);
@@ -2975,6 +3018,68 @@ async function writeServeCursor(paths: ReturnType<typeof getStoragePaths>, roomI
   await writeFile(serveCursorPath(paths, roomId, memberId), `${cursor}\n`, { mode: 0o600 }).catch(() => undefined);
 }
 
+/**
+ * A wake handed to an open session is out of the connector's hands: the session may drop it, be
+ * interrupted, or answer. The cursor still moves on (else the same lines are queued again), so the
+ * hand-over is written down here and stays unanswered until its session settles it, by Room, seat
+ * and through, with `sharednet handed settle`. Other words from the seat do not settle it.
+ */
+type HandedWake = { from: number; through: number; addressed: number[]; handed_at: string };
+
+function handedPath(paths: ReturnType<typeof getStoragePaths>, roomId: string, memberId: string): string {
+  return joinPath(paths.roomsDir, roomId, `${memberId}.handed.json`);
+}
+
+async function readHanded(paths: ReturnType<typeof getStoragePaths>, roomId: string, memberId: string): Promise<HandedWake[]> {
+  let raw: string;
+  try {
+    raw = await readFile(handedPath(paths, roomId, memberId), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  try {
+    const value = JSON.parse(raw) as { schema_version?: unknown; handed?: unknown };
+    if (value?.schema_version !== 1 || !Array.isArray(value.handed)) throw new Error();
+    return value.handed.map((candidate) => {
+      const item = candidate as Partial<HandedWake> | null;
+      if (
+        item === null || !Number.isSafeInteger(item.from) || (item.from as number) < 0 ||
+        !Number.isSafeInteger(item.through) || (item.through as number) < (item.from as number) ||
+        !Array.isArray(item.addressed) || !item.addressed.every((sequence) => Number.isSafeInteger(sequence) && sequence >= 0) ||
+        typeof item.handed_at !== "string" || item.handed_at.length === 0
+      ) throw new Error();
+      return item as HandedWake;
+    });
+  } catch {
+    throw localError("invalid_local_state", `The unsettled hand-over file for ${memberId} in ${roomId} is not valid SharedNet state.`);
+  }
+}
+
+async function writeHanded(paths: ReturnType<typeof getStoragePaths>, roomId: string, memberId: string, handed: HandedWake[]): Promise<void> {
+  const target = handedPath(paths, roomId, memberId);
+  if (handed.length === 0) {
+    await rm(target, { force: true });
+    return;
+  }
+  const temporary = `${target}.${process.pid}.tmp`;
+  await writeFile(temporary, `${JSON.stringify({ schema_version: 1, handed })}\n`, { mode: 0o600 });
+  await rename(temporary, target);
+}
+
+/**
+ * Every change to a seat's hand-overs reads and writes under one lock, so serve adding one and a
+ * settle removing another cannot overwrite each other.
+ */
+export async function updateHanded(paths: ReturnType<typeof getStoragePaths>, roomId: string, memberId: string, change: (handed: HandedWake[]) => HandedWake[]): Promise<HandedWake[]> {
+  const root = joinPath(paths.roomsDir, roomId);
+  return withControlLock({ root }, "handed", async () => {
+    const next = change(await readHanded(paths, roomId, memberId));
+    await writeHanded(paths, roomId, memberId, next);
+    return next;
+  });
+}
+
 /** The newest sequence in a Room, so a first start listens forward instead of replaying. */
 async function roomEnd(client: ApiClient, seat: StoredRoomCredential): Promise<number> {
   const page = await client.request<PageShape>(
@@ -3182,6 +3287,7 @@ export type GuestVerb =
   | "read"
   | "wait"
   | "ack"
+  | "handed"
   | "balance"
   | "redeem"
   | "pay"
@@ -3212,6 +3318,7 @@ export function isGuestVerb(value: string | undefined): value is GuestVerb {
     value === "read" ||
     value === "wait" ||
     value === "ack" ||
+    value === "handed" ||
     value === "balance" ||
     value === "redeem" ||
     value === "pay" ||
@@ -3246,6 +3353,7 @@ export async function runGuestVerb(
   if (verb === "read") return read(args, dependencies);
   if (verb === "watch") return watch(args, dependencies);
   if (verb === "ack") return ackWake(args, dependencies);
+  if (verb === "handed") return handedVerb(args, dependencies);
   if (verb === "add") return add(args, dependencies);
   if (verb === "rooms") return rooms(args, dependencies);
   if (verb === "requests") return requests(args, dependencies);

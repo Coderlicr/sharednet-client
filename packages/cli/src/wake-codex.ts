@@ -23,8 +23,8 @@ import {
  * Idle, the seat's thread is resumed with `codex exec resume`, and its last agent message is the
  * reply. Open in a chat, Codex refuses a second writer ("active writer"); the wake is then put in the
  * thread's queue with `codex queue`, which the open chat runs after its current turn and answers in the
- * Room itself. Verified on Codex 0.162.0: the queue is durable, an idle thread does not run it by
- * itself, and its next resumed turn receives it first, so a handed wake is never lost.
+ * Room itself. Verified on Codex 0.162.0: the queue is durable, but Codex removes a message once a turn
+ * takes it. Serve separately records the hand-over because that turn may still be interrupted.
  *
  * Inside a session CODEX_SESSION_ID is the thread id that `exec resume` and `queue` take.
  */
