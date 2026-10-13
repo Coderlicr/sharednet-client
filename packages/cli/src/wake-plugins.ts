@@ -1,6 +1,7 @@
 import { claudePlugin } from "./wake-claude.ts";
 import { codexPlugin } from "./wake-codex.ts";
 import { commandPlugin } from "./wake-command.ts";
+import { validTurnLimit } from "./wake-driver.ts";
 import type { Environment, SeatWake, WakeDriver, WakePlugin } from "./wake-driver.ts";
 
 /**
@@ -41,12 +42,14 @@ export function parseSeatWake(value: unknown): SeatWake | undefined {
   if (!driver || !cwd || !command || (driver !== "command" && !session)) return undefined;
   const home = text(record.codex_home);
   const live = record.live_pid;
+  if (record.turn_limit_ms !== undefined && !validTurnLimit(record.turn_limit_ms)) return undefined;
   return {
     driver,
     ...(session ? { session } : {}),
     cwd,
     command,
     ...(home ? { codex_home: home } : {}),
+    ...(validTurnLimit(record.turn_limit_ms) ? { turn_limit_ms: record.turn_limit_ms } : {}),
     ...(typeof live === "number" && Number.isSafeInteger(live) && live > 0 ? { live_pid: live } : {}),
   };
 }

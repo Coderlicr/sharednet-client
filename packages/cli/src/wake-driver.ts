@@ -16,6 +16,11 @@ import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 
 export type Environment = Record<string, string | undefined>;
 
+export const DEFAULT_TURN_LIMIT_MS = 40 * 60_000;
+export function validTurnLimit(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 60_000 && value <= 24 * 60 * 60_000;
+}
+
 export type WakeDriver = "codex" | "claude-code" | "command";
 
 export interface SeatWake {
@@ -33,6 +38,8 @@ export interface SeatWake {
    * is 1). While it runs, the seat's lines are left to that chat (wake-claude.ts).
    */
   live_pid?: number;
+  /** Host-local budget for subsequent headless turns, in milliseconds. */
+  turn_limit_ms?: number;
 }
 
 /** What one wake is about: where it was said, by whom, and the two prompts a plugin may hand on. */

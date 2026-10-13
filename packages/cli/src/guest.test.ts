@@ -2049,12 +2049,42 @@ describe("sharednet say and wait", () => {
       expect(result.acks).toEqual([2]);
     });
 
+    it("changes the next turn budget without losing the session or live chat binding", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], { CLAUDE_CODE_SESSION_ATTENDED: "1", CLAUDE_PID: "4321" });
+      const original = (await credentialOf(space)).wake;
+      const changed = await run(["wake", "limit", "90m", "--json"], space, []);
+      expect(changed.exitCode).toBe(0);
+      expect((await credentialOf(space)).wake).toEqual({ ...original, turn_limit_ms: 90 * 60_000 });
+      expect(JSON.parse(changed.stdout).applies).toContain("does not extend a running turn");
+      for (const limit of ["0m", "30s", "25h", "Infinity", "-1m"]) {
+        expect((await run(["wake", "limit", limit], space, [])).exitCode).not.toBe(0);
+      }
+      expect((await credentialOf(space)).wake).toEqual({ ...original, turn_limit_ms: 90 * 60_000 });
+    });
+
+    it("saves progress privately without any Room request and replaces the previous checkpoint", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const saved = await run(["wake", "checkpoint", "Completed test; next inspect CI", "--json"], space, []);
+      expect(saved.exitCode).toBe(0);
+      expect(saved.requests).toHaveLength(0);
+      const path = JSON.parse(saved.stdout).checkpoint_path;
+      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ room_id: ROOM_ID, member_id: MEMBER_ID, progress: "Completed test; next inspect CI" });
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      await run(["wake", "checkpoint", "CI green; next review", "--json"], space, []);
+      expect(JSON.parse(await readFile(path, "utf8")).progress).toBe("CI green; next review");
+    });
+
     it("reports a timed-out turn accurately and still handles the next mention", async () => {
       const space = await workspace();
       await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
       const turns: TurnSpec[] = [];
       const runTurn: TurnRunner = async (spec) => {
         turns.push(spec);
+        if (turns.length === 1) {
+          expect((await run(["wake", "limit", "90m", "--json"], space, [])).exitCode).toBe(0);
+        }
         return turns.length === 1
           ? { exitCode: 143, stdout: "", stderr: "", timedOut: true }
           : { exitCode: 0, stdout: '{"type":"turn.completed","usage":{}}', stderr: "", timedOut: false };
@@ -2069,6 +2099,10 @@ describe("sharednet say and wait", () => {
       expect(JSON.parse(String(notice.init.body)).content).toContain("turn was stopped");
       expect(JSON.parse(String(notice.init.body)).content).not.toContain("could not be resumed");
       expect(turns).toHaveLength(2);
+      expect(turns[0]!.timeoutMs).toBe(40 * 60_000);
+      expect(turns[1]!.timeoutMs).toBe(90 * 60_000);
+      expect(turns[0]!.input).toContain("sharednet wake checkpoint");
+      expect(JSON.parse(String(notice.init.body)).content).toContain("40 minutes");
       expect(result.acks).toEqual([2, 4]);
     });
 
