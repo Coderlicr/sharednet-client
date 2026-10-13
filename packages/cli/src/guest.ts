@@ -2588,6 +2588,33 @@ async function saveWakeProgress(path: string, value: unknown): Promise<void> {
  * and still carries everything said meanwhile.
  */
 const MAX_TURNS_PER_HOUR = 30;
+/**
+ * Seats that resume the same session take turns. While one seat's turn holds the session, a second
+ * resume would find an "active writer" and queue its lines into that turn, which neither belongs to
+ * the seat nor keeps the lines if it ends early. So the next seat waits, then resumes, in order.
+ */
+export function sessionTurnOrder() {
+  const held = new Map<string, { holder: string; done: Promise<void> }>();
+  return async <T>(key: string, holder: string, onWait: (holder: string) => void, work: () => Promise<T>): Promise<T> => {
+    for (let current = held.get(key); current; current = held.get(key)) {
+      onWait(current.holder);
+      await current.done;
+    }
+    let release!: () => void;
+    held.set(key, { holder, done: new Promise<void>((resolve) => { release = resolve; }) });
+    try {
+      return await work();
+    } finally {
+      held.delete(key);
+      release();
+    }
+  };
+}
+
+function wakeSessionKey(wake: SeatWake): string | null {
+  return wake.session ? JSON.stringify([wake.driver, wake.codex_home ?? null, wake.session]) : null;
+}
+
 /** A wake program that did not start is looked at again after this, doubling up to the cap. */
 const CHECK_RETRY_MS = 30_000;
 const CHECK_RETRY_MAX_MS = 600_000;
@@ -2648,6 +2675,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const seatKey = (seat: StoredRoomCredential) => `${seat.room_id}/${seat.member_id}`;
   const tracked = new Map(seats.map((seat) => [seatKey(seat), seat]));
   const turnTimes = new Map<string, number[]>();
+  const inTurnOrder = sessionTurnOrder();
   const statusOf = (all: StoredRoomCredential[]): ServeStatus => ({
     pid: process.pid,
     started_at: started,
@@ -2814,22 +2842,73 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         await sleep(Math.max(wait, 0));
       }
       // The seat file names the session; a later join or `wake set` replaces it.
-      const wake = (await readRoomCredential(paths, seat.room_id, seat.member_id))?.wake;
+      let wake = (await readRoomCredential(paths, seat.room_id, seat.member_id))?.wake;
       // `wake off` may have run while the poll or turn backstop was waiting.
       if (!wake) return null;
-      const about = { roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through };
-      const timeoutMs = wake.turn_limit_ms ?? DEFAULT_TURN_LIMIT_MS;
-      const checkpoint = checkpointPath(paths.stateDir, seat.room_id, seat.member_id);
-      const deadline = dependencies.now().getTime() + timeoutMs;
-      const checkpointAt = deadline - Math.min(120_000, timeoutMs / 4);
-      let prompt = wakeTurnPrompt(about) + `\n\nExecution budget: ${timeoutMs / 60_000} minutes; deadline ${new Date(deadline).toISOString()}. Save progress by ${new Date(checkpointAt).toISOString()} and after each significant milestone: sharednet wake checkpoint "completed; next step; blockers; evidence paths" --as ${seat.member_id}. Keep secrets out. Previous checkpoint (if any): ${checkpoint}. Read it to recover context, then verify current state before repeating actions. A checkpoint does not authorize automatic retries. You can set the NEXT turn's limit with sharednet wake limit 60m --as ${seat.member_id}; this does not extend this running turn. This budget applies to headless execution, not a handoff into an open chat.`;
-      if (seat.room_type === "compiled") {
-        const state = await client.request<CompiledState>("GET", `/rooms/${encodeURIComponent(seat.room_id)}/state`, seat.member_token);
-        prompt += `\n\n${compiledPrompt(state)}`;
+      type WakeRun =
+        | { state: "cancelled" }
+        | { state: "moved"; wake: SeatWake }
+        | { state: "delivered"; delivery: Delivery; pluginLabel: string; started: number; timeoutMs: number };
+      const take = async (currentWake: SeatWake): Promise<WakeRun> => {
+        if (stopping.signal.aborted) return { state: "cancelled" };
+        const about = { roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through };
+        const checkpoint = checkpointPath(paths.stateDir, seat.room_id, seat.member_id);
+        let compiled = "";
+        if (seat.room_type === "compiled") {
+          const state = await client.request<CompiledState>("GET", `/rooms/${encodeURIComponent(seat.room_id)}/state`, seat.member_token);
+          compiled = `\n\n${compiledPrompt(state)}`;
+        }
+        // A queued turn can outlive daemon shutdown. Do not start its harness after the stop.
+        if (stopping.signal.aborted) return { state: "cancelled" };
+        const plugin = pluginFor(currentWake.driver);
+        const timeoutMs = currentWake.turn_limit_ms ?? DEFAULT_TURN_LIMIT_MS;
+        const started = dependencies.now().getTime();
+        const deadline = started + timeoutMs;
+        const checkpointAt = deadline - Math.min(120_000, timeoutMs / 4);
+        const prompt = wakeTurnPrompt(about) + `\n\nExecution budget: ${timeoutMs / 60_000} minutes; deadline ${new Date(deadline).toISOString()}. Save progress by ${new Date(checkpointAt).toISOString()} and after each significant milestone: sharednet wake checkpoint "completed; next step; blockers; evidence paths" --as ${seat.member_id}. Keep secrets out. Previous checkpoint (if any): ${checkpoint}. Read it to recover context, then verify current state before repeating actions. A checkpoint does not authorize automatic retries. You can set the NEXT turn's limit with sharednet wake limit 60m --as ${seat.member_id}; this does not extend this running turn. This budget applies to headless execution, not a handoff into an open chat.${compiled}`;
+        const delivery = await plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs });
+        return { state: "delivered", delivery, pluginLabel: plugin.label, started, timeoutMs };
+      };
+      let ran: WakeRun;
+      for (;;) {
+        if (stopping.signal.aborted) return null;
+        const sessionKey = wakeSessionKey(wake);
+        if (sessionKey === null) {
+          // A session wake may have been changed to a command wake since the first read. Take the
+          // latest command only after confirming it still has no session to serialize.
+          const currentWake = (await readRoomCredential(paths, seat.room_id, seat.member_id))?.wake;
+          if (!currentWake || stopping.signal.aborted) return null;
+          if (wakeSessionKey(currentWake) !== null) {
+            wake = currentWake;
+            continue;
+          }
+          ran = await take(currentWake);
+        } else {
+          ran = await inTurnOrder(
+            sessionKey,
+            `${seat.room_id} ${seat.name}`,
+            (holder) => dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} addressed; its session is in ${holder}'s turn, so it resumes after that\n`),
+            async () => {
+              if (stopping.signal.aborted) return { state: "cancelled" };
+              // Waiting can last an entire model turn. `wake off`, `wake set`, or a new join may
+              // have changed this seat meanwhile, so no captured wake may cross the lock boundary.
+              const currentWake = (await readRoomCredential(paths, seat.room_id, seat.member_id))?.wake;
+              if (!currentWake || stopping.signal.aborted) return { state: "cancelled" };
+              if (wakeSessionKey(currentWake) !== sessionKey) return { state: "moved", wake: currentWake };
+              return take(currentWake);
+            },
+          );
+        }
+        if (ran.state === "cancelled") return null;
+        if (ran.state === "moved") {
+          // Release the old session before entering the replacement's queue; nesting the locks can
+          // deadlock when two seats swap sessions while both are waiting.
+          wake = ran.wake;
+          continue;
+        }
+        break;
       }
-      const plugin = pluginFor(wake.driver);
-      const started = dependencies.now().getTime();
-      const delivery = await plugin.deliver(wake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs });
+      const { delivery, pluginLabel, started, timeoutMs } = ran;
       // The backstop counts turns that ran; a wake handed on, left or put off ran none.
       if (delivery.kind === "replied" || delivery.kind === "failed") turns.push(started);
       const span = `#${from + 1}..#${through}`;
@@ -2856,7 +2935,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         // Whoever addressed the seat would otherwise hear nothing at all, and not know why.
         const notice = delivery.timedOut
           ? `(${seat.name}'s turn was stopped after ${timeoutMs / 60_000} minutes. The listener remains available for the next mention; this task was not automatically retried.)`
-          : `(${seat.name} was addressed, but its ${plugin.label} session could not be resumed: ${delivery.why})`;
+          : `(${seat.name} was addressed, but its ${pluginLabel} session could not be resumed: ${delivery.why})`;
         await post(notice).catch(() => undefined);
       }
       return delivery;

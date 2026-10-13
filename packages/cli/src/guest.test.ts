@@ -90,6 +90,8 @@ async function run(
   environment: Record<string, string> = {},
   overrides: {
     exec?: CommandRunner;
+    fetch?: typeof globalThis.fetch;
+    onStderr?: (value: string) => void;
     sleep?: (ms: number) => Promise<void>;
     now?: () => Date;
     service?: { delivered_through: number; acked_through: number };
@@ -110,10 +112,10 @@ async function run(
   // The seat's place is the service's (wait PR 5). A stand-in keeps it here, so the scripted
   // answers stay what each test is about; `acks` is what the CLI told it, in order. Pass the same
   // `service` to two runs and it carries over, as the real one does.
-  const { service: kept, ackFailure, ...dependencyOverrides } = overrides;
+  const { service: kept, ackFailure, fetch: fetchOverride, onStderr, ...dependencyOverrides } = overrides;
   const service = kept ?? { delivered_through: 0, acked_through: 0 };
   const acks: number[] = [];
-  const fetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+  const scriptedFetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
     const place = /\/api\/v1\/rooms\/(rom_[A-Za-z0-9]+)\/(subscription|ack)$/.exec(new URL(String(input)).pathname);
     if (place) {
       if (place[2] === "ack" && ackFailure) {
@@ -149,13 +151,17 @@ async function run(
       headers: next.body === undefined ? undefined : { "content-type": "application/json" },
     });
   });
+  const fetch = fetchOverride ?? scriptedFetch;
   const exitCode = await runCli(argv, {
     env: { ...space.env, ...environment },
     fetch,
     cwd: space.project,
     sleep: async () => undefined,
     stdout: (value) => stdout.push(value),
-    stderr: (value) => stderr.push(value),
+    stderr: (value) => {
+      stderr.push(value);
+      onStderr?.(value);
+    },
     // The wake programs are stand-ins here; a test that is about the check passes its own.
     checkWake: async () => ({ ok: true, message: "stand-in" }),
     ...dependencyOverrides,
@@ -3609,4 +3615,282 @@ it.each(["watch", "serve"])("hydrates a legacy compiled credential before %s inv
   const again = await run(["watch", "--on", "message", "--run", "driver", "--max-runs", "1", "--json"], space, [page([message(3, "next act")]), { body: state }], {}, { exec, service: { delivered_through: 2, acked_through: 2 } });
   expect(again.exitCode, again.stderr).toBe(0);
   expect(again.requests).toHaveLength(2);
+});
+
+describe("seats that resume one session take turns", () => {
+  const ROOM_B = "rom_BbBbBbBbBb";
+  const ROOM_C = "rom_CcCcCcCcCc";
+  const CODEX_RUNTIME = { CLAUDE_SESSION_ID: "", CODEX_SESSION_ID: "session-one", CODEX_HOME: "/codex-home", PATH: "" };
+  const noReply = (spec: TurnSpec) => ({
+    exitCode: 0,
+    stdout: spec.command.includes("claude")
+      ? JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "(no reply)" })
+      : JSON.stringify({ type: "turn.completed", usage: {} }),
+    stderr: "",
+    timedOut: false,
+  });
+
+  function deferred<T = void>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    const promise = new Promise<T>((done) => { resolve = done; });
+    return { promise, resolve };
+  }
+
+  async function storeDrivenSeat(
+    space: Awaited<ReturnType<typeof workspace>>,
+    roomId: string,
+    wake: SeatWake,
+  ) {
+    const { getStoragePaths, writeRoomCredential } = await import("./storage.ts");
+    const paths = getStoragePaths(space.env);
+    await writeRoomCredential(paths, {
+      schema_version: 1,
+      base_url: "https://www.sharednet.ai",
+      room_id: roomId,
+      member_id: MEMBER_ID,
+      name: roomId,
+      member_token: MEMBER_TOKEN,
+      joined_at: "2026-10-13T00:00:00.000Z",
+      room_type: "board",
+      wake,
+    });
+    await writeFile(join(paths.roomsDir, roomId, `${MEMBER_ID}.serve-cursor`), "1\n", { mode: 0o600 });
+  }
+
+  function multiRoomWakeService(roomIds: string[]) {
+    const waits = new Map<string, number>();
+    const acknowledged = new Map(roomIds.map((roomId) => [roomId, 1]));
+    const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+    const wakeMessage = (roomId: string) => ({
+      ...message(2, `@codex work in ${roomId}`),
+      room_id: roomId,
+      mentions: [MEMBER_ID],
+    });
+    const fetch: typeof globalThis.fetch = async (input, init = {}) => {
+      const url = new URL(String(input));
+      const match = /\/rooms\/(rom_[A-Za-z0-9]+)(?:\/(subscription|ack|wait|messages))?$/.exec(url.pathname);
+      if (!match || !roomIds.includes(match[1]!)) throw new Error(`Unexpected request ${init.method ?? "GET"} ${url}`);
+      const roomId = match[1]!;
+      const route = match[2];
+      if (route === "subscription") {
+        return response({ subscription: { room_id: roomId, delivered_through: acknowledged.get(roomId), acked_through: acknowledged.get(roomId) } });
+      }
+      if (route === "ack") {
+        const through = (JSON.parse(String(init.body)) as { through: number }).through;
+        acknowledged.set(roomId, through);
+        return response({ subscription: { room_id: roomId, delivered_through: through, acked_through: through } });
+      }
+      if (route === "wait") {
+        const count = (waits.get(roomId) ?? 0) + 1;
+        waits.set(roomId, count);
+        return count === 1
+          ? response({ items: [wakeMessage(roomId)], next_cursor: null, has_more: false })
+          : response({ error: { code: "invalid_credentials", message: "test finished" } }, 401);
+      }
+      if (route === "messages" && (init.method ?? "GET") === "GET") {
+        return response({ items: [wakeMessage(roomId)], next_cursor: null, has_more: false });
+      }
+      if (route === "messages" && init.method === "POST") {
+        return response({ message: { ...wakeMessage(roomId), sequence: 3 } }, 201);
+      }
+      if (route === undefined) return response({ room: { id: roomId, type: "board" } });
+      throw new Error(`Unexpected request ${init.method ?? "GET"} ${url}`);
+    };
+    return { acknowledged, fetch };
+  }
+
+  it("does not run a same-session wake that was turned off while it waited", async () => {
+    const space = await workspace();
+    const sharedWake: SeatWake = { driver: "codex", session: "session-one", cwd: space.project, command: "codex", codex_home: "/codex-home" };
+    await storeDrivenSeat(space, ROOM_ID, sharedWake);
+    await storeDrivenSeat(space, ROOM_B, sharedWake);
+    const service = multiRoomWakeService([ROOM_ID, ROOM_B]);
+    const controller = new AbortController();
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    const turns: TurnSpec[] = [];
+    let waitingRoom: string | null = null;
+    const serving = run(["serve", "--json"], space, [], CODEX_RUNTIME, {
+      fetch: service.fetch,
+      signal: controller.signal,
+      sleep: async () => controller.abort(),
+      onStderr: (value) => {
+        const match = /serve: (rom_[A-Za-z0-9]+) .*resumes after/.exec(value);
+        if (match) waitingRoom = match[1]!;
+      },
+      runTurn: async (spec) => {
+        turns.push(spec);
+        if (turns.length === 1) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        }
+        return noReply(spec);
+      },
+    });
+    await firstStarted.promise;
+    await vi.waitFor(() => expect(waitingRoom).not.toBeNull());
+    const { getStoragePaths, readRoomCredential, writeRoomCredential } = await import("./storage.ts");
+    const paths = getStoragePaths(space.env);
+    const queued = (await readRoomCredential(paths, waitingRoom!, MEMBER_ID))!;
+    const { wake: _removed, ...withoutWake } = queued;
+    await writeRoomCredential(paths, withoutWake);
+    releaseFirst.resolve();
+
+    const result = await serving;
+    expect(result.exitCode).toBe(0);
+    expect(turns).toHaveLength(1);
+    expect(service.acknowledged.get(waitingRoom!)).toBe(1);
+  });
+
+  it("does not start a queued same-session turn after serve is stopped", async () => {
+    const space = await workspace();
+    const sharedWake: SeatWake = { driver: "codex", session: "session-one", cwd: space.project, command: "codex", codex_home: "/codex-home" };
+    await storeDrivenSeat(space, ROOM_ID, sharedWake);
+    await storeDrivenSeat(space, ROOM_B, sharedWake);
+    const service = multiRoomWakeService([ROOM_ID, ROOM_B]);
+    const controller = new AbortController();
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    const turns: TurnSpec[] = [];
+    let queued = false;
+    const serving = run(["serve", "--json"], space, [], CODEX_RUNTIME, {
+      fetch: service.fetch,
+      signal: controller.signal,
+      onStderr: (value) => { if (value.includes("resumes after")) queued = true; },
+      runTurn: async (spec) => {
+        turns.push(spec);
+        if (turns.length === 1) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        }
+        return noReply(spec);
+      },
+    });
+    await firstStarted.promise;
+    await vi.waitFor(() => expect(queued).toBe(true));
+    controller.abort();
+    releaseFirst.resolve();
+
+    const result = await serving;
+    expect(result.exitCode).toBe(0);
+    expect(turns).toHaveLength(1);
+  });
+
+  it("rebinds a queued wake to the new session lock and uses its fresh driver, limit and deadline", async () => {
+    const space = await workspace();
+    const firstWake: SeatWake = { driver: "codex", session: "session-one", cwd: space.project, command: "codex", codex_home: "/codex-home" };
+    const secondWake: SeatWake = { driver: "claude-code", session: "session-two", cwd: "/old/claude-work", command: "/old/claude" };
+    await storeDrivenSeat(space, ROOM_ID, firstWake);
+    await storeDrivenSeat(space, ROOM_B, firstWake);
+    await storeDrivenSeat(space, ROOM_C, secondWake);
+    const service = multiRoomWakeService([ROOM_ID, ROOM_B, ROOM_C]);
+    const controller = new AbortController();
+    const releaseFirstSession = deferred();
+    const releaseSecondSession = deferred();
+    const firstSessionStarted = deferred();
+    const secondSessionStarted = deferred();
+    const turns: TurnSpec[] = [];
+    const waiting: string[] = [];
+    let nowMs = Date.parse("2026-10-13T12:00:00.000Z");
+    const serving = run(["serve", "--json"], space, [], CODEX_RUNTIME, {
+      fetch: service.fetch,
+      signal: controller.signal,
+      now: () => new Date(nowMs),
+      onStderr: (value) => { if (value.includes("resumes after")) waiting.push(value); },
+      runTurn: async (spec) => {
+        turns.push(spec);
+        if (spec.command === "codex" && spec.args.includes("session-one")) {
+          firstSessionStarted.resolve();
+          await releaseFirstSession.promise;
+        } else if (spec.command === "/old/claude") {
+          secondSessionStarted.resolve();
+          await releaseSecondSession.promise;
+        }
+        return noReply(spec);
+      },
+    });
+
+    try {
+      await Promise.all([firstSessionStarted.promise, secondSessionStarted.promise]);
+      await vi.waitFor(() => expect(waiting).toHaveLength(1));
+      const queuedRoom = /serve: (rom_[A-Za-z0-9]+) /.exec(waiting[0]!)![1]!;
+      const { getStoragePaths, readRoomCredential, writeRoomCredential } = await import("./storage.ts");
+      const paths = getStoragePaths(space.env);
+      const queued = (await readRoomCredential(paths, queuedRoom, MEMBER_ID))!;
+      await writeRoomCredential(paths, {
+        ...queued,
+        wake: {
+          driver: "claude-code",
+          session: "session-two",
+          cwd: "/fresh/claude-work",
+          command: "/fresh/claude",
+          turn_limit_ms: 90 * 60_000,
+        },
+      });
+
+      releaseFirstSession.resolve();
+      await vi.waitFor(() => expect(waiting.length >= 2 || turns.length >= 3).toBe(true));
+      const turnsBeforeSecondSessionFinished = turns.length;
+      nowMs = Date.parse("2026-10-13T12:20:00.000Z");
+      releaseSecondSession.resolve();
+      const result = await serving;
+
+      expect(result.exitCode).toBe(0);
+      expect(turnsBeforeSecondSessionFinished).toBe(2);
+      expect(waiting[1]).toContain(`${ROOM_C} ${ROOM_C}`);
+      const rebound = turns.find((turn) => turn.command === "/fresh/claude")!;
+      expect(rebound).toBeDefined();
+      expect(rebound.args).toEqual(["-p", "--resume", "session-two", "--output-format", "json"]);
+      expect(rebound.cwd).toBe("/fresh/claude-work");
+      expect(rebound.timeoutMs).toBe(90 * 60_000);
+      expect(rebound.input).toContain("deadline 2026-10-13T13:50:00.000Z");
+    } finally {
+      releaseFirstSession.resolve();
+      releaseSecondSession.resolve();
+      controller.abort();
+      await serving;
+    }
+  });
+
+  it("runs one turn per session at a time, in order, and keeps other sessions free", async () => {
+    const { sessionTurnOrder } = await import("./guest.ts");
+    const inTurnOrder = sessionTurnOrder();
+    const log: string[] = [];
+    const waited: string[] = [];
+    let open!: () => void;
+    const first = inTurnOrder("codex:thread-1", "rom_A codex", () => undefined, async () => {
+      log.push("A start");
+      await new Promise<void>((resolve) => { open = resolve; });
+      log.push("A end");
+      return "A";
+    });
+    const second = inTurnOrder("codex:thread-1", "rom_B triage", (holder) => waited.push(`B waits for ${holder}`), async () => {
+      log.push("B start");
+      return "B";
+    });
+    const third = inTurnOrder("codex:thread-1", "rom_C follow-up", (holder) => waited.push(`C waits for ${holder}`), async () => {
+      log.push("C start");
+      return "C";
+    });
+    const elsewhere = await inTurnOrder("codex:thread-2", "rom_D other", () => waited.push("D waited"), async () => "D");
+    await Promise.resolve();
+    // Another session is not held up; this one has started nothing else while A holds it.
+    expect(elsewhere).toBe("D");
+    expect(log).toEqual(["A start"]);
+    open();
+    expect(await Promise.all([first, second, third])).toEqual(["A", "B", "C"]);
+    expect(log).toEqual(["A start", "A end", "B start", "C start"]);
+    expect(waited).toContain("B waits for rom_A codex");
+    expect(waited).not.toContain("D waited");
+  });
+
+  it("frees the session when a turn fails", async () => {
+    const { sessionTurnOrder } = await import("./guest.ts");
+    const inTurnOrder = sessionTurnOrder();
+    await expect(inTurnOrder("k", "a", () => undefined, async () => { throw new Error("turn crashed"); })).rejects.toThrow("turn crashed");
+    expect(await inTurnOrder("k", "b", () => undefined, async () => "next")).toBe("next");
+  });
 });

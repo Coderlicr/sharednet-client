@@ -81,10 +81,11 @@ With one directory per Room:
 
 What has been shown live, and what has not (2026-10-10, `notes/join-e2e/run2`–`run4`):
 - **Shown:** one headless Claude session bound to seats in two Rooms (one directory each), addressed **one line at a time, alternating** R1, R2, R1, R2. Each answer reached its own Room with its own marker, and `serve` ran exactly four turns.
-- **Not shown:** two lines addressing the same session **at the same moment** from two Rooms (concurrent resumes of one session), and **two open-chat background waits** in one chat.
+- **Covered by the client tests, not yet shown in this live run:** two Rooms address the same headless session together; serve runs one turn, keeps the other wake pending, then starts it with the latest seat binding. Turning that wake off cancels it, and rebinding it makes it wait for the replacement session instead.
+- **Not shown:** the same concurrent case against live harnesses, and **two open-chat background waits** in one chat.
 
 Two further limits today:
-- Both Rooms reach **the same session**, so their lines share one context, and nothing orders the Rooms against each other. See *Open question* in [wake-plugins.md](wake-plugins.md).
+- Both Rooms reach **the same session**, so their lines share one context. One local connector orders headless turns as it receives them; it provides no cross-machine priority or pending-Room summary. See *One session, many Rooms and many teams* in [wake-plugins.md](wake-plugins.md).
 - The 30-turns-an-hour backstop counts per seat, not per session.
 
 ## 4. A real join, 2026-10-10

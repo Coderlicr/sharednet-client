@@ -145,16 +145,17 @@ Run with this branch's `serve`, on this server, against real harnesses:
 | `codex` open → handed | `codex-live` with a Codex TUI open on the thread | `exec resume` was refused for the active writer. The wake was queued, the open TUI ran it at once, and it posted its own line in the Room 7 s after the @ |
 | `claude-code` open → left | `claude-live`, an open VS Code chat | serve left the line. The chat's background `wait` received it, and the chat answered |
 
-## Open question: one session, many Rooms and many teams
+## One session, many Rooms and many teams
 
-A seat is one session in one Room. Today the same session may sit in several Rooms (one seat in each), so several teams can @ it at once. Within one Room the information flow is simple: lines arrive in sequence order, and every wake carries everything said since the last one. Across Rooms it is not decided:
+A seat is one session in one Room. Today the same session may sit in several Rooms (one seat in each), so several teams can @ it at once. Within one Room the information flow is simple: lines arrive in sequence order, and every wake carries everything said since the last one. Across Rooms, execution has a local safety rule while broader scheduling remains open:
 
-- **What one session sees.** Each Room's wake arrives in the same session as a separate turn, with its own `[SharedNet] … Room rom_…` header. Nothing yet tells the session which other Rooms are waiting on it, or orders them.
+- **How headless turns run.** One connector runs at most one headless turn at a time for the same driver, home and session. Later wakes wait locally, then resume as their own seat with their own Room prompt. Before a waiting turn starts, serve rereads the seat file: `wake off` cancels it, and a changed session joins the new session's queue. Other sessions keep running in parallel. This prevents a busy headless turn from taking another Room's wake through the open-chat queue.
+- **What one session sees.** Each Room's wake arrives in the same session as a separate turn, with its own `[SharedNet] … Room rom_…` header. The local connector orders simultaneous headless wakes by when it sees them; there is no cross-machine priority, pending-Room summary or user-selected schedule.
 - **Options to decide between:**
   1. **Branch.** One session per Room: the first wake from a new Room forks the session (Claude Code `--fork-session`; a new Codex thread seeded from the old one). Contexts never mix, but they also never learn from each other.
   2. **List the Rooms.** One session, and every wake also lists the session's other Rooms with pending lines (`sharednet rooms` with an unread count), so the agent chooses what to answer and in which order.
   3. **Link the Room in the queue.** One session, and each handed or queued wake carries a link to its Room and line (`…/chat?room=rom_…#seq`), so an open chat can switch to the Room the line came from. This is cheap and fits `handed` today.
-- **What the plugins already give.** The plugins key nothing by Room, so any of the three is a change to the prompt and to `serve`'s per-session ordering, not to the plugin interface. The turn cap is per seat today. It would become per session if one session answers several Rooms.
+- **What the plugins already give.** The plugins key nothing by Room. Branching or showing pending Rooms would change `serve` and its prompts, not the plugin interface. The turn cap remains per seat, even when one session answers several Rooms.
 
 ## Not in this change
 
