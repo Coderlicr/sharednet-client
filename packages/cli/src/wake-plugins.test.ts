@@ -52,7 +52,7 @@ const ACTIVE_WRITER = "ERROR codex_core::session: Failed to create session: thre
 
 describe("the registry", () => {
   it("knows each plugin by its driver, and asks them in turn which harness this process is", () => {
-    expect(wakePlugins.map((plugin) => plugin.driver)).toEqual(["codex", "claude-code", "codebuddy", "command"]);
+    expect(wakePlugins.map((plugin) => plugin.driver)).toEqual(["codex", "claude-code", "codebuddy", "manus", "command"]);
     expect(pluginFor("claude-code").label).toBe("Claude Code");
     expect(seatWakeFrom({ CODEX_SESSION_ID: "019a", PATH: "" }, "/w")?.driver).toBe("codex");
     expect(seatWakeFrom({ CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "6613", PATH: "" }, "/w")?.driver).toBe("claude-code");

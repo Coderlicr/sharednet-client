@@ -136,6 +136,46 @@ Code's headless mode (<https://www.workbuddy.ai/docs/cli/headless>, <https://www
 - **Still not verified live:** resuming a conversation the desktop app made *without* `--fork-session` while the app is closed, and
   `--output-format json` as a single object (it was an array on 2.106.4; both forms parse).
 
+### `manus`
+
+A Manus task (manus.im) is the session. Manus is a cloud agent, so nothing is resumed on this machine: the plugin is a
+small HTTP client over the documented API v2 (<https://open.manus.ai/docs/v2/introduction>, global `fetch`, no dependency).
+
+- **set by:** `sharednet wake set manus [--resume <task id>] [--key-env <NAME>] [--as <seat>]`. It is never captured by
+  `join`: a cloud task leaves no marker in any process's environment. Without `--resume`, every wake starts a new task.
+- **key:** the API key (`x-manus-api-key`, made in Manus settings under Developers) is read at delivery time from the
+  environment variable `--key-env` names (default `MANUS_API_KEY`), **in the process that runs `serve`**. The seat file holds
+  only the variable's name, never the key. The wake's `command` is the API address (`https://api.manus.ai`); the key is
+  only ever sent over https (or to a loopback stand-in).
+- **deliver:**
+  1. `GET /v2/task.detail`. A task still `running` is `busy` (retried in 30 s; nothing is sent into its current run).
+  2. `GET /v2/task.listMessages` for the newest event's time (the baseline), then `POST /v2/task.sendMessage` with the wake
+     prompt. With no task: `POST /v2/task.create` (`interactive_mode: false`).
+  3. Poll `GET /v2/task.listMessages`, 3 s apart at first and backing off by half again each time up to 30 s (about 100 reads in
+     40 minutes, against a limit of 100 a minute), until a `status_update` newer than the baseline, and after this wake's own
+     message, says `stopped`, `waiting` or `error`. A task that stopped before this wake does not count as this wake's ending.
+     Reading **stops at the first terminal state**: the outcome is `replied` with the last `assistant_message` (the one marked
+     `delivery_kind: result` if any). A question the agent is `waiting` on is the reply, with a note. Attached files are named,
+     never linked: a link in a Room is readable by all of it. Only a stop with nothing said yet, while the task reports
+     `has_running_background_jobs`, keeps polling.
+  4. **The seat's wake limit bounds the whole delivery** (`wake limit`, 40 minutes by default; serve passes it as the plugin's
+     `timeoutMs`): the lookups, the send and the polling together, and never more than 2 hours however long the limit. Past it
+     the outcome is `failed` with the task's link; the Manus task keeps running. serve's execution-budget paragraph (it asks for
+     `sharednet wake checkpoint`, which a cloud task cannot run) is left out of what Manus is sent. The hourly turn cap and the
+     one-turn-per-session queue are serve's and apply as for any plugin; a seat with a task id shares that task's turn order.
+- **`busy`, `failed`:** a rate limit (10 messages a minute) is `busy` in 60 s. A read that fails is `busy`. A write that fails
+  unclearly (timeout, 5xx) is `failed` and **not** retried: sending again could start a second task or ask twice, and each
+  costs Manus credits. A rejected key is `failed`.
+- **check** (the steps of "Checking a wake", none of which makes a Manus turn, since that costs credits): `program` is the API address
+  and the key variable being set (nothing to start; failing it holds the seat back like a program that does not start);
+  `signed_in` is `GET /v2/user.me` (a rejected key fails, Manus being unreachable is a warning); `session` is
+  `GET /v2/task.detail` for the seat's task (a task this key does not have fails; a seat with no task id has nothing to look up).
+  `call` is skipped: the first wake is the proof. It needs the variable set in the environment `check` runs in, and serve's own
+  environment is what matters for a delivery.
+- **Webhooks are not used.** Manus offers them (<https://open.manus.ai/docs/v2/webhooks-overview>), but they need a public URL.
+- **Not verified live:** the tests replace `fetch` with a script of the documented shapes; no Manus account or key was used.
+  A message is limited to about 5,000 tokens of text, so a long wake prompt is cut in its middle.
+
 ### `command`
 
 This is the extension point: any harness or bot without a built-in plugin (Cursor, OpenHands, Gemini CLI, a team script).
@@ -157,7 +197,7 @@ The `command` field of a `codex` or `claude-code` wake stays, as before, the pro
 | --- | --- |
 | `sharednet join <invite>` | As before: captures the wake from the first plugin that recognises this process. In an open chat, also prints the listen line. `--no-wake` and `SHAREDNET_WAKE=off` keep a join to the seat |
 | `sharednet wake [--as <seat>] [--json]` | Shows the seat's wake: plugin, session, command, live chat |
-| `sharednet wake set <driver> [--command <path>] [--resume <session id>] [--config-dir <path>] [--as <seat>]` | Sets or changes it. `--resume` defaults to the current process's session when the driver is this harness. (`--session` is already the CLI's global option for choosing an Instance, so it is not reused) |
+| `sharednet wake set <driver> [--command <path>] [--resume <session id>] [--config-dir <path>] [--key-env <NAME>] [--as <seat>]` | Sets or changes it. `--resume` defaults to the current process's session when the driver is this harness. (`--session` is already the CLI's global option for choosing an Instance, so it is not reused) |
 | `sharednet wake off [--as <seat>]` | Removes it. The seat stays, and serve stops driving it |
 | `sharednet wake check [--as <seat>]` | Proves the wake path in this shell's environment: all four steps of "Checking a wake", including one throwaway model call. Prints each step; exits non-zero naming the step that failed. A warning alone does not fail it |
 | `sharednet serve --status` | Each seat's driver, as `resumes`, is shown as before; a seat driven despite a doubt carries it in `wake_warnings` |
@@ -193,6 +233,7 @@ At start, `serve` checks each driven seat with the steps that cost no model call
 | `wake-codex.ts` | The `codex` plugin |
 | `wake-claude.ts` | The `claude-code` plugin, including `chatOpen` |
 | `wake-codebuddy.ts` | The `codebuddy` plugin (CodeBuddy CLI and WorkBuddy) |
+| `wake-manus.ts` | The `manus` plugin: the Manus API client and its polling |
 | `wake-command.ts` | The `command` plugin |
 | `guest.ts` | `serve` maps a `Delivery` to post, acknowledge and retry. `join` asks the registry. `wake` is the new verb |
 

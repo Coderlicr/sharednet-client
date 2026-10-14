@@ -14,6 +14,7 @@ import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn
 import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
 import { chatOpen } from "./wake-claude.ts";
 import { codebuddyProgram } from "./wake-codebuddy.ts";
+import { MANUS_API } from "./wake-manus.ts";
 import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
 import { describeWake, isWakeDriver, pluginFor, seatWakeFrom } from "./wake-plugins.ts";
 import {
@@ -121,7 +122,7 @@ const INVITE_TOKEN_PATTERN = /^rit_[A-Za-z0-9_-]{43}$/;
 /** The server caps one wait at this; the client loops. */
 const WAIT_MAX_SECONDS = 25;
 
-const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume", "config-dir"]);
+const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume", "config-dir", "key-env"]);
 /** Options that may be given more than once; every value is kept, in order. */
 const REPEATABLE_OPTIONS = new Set(["on", "artifact"]);
 const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake", "switch-account"]);
@@ -3427,7 +3428,7 @@ async function timer(args: string[], dependencies: GuestDependencies): Promise<u
 }
 
 const WAKE_USAGE =
-  "Usage: sharednet wake [--as <i_…>], sharednet wake set codex|claude-code|codebuddy|command [--command <path>] [--resume <session>] [--config-dir <path>] [--as <i_…>], sharednet wake off [--as <i_…>], sharednet wake check [--as <i_…>], sharednet wake limit <1m..24h> [--as <i_…>], or sharednet wake checkpoint <progress> [--as <i_…>]";
+  "Usage: sharednet wake [--as <i_…>], sharednet wake set codex|claude-code|codebuddy|manus|command [--command <path>] [--resume <session>] [--config-dir <path>] [--key-env <NAME>] [--as <i_…>], sharednet wake off [--as <i_…>], sharednet wake check [--as <i_…>], sharednet wake limit <1m..24h> [--as <i_…>], or sharednet wake checkpoint <progress> [--as <i_…>]";
 
 /**
  * A seat's wake, by hand (docs/wake-plugins.md): which plugin delivers it, what it resumes, the
@@ -3435,7 +3436,7 @@ const WAKE_USAGE =
  */
 async function wakeVerb(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["as", "command", "resume", "config-dir"]);
+  assertOnlyOptions(parsed, ["as", "command", "resume", "config-dir", "key-env"]);
   const [action = "show", driver, ...extra] = parsed.positionals;
   if (extra.length > 0 || !["show", "set", "off", "check", "limit", "checkpoint"].includes(action) || ["set", "limit", "checkpoint"].includes(action) !== (driver !== undefined)) {
     throw localError("invalid_arguments", WAKE_USAGE);
@@ -3485,30 +3486,35 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
     return { ...shown(wake), check: checked.message, ...(checked.steps ? { steps: checked.steps } : {}) };
   }
 
-  if (!isWakeDriver(driver)) throw localError("invalid_arguments", `The wake drivers are codex, claude-code, codebuddy and command. ${WAKE_USAGE}`);
+  if (!isWakeDriver(driver)) throw localError("invalid_arguments", `The wake drivers are codex, claude-code, codebuddy, manus and command. ${WAKE_USAGE}`);
   // What this process is, when it is the harness being set: its session, its program, its open chat.
   const here = pluginFor(driver).capture(dependencies.env, dependencies.cwd);
   const before = credential.wake?.driver === driver ? credential.wake : undefined;
   const session = stringOption(parsed, "resume") ?? before?.session ?? here?.session;
   const command = stringOption(parsed, "command") ?? before?.command ?? here?.command;
   if (driver === "command" && command === undefined) throw localError("invalid_arguments", "A command wake needs --command <path>: the adapter that is handed each wake.");
-  if (driver !== "command" && session === undefined) {
+  // A Manus seat may have no task: every wake then starts one.
+  if (driver !== "command" && driver !== "manus" && session === undefined) {
     throw localError("invalid_arguments", `A ${pluginFor(driver).label} wake resumes a session: give --resume <session id>, or run this from inside that session.`);
   }
   const home = before?.codex_home ?? here?.codex_home;
   const configDir = stringOption(parsed, "config-dir") ?? before?.config_dir ?? here?.config_dir;
   if (stringOption(parsed, "config-dir") !== undefined && driver !== "codebuddy") throw localError("invalid_arguments", "--config-dir belongs to the codebuddy driver.");
+  const keyEnv = stringOption(parsed, "key-env") ?? before?.api_key_env;
+  if (keyEnv !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyEnv)) throw localError("invalid_arguments", "--key-env is the NAME of the environment variable that holds the API key, not the key.");
+  if (keyEnv !== undefined && driver !== "manus") throw localError("invalid_arguments", "--key-env belongs to the manus driver.");
   // An open chat is only this one, and only when it is the session being set.
   const live = here?.live_pid !== undefined && here.session === session ? here.live_pid : undefined;
   const wake: SeatWake = {
     driver,
-    ...(driver === "command" ? {} : { session: session! }),
+    ...(driver === "command" || session === undefined ? {} : { session }),
     cwd: before?.cwd ?? dependencies.cwd,
     ...(credential.wake?.turn_limit_ms !== undefined ? { turn_limit_ms: credential.wake.turn_limit_ms } : {}),
-    command: command ?? (driver === "codex" ? (onPath("codex", dependencies.env) ?? "codex") : driver === "codebuddy" ? codebuddyProgram(dependencies.env) : (onPath("claude", dependencies.env) ?? "claude")),
+    command: command ?? (driver === "codex" ? (onPath("codex", dependencies.env) ?? "codex") : driver === "codebuddy" ? codebuddyProgram(dependencies.env) : driver === "manus" ? MANUS_API : (onPath("claude", dependencies.env) ?? "claude")),
     ...(driver === "codex" && home ? { codex_home: home } : {}),
     ...(driver === "codebuddy" && configDir ? { config_dir: configDir } : {}),
     ...(driver === "claude-code" && live !== undefined ? { live_pid: live } : {}),
+    ...(driver === "manus" && keyEnv ? { api_key_env: keyEnv } : {}),
   };
   await writeRoomCredential(paths, { ...credential, wake });
   dependencies.stderr?.(`${credential.member_id} wakes ${describeWake(wake)} when addressed; a running serve uses it from the next wake.\n`);

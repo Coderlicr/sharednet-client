@@ -21,7 +21,7 @@ export function validTurnLimit(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 60_000 && value <= 24 * 60 * 60_000;
 }
 
-export type WakeDriver = "codex" | "claude-code" | "codebuddy" | "command";
+export type WakeDriver = "codex" | "claude-code" | "codebuddy" | "manus" | "command";
 
 export interface SeatWake {
   driver: WakeDriver;
@@ -45,6 +45,11 @@ export interface SeatWake {
    * which holds the session. A resume finds a session only under the directory it was made in.
    */
   config_dir?: string;
+  /**
+   * Manus (wake-manus.ts): the NAME of the environment variable that holds the API key in the process
+   * that runs `serve`. The key itself is never written to a seat file.
+   */
+  api_key_env?: string;
 }
 
 /** What one wake is about: where it was said, by whom, and the two prompts a plugin may hand on. */
@@ -68,6 +73,15 @@ export interface DeliveryContext {
   /** Whether a chat's process is still open. Tests replace it. */
   chatOpen: (pid: number) => boolean;
   timeoutMs: number;
+  /** For a plugin that talks to an HTTP API instead of running a program. Tests replace it. */
+  api?: PluginNet;
+}
+
+/** What an API plugin needs from the outside world; each defaults to the real one. */
+export interface PluginNet {
+  fetch?: typeof globalThis.fetch;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
 }
 
 /**
@@ -109,6 +123,8 @@ export interface CheckOptions {
    * so only `sharednet wake check` asks for it; serve's start takes the steps that cost none.
    */
   call: boolean;
+  /** For a plugin that talks to an HTTP API instead of running a program. Tests replace it. */
+  api?: PluginNet;
 }
 
 export interface WakePlugin {

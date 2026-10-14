@@ -2620,6 +2620,29 @@ describe("sharednet say and wait", () => {
       expect((await run(["wake", "set", "codex", "--resume", "019a", "--config-dir", "/x", "--json"], space, [])).exitCode).not.toBe(0);
     });
 
+    it("binds a seat to a Manus task by hand, naming the key's variable and never holding the key", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE, "--no-wake"], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
+
+      // Nothing in a cloud task's environment says which task a process is, so the task id is given.
+      const set = await run(["wake", "set", "manus", "--resume", "task_synthetic_0001", "--key-env", "TEAM_MANUS_KEY", "--json"], space, []);
+      expect(JSON.parse(set.stdout).wake).toEqual({ driver: "manus", session: "task_synthetic_0001", cwd: space.project, command: "https://api.manus.ai", api_key_env: "TEAM_MANUS_KEY" });
+      expect(set.stderr).toContain(`${MEMBER_ID} wakes manus task_synthetic_0001 when addressed`);
+      // A later set keeps what it is not told to change.
+      const again = await run(["wake", "set", "manus", "--json"], space, []);
+      expect(JSON.parse(again.stdout).wake).toMatchObject({ session: "task_synthetic_0001", api_key_env: "TEAM_MANUS_KEY" });
+
+      // Without a task, every wake starts one; and a pasted key is refused as a variable name.
+      expect((await run(["wake", "off", "--json"], space, [])).exitCode).toBe(0);
+      const fresh = await run(["wake", "set", "manus", "--json"], space, []);
+      expect(JSON.parse(fresh.stdout).wake).toEqual({ driver: "manus", cwd: space.project, command: "https://api.manus.ai" });
+      const pasted = await run(["wake", "set", "manus", "--key-env", "sk-synthetic-not-a-name", "--json"], space, []);
+      expect(pasted.exitCode).not.toBe(0);
+      expect(pasted.stdout + pasted.stderr).toContain("NAME of the environment variable");
+      expect((await run(["wake", "set", "claude-code", "--resume", "6613bb00", "--key-env", "X", "--json"], space, [], { CLAUDE_SESSION_ID: "" })).exitCode).not.toBe(0);
+      expect(JSON.stringify(await credentialOf(space))).not.toContain("sk-synthetic");
+    });
+
     it("leaves alone a seat no session took, unless --run gives it a command", async () => {
       // Such a seat is someone's own `wait`'s to answer; sitting in it would count its lines as handled.
       const space = await workspace();

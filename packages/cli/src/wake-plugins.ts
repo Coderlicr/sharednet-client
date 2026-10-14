@@ -3,13 +3,14 @@ import { codebuddyPlugin } from "./wake-codebuddy.ts";
 import { codexPlugin } from "./wake-codex.ts";
 import { commandPlugin } from "./wake-command.ts";
 import { validTurnLimit } from "./wake-driver.ts";
+import { manusPlugin } from "./wake-manus.ts";
 import type { Environment, SeatWake, WakeDriver, WakePlugin } from "./wake-driver.ts";
 
 /**
  * The wake plugins (docs/wake-plugins.md). A harness is one module and one line here; `serve` and
  * `join` only ever ask the registry.
  */
-export const wakePlugins: readonly WakePlugin[] = [codexPlugin, claudePlugin, codebuddyPlugin, commandPlugin];
+export const wakePlugins: readonly WakePlugin[] = [codexPlugin, claudePlugin, codebuddyPlugin, manusPlugin, commandPlugin];
 
 export function pluginFor(driver: WakeDriver): WakePlugin {
   const plugin = wakePlugins.find((candidate) => candidate.driver === driver);
@@ -39,8 +40,10 @@ export function parseSeatWake(value: unknown): SeatWake | undefined {
   const session = text(record.session);
   const cwd = text(record.cwd);
   const command = text(record.command);
-  // A harness's wake resumes a session; a command's has none to resume.
-  if (!driver || !cwd || !command || (driver !== "command" && !session)) return undefined;
+  // A harness's wake resumes a session; a command's has none to resume, and a Manus seat without a
+  // task id starts a new task per wake.
+  if (!driver || !cwd || !command || (driver !== "command" && driver !== "manus" && !session)) return undefined;
+  const keyEnv = typeof record.api_key_env === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(record.api_key_env) ? record.api_key_env : null;
   const home = text(record.codex_home);
   const configDir = text(record.config_dir);
   const live = record.live_pid;
@@ -54,6 +57,7 @@ export function parseSeatWake(value: unknown): SeatWake | undefined {
     ...(validTurnLimit(record.turn_limit_ms) ? { turn_limit_ms: record.turn_limit_ms } : {}),
     ...(typeof live === "number" && Number.isSafeInteger(live) && live > 0 ? { live_pid: live } : {}),
     ...(driver === "codebuddy" && configDir ? { config_dir: configDir } : {}),
+    ...(driver === "manus" && keyEnv ? { api_key_env: keyEnv } : {}),
   };
 }
 
