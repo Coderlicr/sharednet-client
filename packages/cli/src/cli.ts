@@ -15,6 +15,7 @@ import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
 import type { ProcessProbe } from "./process-identity.ts";
+import type { WakeServiceControl } from "./serve-service.ts";
 import type { CheckOptions, CheckResult, SeatWake, TurnRunner } from "./wake-driver.ts";
 
 
@@ -47,6 +48,8 @@ export interface CliDependencies {
   checkWake?: (wake: SeatWake, options: CheckOptions) => Promise<CheckResult>;
   /** Starts `serve` in the background after a join; only the real process (main.ts) supplies it. */
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
+  /** `serve --install`'s launchd agent; only the real process (main.ts) supplies it. */
+  wakeService?: (env: Environment) => WakeServiceControl;
   /** Whether a serve lock's pid is still the process that wrote it; tests replace it. */
   processProbe?: ProcessProbe;
   /** Test seams for serve's look for new seats. */
@@ -71,6 +74,8 @@ interface ResolvedDependencies {
   chatOpen?: (pid: number) => boolean;
   checkWake?: (wake: SeatWake, options: CheckOptions) => Promise<CheckResult>;
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
+  /** `serve --install`'s launchd agent; only the real process (main.ts) supplies it. */
+  wakeService?: (env: Environment) => WakeServiceControl;
   /** Whether a serve lock's pid is still the process that wrote it; tests replace it. */
   processProbe?: ProcessProbe;
   /** Test seams for serve's look for new seats. */
@@ -771,6 +776,7 @@ export async function runCli(
     ...(supplied.checkWake ? { checkWake: supplied.checkWake } : {}),
     ...(supplied.startWakeService ? { startWakeService: supplied.startWakeService } : {}),
     ...(supplied.processProbe ? { processProbe: supplied.processProbe } : {}),
+    ...(supplied.wakeService ? { wakeService: supplied.wakeService } : {}),
     ...(supplied.rescanMs ? { rescanMs: supplied.rescanMs } : {}),
     ...(supplied.listSeats ? { listSeats: supplied.listSeats } : {}),
     ...(supplied.lockPause ? { lockPause: supplied.lockPause } : {}),

@@ -13,6 +13,7 @@ import { detectRuntime, type DetectedRuntime } from "./runtime-detection.ts";
 import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn, triggerTakesParameter, wakeIdentity, type Trigger } from "./triggers.ts";
 import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
 import { looksLikeServe, systemProcessProbe, type ProcessProbe } from "./process-identity.ts";
+import { RESTART_SECONDS, serviceInstalled, type WakeServiceControl } from "./serve-service.ts";
 import { chatOpen } from "./wake-claude.ts";
 import { codebuddyProgram } from "./wake-codebuddy.ts";
 import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
@@ -73,6 +74,11 @@ export interface GuestDependencies {
    * when it is addressed. Only the real process supplies it; without it, a join starts nothing.
    */
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
+  /**
+   * The wake service as an installed launchd agent (serve-service.ts): `serve --install`,
+   * `--uninstall`, its state in `--status`, and starting it after a join. Only the real process supplies it.
+   */
+  wakeService?: (env: Environment) => WakeServiceControl;
   /** Whether a serve lock's pid is still the process that wrote it (process-identity.ts); tests replace it. */
   processProbe?: ProcessProbe;
   /** How often a running `serve` looks for seats joined since it started; tests shorten it. */
@@ -133,7 +139,7 @@ const WAIT_MAX_SECONDS = 25;
 const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume", "config-dir"]);
 /** Options that may be given more than once; every value is kept, in order. */
 const REPEATABLE_OPTIONS = new Set(["on", "artifact"]);
-const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake", "switch-account"]);
+const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake", "switch-account", "install", "uninstall", "service"]);
 
 function parseGuestArguments(args: string[]): ParsedGuestArguments {
   const options = new Map<string, string | true>();
@@ -778,6 +784,7 @@ async function wakeAfterJoin(
   let service: "running" | "started" | "not_started" | "outdated";
   let how: string;
   let pid: number | null = null;
+  const installed = status.running && status.pid ? null : await installedService(dependencies);
   if (status.running && status.pid) {
     const compatible = status.drives && status.wake_protocol === "wake-plugins-v1";
     service = compatible ? "running" : "outdated";
@@ -785,6 +792,14 @@ async function wakeAfterJoin(
     how = compatible
       ? `the wake service already running here (pid ${status.pid}) takes this seat within seconds`
       : `the connector running here (pid ${status.pid}) has not confirmed wake-plugins-v1; do not start a background wait alongside it. Have the host operator upgrade/restart it (sharednet serve --stop, then sharednet serve) and verify this seat before participating`;
+  } else if (installed !== null) {
+    // An installed service is the one serve on this machine: start it, never a second, detached one.
+    // launchd starts it, so it does not inherit this session or its sandbox.
+    const started = await installed.start().catch((error: unknown) => ({ ok: false, message: String(error) }));
+    service = started.ok ? "started" : "not_started";
+    how = started.ok
+      ? `${started.message}; it takes this seat within seconds (log ${joinPath(paths.stateDir, "serve.log")})`
+      : `${started.message}; check it with \`sharednet serve --status\`, or run \`sharednet serve --uninstall\` and install it again`;
   } else if (sandboxed(dependencies.env)) {
     service = "not_started";
     how = "this session runs in a sandbox, which a background service would inherit, so nothing was started: run `sharednet serve` outside it";
@@ -808,6 +823,14 @@ async function wakeAfterJoin(
     );
   }
   return { driver: wake.driver, session: wake.session, address, service, ...(pid ? { pid } : {}), ...(listen !== null ? { live_chat: true, listen } : {}) };
+}
+
+/** The installed wake service, or null when none is installed (or none can be, here). */
+async function installedService(dependencies: GuestDependencies): Promise<WakeServiceControl | null> {
+  const control = dependencies.wakeService?.(dependencies.env);
+  if (!control) return null;
+  const state = await control.state().catch(() => null);
+  return state?.installed ? control : null;
 }
 
 async function currentSeat(
@@ -2678,6 +2701,8 @@ async function doorbellAddress(option: string, port: number, dependencies: Guest
 
 /** How often a running `serve` looks for seats joined since it started. */
 const RESCAN_MS = 5_000;
+/** How often an installed service, kept waiting by another serve, looks whether that one stopped. */
+const SLOT_WAIT_MS = 10_000;
 // Checkpoints contain agent-written progress, never captured process output or credentials.
 function checkpointPath(stateDir: string, room: string, member: string): string {
   return joinPath(stateDir, "wake-progress", `${createHash("sha256").update(`${room}/${member}`).digest("hex")}.json`);
@@ -2733,11 +2758,11 @@ const MAX_MESSAGE_BYTES = 32_768;
 
 async function serve(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["run", "reply", "rooms", "from-instance", "from-agent", "grep", "status", "stop", "push", "listen"]);
+  assertOnlyOptions(parsed, ["run", "reply", "rooms", "from-instance", "from-agent", "grep", "status", "stop", "push", "listen", "install", "uninstall", "service"]);
   if (parsed.positionals.length !== 0) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet serve [--run '<command>'] [--reply] [--rooms all|rom_…,rom_…] [--grep TEXT] [--push <public address>|ngrok [--listen <port>]], or sharednet serve --status | --stop",
+      "Usage: sharednet serve [--run '<command>'] [--reply] [--rooms all|rom_…,rom_…] [--grep TEXT] [--push <public address>|ngrok [--listen <port>]], or sharednet serve --status | --stop | --install | --uninstall",
     );
   }
   const pushOption = stringOption(parsed, "push");
@@ -2747,8 +2772,48 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   }
   const listen = listenOption === undefined ? 8787 : Number(listenOption);
   const paths = getStoragePaths(dependencies.env);
-  if (parsed.options.get("status") === true) return readServeStatus(paths, dependencies.processProbe);
-  if (parsed.options.get("stop") === true) return stopServe(paths, dependencies);
+  const control = dependencies.wakeService?.(dependencies.env);
+  const install = parsed.options.get("install") === true;
+  if (install || parsed.options.get("uninstall") === true) {
+    if ([...parsed.options.keys()].some((name) => name !== "install" && name !== "uninstall") || (install && parsed.options.get("uninstall") === true)) {
+      throw localError("invalid_arguments", "--install and --uninstall go alone: the service serves every seat here joined from a Codex or Claude Code session.");
+    }
+    if (!control) throw localError("service_unsupported", "Only the sharednet executable can install or remove its service.");
+    // No launchd here (Linux, Windows): say so before anything else, the sandbox included, since
+    // leaving the sandbox would not help.
+    control.assertSupported();
+    if (!install) return control.uninstall();
+    if (sandboxed(dependencies.env)) throw localError("service_not_installed", "This session runs in a sandbox; install the service from a terminal outside it.");
+    // The install-time contract (docs/serve-service.md), in this order. First SharedNet's own service
+    // for this root, by exact label and plist: an installed one holds the lock itself, and launchd
+    // would undo a --stop, so the way on is --uninstall. Then this root's serve lock, whoever holds
+    // it. Supervisors SharedNet did not write are not interpreted; the report tells the operator so.
+    const own = await control.state();
+    // Supported (above), so launchd answers; null would mean no launchd after all, which install refuses.
+    if (own === null) return reportInstall(await control.install(), dependencies);
+    if (own.installed || own.loaded) throw serviceInstalled(own);
+    // The lock checked is the one the service will use.
+    if (own.root !== resolvePathFrom(paths.configDir)) {
+      throw localError("service_not_installed", `This shell's storage root ${paths.configDir} is not the root the service would use (${own.root}); install from a shell with plain absolute HOME and XDG_CONFIG_HOME.`);
+    }
+    const running = (await readServeStatus(paths, dependencies.processProbe)) as { running?: boolean; pid?: number };
+    if (running.running && running.pid) {
+      throw localError(
+        "serve_running",
+        `A connector already holds the serve lock for storage root ${paths.configDir} (pid ${running.pid}), whoever started it. Stop it first with \`sharednet serve --stop\` (or retire the supervisor that runs it), then install again.`,
+      );
+    }
+    return reportInstall(await control.install(), dependencies);
+  }
+  if (parsed.options.get("status") === true) {
+    const status = (await readServeStatus(paths, dependencies.processProbe)) as Record<string, unknown>;
+    const service = await control?.state().catch(() => null);
+    return service ? { ...status, service } : status;
+  }
+  if (parsed.options.get("stop") === true) return stopServe(paths, dependencies, control);
+  // What an installed service runs: with no seat yet, or another serve holding the lock, it waits
+  // instead of ending, since launchd would only start it again.
+  const asService = parsed.options.get("service") === true;
 
   const command = stringOption(parsed, "run");
   const reply = parsed.options.get("reply") === true;
@@ -2769,7 +2834,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const listSeats = () => (dependencies.listSeats ? dependencies.listSeats(() => heldSeats(paths)) : heldSeats(paths));
   const held = await listSeats();
   const seats = held.filter(served);
-  if (seats.length === 0) {
+  if (seats.length === 0 && !asService) {
     throw localError(
       "not_in_a_room",
       held.length === 0
@@ -2812,8 +2877,23 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       ...(wakeWarnings.get(seatKey(seat))?.length ? { wake_warnings: wakeWarnings.get(seatKey(seat)) } : {}),
     })),
   });
-  const holder = hardened ? await claimServe(paths, statusOf(seats), probe, dependencies.lockPause) : await legacyClaimServe(paths, statusOf(seats));
+  const claim = () => (hardened ? claimServe(paths, statusOf(seats), probe, dependencies.lockPause) : legacyClaimServe(paths, statusOf(seats)));
   const release = () => (lockId !== undefined ? releaseServe(paths, lockId) : legacyReleaseServe(paths));
+  let holder = await claim();
+  if (holder !== null && asService) {
+    const waitSleep = dependencies.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    dependencies.stderr?.(`serve: ${holder === 0 ? "another connector is starting" : `a connector is already running (pid ${holder})`} for storage root ${paths.configDir}; this service waits for it to stop, then takes over\n`);
+    while (holder !== null && !dependencies.signal?.aborted) {
+      await waitSleep(SLOT_WAIT_MS);
+      holder = await claim();
+    }
+    if (holder !== null) return { served: 0 };
+    // Stopped while it waited, though the lock came free on the last look: give it straight back.
+    if (dependencies.signal?.aborted) {
+      await release();
+      return { served: 0 };
+    }
+  }
   if (holder !== null) {
     throw localError(
       "serve_running",
@@ -2849,6 +2929,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   // nothing is said. Ctrl-C takes the doorbells down before it goes.
   const stopping = new AbortController();
   const stop = () => stopping.abort();
+  if (dependencies.signal?.aborted) stop();
   dependencies.signal?.addEventListener("abort", stop, { once: true });
   /** A startup retry must not keep an installed service alive for the full backoff after shutdown. */
   const retryDelay = async (ms: number): Promise<void> => {
@@ -2888,7 +2969,11 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     throw error;
   }
 
-  dependencies.stderr?.(`serve: sitting in ${seats.length} Room(s): ${seats.map((seat) => seat.room_id).join(", ")}\n`);
+  dependencies.stderr?.(
+    seats.length > 0
+      ? `serve: sitting in ${seats.length} Room(s): ${seats.map((seat) => seat.room_id).join(", ")}\n`
+      : `serve: no seat to drive yet; looking every ${(dependencies.rescanMs ?? RESCAN_MS) / 1000}s for one joined from a Codex or Claude Code session\n`,
+  );
   if (base !== null) dependencies.stderr?.(`serve: doorbell at ${base}/sharednet/push/<seat>, listening on 127.0.0.1:${listen}; idle until rung\n`);
 
   const sitIn = async (seat: StoredRoomCredential) => {
@@ -3211,7 +3296,8 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       supervise(seat).then(
         () => {
           live -= 1;
-          if (live === 0) finish();
+          // A service outlives its seats: a seat joined later is still picked up by the next look.
+          if (live === 0 && (!asService || stopping.signal.aborted)) finish();
         },
         (error: unknown) => {
           failure ??= error;
@@ -3222,6 +3308,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     return true;
   };
   for (const seat of seats) begin(seat);
+  if (asService) stopping.signal.addEventListener("abort", () => live === 0 && finish(), { once: true });
   // A look still in flight when the loops are done must finish before the lock is given back: it
   // could otherwise begin a seat, and write a status, after a successor has taken the lock.
   let looking: Promise<void> | null = null;
@@ -3559,7 +3646,19 @@ async function readServeStatus(paths: ReturnType<typeof getStoragePaths>, probe:
 }
 
 /** Stops the listener holding the slot: only an exact, verified holder is ever signalled. */
-async function stopServe(paths: ReturnType<typeof getStoragePaths>, dependencies: GuestDependencies): Promise<unknown> {
+async function stopServe(paths: ReturnType<typeof getStoragePaths>, dependencies: GuestDependencies, control?: WakeServiceControl): Promise<unknown> {
+  const stopped = (await stopListener(paths, dependencies)) as { stopped?: boolean };
+  // An installed service is started again by launchd: stopping is how it restarts on the newest CLI.
+  const service = stopped.stopped ? await control?.state().catch(() => null) : null;
+  if (service?.installed && service.loaded) {
+    const note = `the installed service ${service.label} starts serve again within ${RESTART_SECONDS}s; to stop it for good: sharednet serve --uninstall`;
+    dependencies.stderr?.(`serve: ${note}\n`);
+    return { ...stopped, restarts: true, note };
+  }
+  return stopped;
+}
+
+async function stopListener(paths: ReturnType<typeof getStoragePaths>, dependencies: GuestDependencies): Promise<unknown> {
   const probe = dependencies.processProbe ?? systemProcessProbe;
   if (!probe.supported) return legacyStopServe(paths, dependencies);
   const status = (await readServeStatus(paths, probe)) as { running: boolean; verified: boolean; pid?: number; start_identity?: string; reason?: string };
@@ -3646,6 +3745,25 @@ async function legacyStopServe(paths: ReturnType<typeof getStoragePaths>, depend
   process.kill(status.pid, "SIGTERM");
   dependencies.stderr?.(`serve: asked pid ${status.pid} to stop\n`);
   return { stopped: true, pid: status.pid };
+}
+
+/** `serve --install` says, on stderr, what it wrote: root, label, file, program, every variable and its value. */
+function reportInstall(report: Record<string, unknown>, dependencies: GuestDependencies): Record<string, unknown> {
+  const env = (report.env ?? {}) as Record<string, string>;
+  const lines = [
+    `serve: installed ${String(report.label)} at ${String(report.file)}, for storage root ${String(report.root)}`,
+    `serve: it runs ${(report.program as string[]).join(" ")}`,
+    `serve: ${String(report.program_note)}`,
+    `serve: environment written (${Object.keys(env).length} variables, from an allowlist; no tokens, keys or passwords):`,
+    ...Object.keys(env)
+      .sort()
+      .map((name) => `  ${name}=${env[name]}`),
+    ...((report.path_entries_dropped as string[] | undefined) ?? []).map((entry) => `serve: PATH entry left out (it belongs to this process only): ${entry}`),
+    ...((report.warnings as string[] | undefined) ?? []).map((warning) => `serve: note: ${warning}`),
+    `serve: log ${String(report.log)}; check it with: sharednet serve --status`,
+  ];
+  dependencies.stderr?.(`${lines.join("\n")}\n`);
+  return report;
 }
 
 const TIMER_USAGE =

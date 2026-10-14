@@ -348,6 +348,9 @@
     "packages/cli/src/wake-codebuddy.ts",
     "packages/cli/src/wake-codebuddy.test.ts",
     "packages/cli/src/process-identity.ts",
-    "packages/cli/src/process-identity.test.ts"
+    "packages/cli/src/process-identity.test.ts",
+    "docs/serve-service.md",
+    "packages/cli/src/serve-service.ts",
+    "packages/cli/src/serve-service.test.ts"
   ]
 }
