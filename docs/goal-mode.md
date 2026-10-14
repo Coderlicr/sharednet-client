@@ -95,6 +95,12 @@ benchmark such as ProgramBench that forbids the internet during inference. `epis
 records the setting. It does not cut the network: the agents still reach their model provider,
 the Room, and package registries.
 
+`--image <image>` runs the agents and the checks in an image of your own, for example a
+benchmark's task image with the harness added. It needs `node` (22.18 or newer) on `PATH`, the
+harness of each driver you use (`codex`, `claude`), `sh` and `git`. `--agent-user <user>` names the
+user the agents and the checks run as in it (default `node`, the default image's user). The
+runner makes `/home/agents` for that user if the image has none.
+
 `--turn-limit 45m` stops a single turn after 45 minutes instead of the default 20 (at least
 `1m`). An experiment that wants only the Room's own end to stop an agent sets it to its
 `after`. `episode.json` records it as `turn_limit_s`.

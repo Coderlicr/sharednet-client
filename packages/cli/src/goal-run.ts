@@ -117,6 +117,7 @@ WORKDIR /workspace
 `;
 
 const AGENT_USER = "node";
+const AGENT_USER_PATTERN = /^(?:[a-z_][a-z0-9_-]{0,31}|[0-9]{1,10}(?::[0-9]{1,10})?)$/;
 const CONTAINER_WORKSPACE = "/workspace";
 const CONTAINER_HOMES = "/home/agents";
 const CONTAINER_CLI = "/opt/sharednet";
@@ -159,6 +160,8 @@ const FORWARDER_PROBE = `require("node:net").connect(Number(process.argv[1]), "1
 
 export interface RunPlan {
   image: string;
+  /** The user the Agents and the checks run as in the image: `node` in the default image. */
+  agentUser?: string;
   agents: AgentSpec[];
   workspace: string;
   /** This CLI's own package on this machine, mounted into each Agent's container so the Agents run the same version. */
@@ -182,7 +185,7 @@ export function cliPackage(entry: string): { root: string; entry: string } {
  * driver to sign in. A run that would fail half-way is refused here instead.
  */
 export async function prepareRun(
-  input: { agents: AgentSpec[]; image: string | null; workspace: string; env: Record<string, string | undefined>; home: string; entry: string },
+  input: { agents: AgentSpec[]; image: string | null; workspace: string; env: Record<string, string | undefined>; home: string; entry: string; agentUser?: string | null },
   docker: DockerRunner,
   log: (line: string) => void,
   pause: (ms: number) => Promise<void> = (ms) => new Promise((resolvePause) => setTimeout(resolvePause, ms)),
@@ -190,6 +193,8 @@ export async function prepareRun(
   if ((await docker(["info", "--format", "{{.ServerVersion}}"])).code !== 0) {
     throw localError("docker_unavailable", "goal run starts the Agents in Docker containers; start Docker, then run it again.");
   }
+  const agentUser = input.agentUser ?? AGENT_USER;
+  if (!AGENT_USER_PATTERN.test(agentUser)) throw localError("invalid_arguments", `--agent-user ${agentUser}: that is not a user name or uid.`);
   const image = input.image ?? DEFAULT_IMAGE;
   // Docker Desktop waking from idle can answer `info` before it can see its images: ask again before building.
   let present = false;
@@ -222,7 +227,7 @@ export async function prepareRun(
       );
     }
   }
-  return { image, agents: input.agents, workspace: input.workspace, cli: cliPackage(input.entry), codexAuth, claudeAuth };
+  return { image, agentUser, agents: input.agents, workspace: input.workspace, cli: cliPackage(input.entry), codexAuth, claudeAuth };
 }
 
 // ---- turns ----
@@ -469,6 +474,7 @@ export async function runGoal(
   const containers = runContainers(input.roomId, plan.agents);
   const turnLimitSeconds = Math.round((input.turnLimitMs ?? TURN_LIMIT_SECONDS * 1000) / 1000);
   const base = input.baseUrl;
+  const user = plan.agentUser ?? AGENT_USER;
   const messageRouting = input.messageRouting ?? (input.mentionGate ? "mentions" : "broadcast");
   if (input.roomType === "compiled" && (input.mentionGate || input.taskGate || messageRouting === "mentions")) throw localError("invalid_arguments", "The mention/task controls are for plain board Rooms.");
   await mkdir(input.out, { recursive: true });
@@ -535,7 +541,7 @@ export async function runGoal(
       ...(seat?.driver === "codex" && plan.codexAuth?.kind === "api-key" ? ["-e", "OPENAI_API_KEY"] : []),
       ...Object.keys(options.env ?? {}).flatMap((name) => ["-e", name]),
     ];
-    return docker(["exec", "--user", AGENT_USER, "--workdir", CONTAINER_WORKSPACE, ...environment, seat ? containerName(input.roomId, seat.name) : checks, ...command], options);
+    return docker(["exec", "--user", user, "--workdir", CONTAINER_WORKSPACE, ...environment, seat ? containerName(input.roomId, seat.name) : checks, ...command], options);
   };
 
   /** The checks' container, then each Agent's container and seat; a start that fails closes the Room it opened. */
@@ -552,11 +558,14 @@ export async function runGoal(
       const container = containerName(input.roomId, seat.name);
       const started = await startContainer(seat);
       if (started.code !== 0) throw localError("container_failed", `${seat.name}'s container did not start: ${started.stderr.trim()}`);
+      // An image other than the default one may have no home for the Agents: made here, as root, for the Agents' user.
+      const homes = await docker(["exec", "--user", "root", container, "sh", "-c", `mkdir -p ${CONTAINER_HOMES} && chown ${user} ${CONTAINER_HOMES}`]);
+      if (homes.code !== 0) throw localError("container_failed", `${seat.name}'s container has no place for homes: ${homes.stderr.trim()}`);
       if (port !== null) {
-        await docker(["exec", "--detach", "--user", AGENT_USER, container, "node", "-e", FORWARDER, String(port)]);
+        await docker(["exec", "--detach", "--user", user, container, "node", "-e", FORWARDER, String(port)]);
         let listening = false;
         for (let attempt = 0; attempt < 20 && !listening; attempt += 1) {
-          listening = (await docker(["exec", "--user", AGENT_USER, container, "node", "-e", FORWARDER_PROBE, String(port)])).code === 0;
+          listening = (await docker(["exec", "--user", user, container, "node", "-e", FORWARDER_PROBE, String(port)])).code === 0;
           if (!listening) await sleep(250);
         }
         if (!listening) throw localError("container_failed", `${seat.name}'s container could not reach this machine's port ${port}.`);
@@ -755,6 +764,7 @@ export async function runGoal(
         {
           ...episode,
           image: plan.image,
+          agent_user: user,
           web_search: input.webSearch ?? "live",
           turn_limit_s: turnLimitSeconds,
           mention_gate: input.mentionGate ?? false,

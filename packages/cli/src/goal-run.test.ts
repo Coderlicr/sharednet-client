@@ -452,6 +452,69 @@ describe("runGoal", () => {
   });
 });
 
+describe("an image of your own", () => {
+  it("is prepared for a user that can be named, and the default image keeps its own", async () => {
+    const home = await temporary();
+    await mkdir(join(home, "cli", "src"), { recursive: true });
+    await writeFile(join(home, "cli", "package.json"), "{}");
+    const base = { agents: parseAgents(["codex"]), image: "programbench-agent:1", workspace: home, home, entry: join(home, "cli", "src", "main.ts"), env: { OPENAI_API_KEY: "sk-test" } };
+    const ready = fakeDocker(() => ({ code: 0 }));
+    await expect(prepareRun({ ...base, agentUser: "bad user" }, ready.docker, () => undefined)).rejects.toMatchObject({ code: "invalid_arguments" });
+    expect(await prepareRun({ ...base, agentUser: "agent" }, ready.docker, () => undefined)).toMatchObject({ image: "programbench-agent:1", agentUser: "agent" });
+    expect(await prepareRun({ ...base, agentUser: "1000:1000" }, ready.docker, () => undefined)).toMatchObject({ agentUser: "1000:1000" });
+    expect(await prepareRun({ ...base, image: null }, ready.docker, () => undefined)).toMatchObject({ image: DEFAULT_IMAGE, agentUser: "node" });
+  });
+
+  it("runs the Agents as the image's user, and makes their homes for that user", async () => {
+    const out = await temporary();
+    const workspace = await temporary();
+    const plan: RunPlan = {
+      image: "programbench-agent:1",
+      agentUser: "agent",
+      agents: parseAgents(["codex"]),
+      workspace,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: { kind: "api-key" },
+      claudeAuth: null,
+    };
+    const { docker, calls } = fakeDocker((_call, command) => {
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_CodexOne01" }) };
+      if (command[2] === "codex") return { lines: [JSON.stringify({ type: "thread.started", thread_id: "thread-1" }), JSON.stringify({ type: "turn.completed", usage: { input_tokens: 2_000, cached_input_tokens: 0, output_tokens: 100 } })] };
+      if (command[0] === "sharednet" && command[1] === "wait") return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, events: [{ kind: "closed" }], messages: [] }) };
+      return {};
+    });
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["budget 1k tokens", "after 2h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) return { room: { id: ROOM, state: "open", goal }, memberships: [] };
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: "2026-10-05T12:01:00.000Z" } } } };
+        return { items: [] };
+      },
+    } as unknown as ApiClient;
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    await runGoal(
+      client,
+      "sni_owner-seat",
+      OWNER_KEY,
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
+    );
+
+    // The image's own user runs everything an Agent or a check runs; only setting the container up runs as root.
+    const execs = calls.filter((call) => call.args[0] === "exec");
+    const users = new Set(execs.map((call) => call.args[call.args.indexOf("--user") + 1]));
+    expect(users).toEqual(new Set(["agent", "root"]));
+    expect(execs.filter((call) => call.args.includes("codex")).every((call) => call.args[call.args.indexOf("--user") + 1] === "agent")).toBe(true);
+    // The image has no home for the Agents, so one is made as root, for that user, before the seat is set up.
+    const homes = execs.findIndex((call) => call.args.join(" ").endsWith("mkdir -p /home/agents && chown agent /home/agents"));
+    expect(homes).toBeGreaterThan(-1);
+    expect(execs[homes]!.args[execs[homes]!.args.indexOf("--user") + 1]).toBe("root");
+    expect(homes).toBeLessThan(execs.findIndex((call) => call.args.includes("join")));
+    expect(calls.filter((call) => call.args[0] === "run").every((call) => call.args.includes("programbench-agent:1"))).toBe(true);
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ image: "programbench-agent:1", agent_user: "agent" });
+  });
+});
+
 describe("a check", () => {
   it("runs in the checks' own container, on the shared workspace, under no Agent's home", async () => {
     const out = await temporary();
