@@ -1,4 +1,5 @@
 import { accessSync, constants } from "node:fs";
+import { basename } from "node:path";
 
 import { deliverResumedPrint } from "./wake-claude.ts";
 import { checkProgram, onPath, type CheckResult, type Delivery, type DeliveryContext, type Environment, type SeatWake, type WakeInput, type WakePlugin } from "./wake-driver.ts";
@@ -24,7 +25,7 @@ import { checkProgram, onPath, type CheckResult, type Delivery, type DeliveryCon
  * processes; bind a seat to a conversation that is not open, or fork one.
  *
  * Inside a session the CLI exports CODEBUDDY_SESSION_ID to the commands its agent runs (read off its
- * source; not observed live), which is the id `--resume` takes.
+ * source, and confirmed in a WorkBuddy tool shell on 2026-10-14), which is the id `--resume` takes.
  *
  * WorkBuddy ships the CLI inside the app and puts no `codebuddy` on PATH. Point the wake at a launcher:
  *   #!/bin/sh
@@ -59,7 +60,8 @@ export const codebuddyPlugin: WakePlugin = {
         return { ok: false, message: `${wake.config_dir} (the CodeBuddy config directory holding the session) is not readable` };
       }
     }
-    const checked = await checkProgram(wake, "codebuddy", env, run);
+    // Both official executable names are the real CLI and are asked for their version; any other name is a launcher.
+    const checked = await checkProgram(wake, basename(wake.command) === "cbc" ? "cbc" : "codebuddy", env, run);
     if (!checked.ok && /is not on PATH$/.test(checked.message)) {
       return { ok: false, message: `${checked.message}. WorkBuddy ships the CLI inside the app without putting it on PATH: use a launcher (see docs/wake-plugins.md) with --command` };
     }

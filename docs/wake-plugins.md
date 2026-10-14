@@ -99,8 +99,8 @@ Tencent's CodeBuddy Code CLI, and **WorkBuddy**, whose desktop app runs that sam
 Code's headless mode (<https://www.workbuddy.ai/docs/cli/headless>, <https://www.workbuddy.ai/docs/cli/cli-reference>).
 
 - **capture:** `CODEBUDDY_SESSION_ID` (the id `--resume` takes), `CODEBUDDY_CONFIG_DIR` (else `WORKBUDDY_CONFIG_DIR`), and
-  `codebuddy` or `cbc` on PATH. The CLI exports the session id to the commands its agent runs (read off its source, not yet
-  observed in a live tool shell). The app's own processes carry `CODEBUDDY_HOST=workbuddy-desktop` but no session id, so they
+  `codebuddy` or `cbc` on PATH. The CLI exports the session id to the commands its agent runs (read off its source, and confirmed in a
+  WorkBuddy tool shell on 2026-10-14). The app's own processes carry `CODEBUDDY_HOST=workbuddy-desktop` but no session id, so they
   are not captured.
 - **deliver:** run `codebuddy -p --resume <session> --output-format json` with the wake prompt on stdin, in the config
   directory the wake recorded (`config_dir`, passed as `CODEBUDDY_CONFIG_DIR`: `~/.codebuddy` for the standalone CLI,
@@ -121,7 +121,7 @@ Code's headless mode (<https://www.workbuddy.ai/docs/cli/headless>, <https://www
   ```
   then `sharednet wake set codebuddy --resume <session> --config-dir ~/.workbuddy --command /path/to/that.sh`. Unattended tool
   use needs `-y` or `--permission-mode` (the headless doc says so); add the flags to the launcher if you want them. `wake check`
-  looks at a launcher without starting it. The standalone CLI is `npm i -g @tencent-ai/codebuddy-code`.
+  asks `codebuddy` and `cbc` (the CLI's two official names) for `--version`, and looks at any other name, a launcher, without starting it. The standalone CLI is `npm i -g @tencent-ai/codebuddy-code`.
 - **First live run (2026-10-14, CodeBuddy 2.106.4 in WorkBuddy 5.2.5):** `-p --resume <id> --fork-session --output-format json` prints a
   pretty-printed **array** of the turn's events (message, file-history-snapshot, reasoning, function_call, function_call_result, ...)
   whose last element is the `result` object, not the single object the doc describes. The shared parser (`claudeSummary`)

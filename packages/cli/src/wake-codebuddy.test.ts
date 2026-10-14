@@ -171,6 +171,23 @@ describe("the codebuddy plugin: check", () => {
     expect(asked).toHaveLength(1);
   });
 
+  it("asks the cbc alias for its version too, so a broken cbc is not reported healthy, and still only looks at a launcher", async () => {
+    const path = await bin("cbc", "my-launcher.sh");
+    const asked: TurnSpec[] = [];
+    const broken = async (spec: TurnSpec) => (asked.push(spec), { exitCode: 7, stdout: "", stderr: "cbc: payload missing\n", timedOut: false });
+    const cbc = await codebuddyPlugin.check({ driver: "codebuddy", session: SESSION, cwd: path, command: "cbc" }, { PATH: path }, broken);
+    expect(cbc.ok).toBe(false);
+    expect(cbc.message).toContain("cbc --version exited 7: cbc: payload missing");
+    expect(asked).toHaveLength(1);
+    expect([asked[0]!.command, ...asked[0]!.args]).toEqual([join(path, "cbc"), "--version"]);
+    const healthy = await codebuddyPlugin.check({ driver: "codebuddy", session: SESSION, cwd: path, command: join(path, "cbc") }, { PATH: "" }, async () => ({ exitCode: 0, stdout: "2.106.4\n", stderr: "", timedOut: false }));
+    expect(healthy).toEqual({ ok: true, message: `${join(path, "cbc")} 2.106.4` });
+    // A launcher, even one named like the alias plus a suffix, is not started.
+    const launcher = await codebuddyPlugin.check({ driver: "codebuddy", session: SESSION, cwd: path, command: join(path, "my-launcher.sh") }, { PATH: "" }, broken);
+    expect(launcher.message).toContain("a launcher; not started");
+    expect(asked).toHaveLength(1);
+  });
+
   it("fails when the config directory that holds the session is not there", async () => {
     const result = await codebuddyPlugin.check({ ...wake, config_dir: "/definitely/not/here/.workbuddy" }, { PATH: "" }, async () => {
       throw new Error("must not start");
