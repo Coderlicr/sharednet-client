@@ -222,7 +222,9 @@ export function workspaceSnapshots(workspace: string, out: string): (label: stri
   return async (label: string) => {
     ready ??= prepare();
     await ready;
-    await git([...base, "add", "-A"], workspace);
+    // A file the runner may not read (a benchmark's execute-only reference binary, say) is left out
+    // of the snapshot instead of failing it.
+    await git([...base, "add", "-A", "--ignore-errors"], workspace);
     const staged = await git([...base, "diff", "--cached", "--quiet"], workspace);
     const empty = (await git([...base, "rev-parse", "--verify", "HEAD"], workspace)).code !== 0;
     if (staged.code === 0 && !empty) return null;

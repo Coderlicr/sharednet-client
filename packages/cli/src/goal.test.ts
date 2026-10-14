@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -323,6 +323,22 @@ describe("workspace snapshots", () => {
     const { execFileSync } = await import("node:child_process");
     const files = execFileSync("git", [`--git-dir=${join(out, "workspace.git")}`, "ls-tree", "-r", "--name-only", "seq-4"], { encoding: "utf8" });
     expect(files.trim().split("\n")).toEqual([".env.example", "a.txt", "b.txt"]);
+  });
+
+  // Root reads every file, so the case needs a user the permission applies to.
+  it.skipIf(process.getuid?.() === 0)("leaves out a file the runner may not read, a benchmark's execute-only reference binary, and snapshots the rest", async () => {
+    const workspace = await temporary();
+    const out = join(workspace, "runs", ROOM);
+    await writeFile(join(workspace, "a.txt"), "a\n");
+    await writeFile(join(workspace, "executable"), "the reference\n");
+    await chmod(join(workspace, "executable"), 0o111);
+    const snapshot = workspaceSnapshots(workspace, out);
+    expect(await snapshot("start")).toMatch(/^[0-9a-f]{40}$/);
+    await writeFile(join(workspace, "b.txt"), "b\n");
+    expect(await snapshot("seq 2")).toMatch(/^[0-9a-f]{40}$/);
+    const { execFileSync } = await import("node:child_process");
+    const files = execFileSync("git", [`--git-dir=${join(out, "workspace.git")}`, "ls-tree", "-r", "--name-only", "seq-2"], { encoding: "utf8" });
+    expect(files.trim().split("\n")).toEqual(["a.txt", "b.txt"]);
   });
 });
 
