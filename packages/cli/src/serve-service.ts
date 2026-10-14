@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 
@@ -113,6 +113,10 @@ export function captureServiceEnv(env: Environment, fallback: { home: string; us
       if (kept.length > 0) captured.PATH = kept.join(delimiter);
       continue;
     }
+    if (/[\r\n]/.test(value)) {
+      skipped.push({ name, why: "it contains a line break, which a service definition cannot carry" });
+      continue;
+    }
     if (carriesCredentials(value)) {
       skipped.push({ name, why: "it carries a user name or password, which is never written to a service file" });
       continue;
@@ -190,21 +194,42 @@ const UNIT = "sharednet-serve";
 
 /**
  * Where the service is defined. One serve per storage root (its serve.json is the lock), so a
- * service for a CLI pointed elsewhere by XDG_CONFIG_HOME gets its own name.
+ * service for a CLI pointed elsewhere by XDG_CONFIG_HOME gets its own name. The definition goes
+ * where the service manager reads it, which is the account's home, not this shell's variables:
+ * launchd loads `~/Library/LaunchAgents` at login, and a systemd --user unit directory is given by
+ * `unitDir` (see userUnitDir).
  */
-export function serviceLocation(platform: NodeJS.Platform, env: Environment, home: string): ServiceLocation | null {
+export function serviceLocation(platform: NodeJS.Platform, env: Environment, home: string, unitDir?: string): ServiceLocation | null {
   const configDir = getStoragePaths({ ...env, HOME: env.HOME || home }).configDir;
   const standard = join(env.HOME || home, ".config", "sharednet");
   const suffix = configDir === standard ? "" : createHash("sha256").update(configDir).digest("hex").slice(0, 8);
   if (platform === "darwin") {
     const label = suffix ? `${LABEL}.${suffix}` : LABEL;
-    return { kind: "launchd", label, file: join(env.HOME || home, "Library", "LaunchAgents", `${label}.plist`) };
+    return { kind: "launchd", label, file: join(home, "Library", "LaunchAgents", `${label}.plist`) };
   }
   if (platform === "linux") {
     const label = `${suffix ? `${UNIT}-${suffix}` : UNIT}.service`;
-    return { kind: "systemd", label, file: join(env.XDG_CONFIG_HOME || join(env.HOME || home, ".config"), "systemd", "user", label) };
+    return { kind: "systemd", label, file: join(unitDir ?? join(home, ".config", "systemd", "user"), label) };
   }
   return null;
+}
+
+/**
+ * The directory a systemd --user manager reads units from, out of its own search path
+ * (`systemctl --user show --property=UnitPath --value`). systemd.unit(5) puts user units in
+ * `$XDG_CONFIG_HOME/systemd/user` and `$XDG_DATA_HOME/systemd/user`, but those are the variables of
+ * the user manager (user@.service), not of the shell installing the unit: a CLI run with its own
+ * XDG_CONFIG_HOME would otherwise write a unit nothing loads. So the manager is asked, and the
+ * first persistent directory under the account's home in its path is used: `~/.config/systemd/user`
+ * when it is there, as it is by default. `.control` (systemctl set-property's), transient, generator
+ * and /run directories are never written to. Null when the manager names none.
+ */
+export function userUnitDir(unitPath: string, home: string): string | null {
+  const candidates = unitPath
+    .split(/\s+/)
+    .filter((entry) => entry.startsWith(`${home}/`) && entry.endsWith("/systemd/user"));
+  const standard = join(home, ".config", "systemd", "user");
+  return candidates.includes(standard) ? standard : (candidates[0] ?? null);
 }
 
 function xml(value: string): string {
@@ -268,9 +293,46 @@ export function launchdPlist(definition: ServiceDefinition): string {
   ].join("\n");
 }
 
-/** One systemd word: quoted, with its quoting, specifier and variable characters escaped. */
-function systemdWord(value: string): string {
-  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%").replace(/\$/g, "$$$$").replace(/\n/g, "\\n")}"`;
+/*
+ * systemd parses each directive its own way, so each gets its own formatter (systemd.syntax(7),
+ * systemd.service(5), systemd.exec(5), systemd.unit(5) "Specifiers"). A line break cannot be
+ * written in any of them, and is refused.
+ */
+function oneLine(directive: string, value: string): string {
+  if (/[\r\n]/.test(value)) throw localError("service_not_installed", `${directive} cannot hold a line break: ${JSON.stringify(value)}`);
+  return value;
+}
+
+/**
+ * One word of ExecStart=: double-quoted with C escapes (systemd.syntax), `%` specifiers escaped as
+ * `%%`, and `$` as `$$`, since ExecStart= alone expands `$VAR` (systemd.service, "Command lines").
+ */
+export function systemdExecWord(value: string): string {
+  oneLine("ExecStart=", value);
+  if (value === ";") throw localError("service_not_installed", "ExecStart= cannot hold a lone ; word.");
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%").replace(/\$/g, "$$$$")}"`;
+}
+
+/**
+ * One Environment= assignment: double-quoted with C escapes, `%` escaped as `%%`. `$` is left as
+ * it is: systemd.exec says Environment= performs no variable expansion and `$` has no special meaning.
+ */
+export function systemdEnvironment(name: string, value: string): string {
+  const assignment = oneLine("Environment=", `${name}=${value}`);
+  return `"${assignment.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
+}
+
+/**
+ * A path setting (WorkingDirectory=, StandardOutput=append:): never quoted, since a quote would be
+ * part of the path and "\"/tmp\"" is not absolute (a fatal error); `%` escaped as `%%`, because
+ * specifiers are expanded in paths; no `$` handling, since paths do not expand variables.
+ */
+export function systemdPath(directive: string, value: string): string {
+  oneLine(directive, value);
+  if (!isAbsolute(value) || value !== value.trim()) {
+    throw localError("service_not_installed", `${directive} needs an absolute path without surrounding spaces, not ${JSON.stringify(value)}.`);
+  }
+  return value.replace(/%/g, "%%");
 }
 
 /** A systemd --user unit with the same lifecycle as the LaunchAgent. */
@@ -284,16 +346,16 @@ export function systemdUnit(definition: ServiceDefinition): string {
     ``,
     `[Service]`,
     `Type=simple`,
-    `ExecStart=${definition.argv.map(systemdWord).join(" ")}`,
-    `WorkingDirectory=${systemdWord(definition.workingDirectory)}`,
+    `ExecStart=${definition.argv.map(systemdExecWord).join(" ")}`,
+    `WorkingDirectory=${systemdPath("WorkingDirectory=", definition.workingDirectory)}`,
     ...Object.keys(definition.env)
       .sort()
-      .map((name) => `Environment=${systemdWord(`${name}=${definition.env[name]}`)}`),
+      .map((name) => `Environment=${systemdEnvironment(name, definition.env[name]!)}`),
     `Restart=always`,
     `RestartSec=${RESTART_SECONDS}`,
     `UMask=0077`,
-    `StandardOutput=append:${definition.logFile}`,
-    `StandardError=append:${definition.logFile}`,
+    `StandardOutput=append:${systemdPath("StandardOutput=", definition.logFile)}`,
+    `StandardError=append:${systemdPath("StandardError=", definition.logFile)}`,
     ``,
     `[Install]`,
     `WantedBy=default.target`,
@@ -311,6 +373,8 @@ export interface ServiceHost {
   writeFile(path: string, content: string): Promise<void>;
   remove(path: string): Promise<boolean>;
   ensureDir(path: string): Promise<void>;
+  /** The names in a directory, or none when it cannot be read. */
+  listDir(path: string): Promise<string[]>;
   sleep(ms: number): Promise<void>;
   run(command: string, args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }>;
 }
@@ -318,7 +382,14 @@ export interface ServiceHost {
 export const realServiceHost = (): ServiceHost => ({
   platform: process.platform,
   uid: process.getuid?.() ?? -1,
-  home: homedir(),
+  // The account's home, which launchd and systemd use, even when this shell's HOME says otherwise.
+  home: (() => {
+    try {
+      return userInfo().homedir || homedir();
+    } catch {
+      return homedir();
+    }
+  })(),
   username: (() => {
     try {
       return userInfo().username;
@@ -338,6 +409,7 @@ export const realServiceHost = (): ServiceHost => ({
   ensureDir: async (path) => {
     await mkdir(path, { recursive: true, mode: 0o700 });
   },
+  listDir: (path) => readdir(path).catch(() => []),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   run: (command, args) =>
     new Promise((resolve) => {
@@ -405,13 +477,49 @@ export class ServiceControl {
     this.program = program;
   }
 
-  location(): ServiceLocation {
-    return serviceLocation(this.host.platform, this.env, this.host.home) ?? unsupported(this.host.platform);
+  /** Where the definition is, or null where there is no service manager to ask. */
+  private async where(): Promise<ServiceLocation | null> {
+    if (this.host.platform !== "linux") return serviceLocation(this.host.platform, this.env, this.host.home);
+    const shown = await this.host.run("systemctl", ["--user", "show", "--property=UnitPath", "--value"]);
+    const dir = shown.exitCode === 0 ? userUnitDir(shown.stdout, this.host.home) : null;
+    return serviceLocation("linux", this.env, this.host.home, dir ?? undefined);
+  }
+
+  async location(): Promise<ServiceLocation> {
+    return (await this.where()) ?? unsupported(this.host.platform);
+  }
+
+  /**
+   * Other definitions in the same manager that run or respawn a SharedNet serve: a hand-made
+   * supervisor would start serve again beside this service, and the two would race for the
+   * machine's one slot. Read-only: they are reported, with the command that stops them, never touched.
+   */
+  async conflicts(): Promise<Array<{ label: string; file: string; stop: string }>> {
+    const where = await this.where();
+    if (where === null) return [];
+    const dir = dirname(where.file);
+    const own = (label: string) => label === where.label || /^ai\.sharednet\.serve(\.[0-9a-f]{8})?$/.test(label) || /^sharednet-serve(-[0-9a-f]{8})?\.service$/.test(label);
+    const found: Array<{ label: string; file: string; stop: string }> = [];
+    for (const name of (await this.host.listDir(dir)).sort()) {
+      const kind = where.kind === "launchd" ? name.endsWith(".plist") : /\.(service|timer)$/.test(name);
+      if (!kind) continue;
+      const file = join(dir, name);
+      const content = await this.host.readFile(file);
+      if (content === null || !/sharednet/i.test(content) || !/serve|supervis|listener|wake/i.test(content)) continue;
+      const label = where.kind === "launchd" ? (/<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(content)?.[1] ?? name.replace(/\.plist$/, "")) : name;
+      if (own(label) || own(name.replace(/\.plist$/, ""))) continue;
+      found.push({
+        label,
+        file,
+        stop: where.kind === "launchd" ? `launchctl bootout gui/${this.host.uid}/${label}` : `systemctl --user disable --now ${label}`,
+      });
+    }
+    return found;
   }
 
   /** The service as its manager sees it, or null where there is no service manager to ask. */
   async state(): Promise<ServiceState | null> {
-    const where = serviceLocation(this.host.platform, this.env, this.host.home);
+    const where = await this.where();
     if (where === null) return null;
     const content = await this.host.readFile(where.file);
     const program = content === null ? undefined : programIn(where.kind, content);
@@ -440,8 +548,10 @@ export class ServiceControl {
    * connector slot (serve.json); the service waits for it to stop and then takes over.
    */
   async install(): Promise<Record<string, unknown>> {
-    const where = this.location();
+    const where = await this.location();
     if (this.program === null) throw localError("service_not_installed", "Only the sharednet executable can install its service.");
+    const others = await this.conflicts();
+    if (others.length > 0) throw supervisorConflict(others);
     const captured = captureServiceEnv(this.env, { home: this.host.home, username: this.host.username });
     for (const required of ["HOME", "PATH"] as const) {
       if (!captured.env[required]) throw localError("service_not_installed", `${required} is not set here, and the service cannot run without it.`);
@@ -450,7 +560,9 @@ export class ServiceControl {
     const paths = getStoragePaths(captured.env);
     const logFile = join(paths.stateDir, "serve.log");
     const definition: ServiceDefinition = { label: where.label, argv: program.argv, env: captured.env, logFile, workingDirectory: captured.env.HOME! };
-    await this.host.writeFile(where.file, where.kind === "launchd" ? launchdPlist(definition) : systemdUnit(definition));
+    // Formatted before anything is written, so a value systemd cannot hold refuses the install.
+    const content = where.kind === "launchd" ? launchdPlist(definition) : systemdUnit(definition);
+    await this.host.writeFile(where.file, content);
     // The log's directory must exist before the manager opens the log for the service.
     await this.host.ensureDir(paths.stateDir);
     if (where.kind === "launchd") {
@@ -479,8 +591,19 @@ export class ServiceControl {
       warnings.push("No proxy variable (HTTPS_PROXY, HTTP_PROXY, ALL_PROXY) was set here, so the service has none. If a harness reaches its API only through a proxy, install again from a shell that has it.");
     }
     for (const skipped of captured.skipped) warnings.push(`${skipped.name} was not written: ${skipped.why}.`);
+    let linger: boolean | null = null;
     if (where.kind === "systemd") {
-      warnings.push(`A systemd --user service runs while you are logged in; to start it at boot without a login, run: loginctl enable-linger ${captured.env.USER ?? "$USER"}`);
+      // Without lingering, logind stops a user's manager, and this service with it, when the last
+      // session ends (an SSH disconnect included), and starts it only at the next login.
+      const user = captured.env.USER ?? this.host.username;
+      const shown = await this.host.run("loginctl", ["show-user", user, "--property=Linger"]);
+      const value = /^Linger=(yes|no)\s*$/m.exec(shown.stdout)?.[1];
+      linger = value === "yes" ? true : value === "no" ? false : null;
+      if (linger !== true) {
+        warnings.push(
+          `${linger === false ? "Lingering is off" : "Whether lingering is on could not be read"} for ${user}: systemd stops this service when ${user}'s last session ends (an SSH disconnect included) and starts it again only at the next login. To keep it running, have an administrator run: sudo loginctl enable-linger ${user}`,
+        );
+      }
     }
     return {
       installed: true,
@@ -494,13 +617,14 @@ export class ServiceControl {
       env: captured.env,
       ...(captured.filled.length > 0 ? { env_filled_in: captured.filled } : {}),
       ...(captured.droppedPath.length > 0 ? { path_entries_dropped: captured.droppedPath } : {}),
+      ...(where.kind === "systemd" ? { linger } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
     };
   }
 
   /** Stops the service and removes its definition. A serve started by hand is not touched. */
   async uninstall(): Promise<Record<string, unknown>> {
-    const where = this.location();
+    const where = await this.location();
     let unloaded = false;
     if (where.kind === "launchd") {
       unloaded = (await this.host.run("launchctl", ["bootout", `gui/${this.host.uid}/${where.label}`])).exitCode === 0;
@@ -534,5 +658,16 @@ export class ServiceControl {
   }
 }
 
+/** The refusal for another definition that runs or respawns serve, with the command that stops each. */
+export function supervisorConflict(others: Array<{ label: string; file: string; stop: string }>) {
+  return localError(
+    "service_conflict",
+    [
+      `Another service definition here runs or respawns a SharedNet serve, and would race this service for the machine's one slot. Stop it, move its file out of the way so it does not come back at login, then install again:`,
+      ...others.map((other) => `  ${other.stop}    # ${other.file}`),
+    ].join("\n"),
+  );
+}
+
 /** What `serve` and `join` use of the service; tests stand in for it. */
-export type WakeServiceControl = Pick<ServiceControl, "state" | "install" | "uninstall" | "start">;
+export type WakeServiceControl = Pick<ServiceControl, "state" | "install" | "uninstall" | "start" | "conflicts">;

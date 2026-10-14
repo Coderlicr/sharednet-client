@@ -30,6 +30,13 @@ jobs:
       - run: pnpm check:export
       - run: pnpm typecheck
       - run: pnpm test
+      # Unit tests once passed a generated unit that systemd refused to load; its own parser decides.
+      - name: systemd parses the generated user unit
+        run: |
+          systemd-analyze --version
+          pnpm exec vitest run packages/cli/src/serve-service.test.ts -t "systemd's own parser"
+        env:
+          SHAREDNET_REQUIRE_SYSTEMD_ANALYZE: "1"
       - run: pnpm test:package
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

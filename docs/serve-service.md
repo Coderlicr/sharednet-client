@@ -16,13 +16,14 @@ Without this, `serve` is a detached child that `join` leaves behind (`startWakeS
 
 | Command | Does |
 | --- | --- |
-| `sharednet serve --install` | Writes the service definition and has the manager load and start it. Running it again replaces the definition and restarts the service. On stderr it prints the program and every variable it wrote, with values. With `--json`, stdout carries the same report. |
+| `sharednet serve --install` | Writes the service definition and has the manager load and start it. Running it again replaces the definition and restarts the service. On stderr it prints the program and every variable it wrote, with values. With `--json`, stdout carries the same report. It refuses, before writing anything, when another service definition runs or respawns serve (`service_conflict`), or when a serve the service did not start is running (`serve_running`). |
+| `sharednet serve --install --handoff` | Installs beside a running serve the service did not start. The service waits for that serve to stop and then takes over; stop it with `serve --stop`. |
 | `sharednet serve --uninstall` | Stops the service and removes its definition. It does not touch a `serve` you started by hand. |
 | `sharednet serve --status` | Shows the connector, as before. When a service exists, it adds `service: { installed, loaded, running, pid, label, file, program }`. |
 | `sharednet serve --stop` | Stops the running connector, as before. When it was the installed service, the manager starts it again within 30 s. That is how it restarts onto the newest CLI. To stop it for good, use `--uninstall`. |
 | `sharednet serve --service` | What the service runs. It is an ordinary `serve` except that it does not end when there is nothing to do yet (see below). |
 
-These are options of `serve`, like `--status` and `--stop`, and not a new verb. `--install` and `--uninstall` take no other `serve` option: the service always serves every seat joined from a Codex or Claude Code session, the same seats a plain `serve` drives.
+These are options of `serve`, like `--status` and `--stop`, and not a new verb. `--install` (with or without `--handoff`) and `--uninstall` take no other `serve` option: the service always serves every seat joined from a Codex or Claude Code session, the same seats a plain `serve` drives.
 
 Install from the environment the service should have. On a machine that reaches the model API only through a proxy, that means a shell where the proxy is set:
 
@@ -34,10 +35,10 @@ HTTPS_PROXY=http://127.0.0.1:10080 HTTP_PROXY=http://127.0.0.1:10080 npx -y shar
 
 | | macOS | Linux |
 | --- | --- | --- |
-| File | `~/Library/LaunchAgents/ai.sharednet.serve.plist` (mode 0600) | `$XDG_CONFIG_HOME/systemd/user/sharednet-serve.service` (default `~/.config/systemd/user/`) |
+| File | `~/Library/LaunchAgents/ai.sharednet.serve.plist` in the account's home (mode 0600) | `sharednet-serve.service` in the user manager's own unit directory, normally `~/.config/systemd/user/` (see below) |
 | Loaded with | `launchctl bootstrap gui/$UID <file>` (after a `bootout` of any earlier one) | `systemctl --user daemon-reload`, `enable`, `restart` |
 | Removed with | `launchctl bootout gui/$UID/ai.sharednet.serve` | `systemctl --user disable --now` |
-| Starts | at login (`RunAtLoad`) | at login (`WantedBy=default.target`); at boot only with `loginctl enable-linger` |
+| Starts | at login (`RunAtLoad`) | at login (`WantedBy=default.target`); kept across logouts and started at boot only with lingering (see below) |
 | Restarts | always (`KeepAlive`), at most once per 30 s (`ThrottleInterval`) | `Restart=always`, `RestartSec=30` |
 | Log | serve's own log, `$XDG_STATE_HOME/sharednet/serve.log` (default `~/.local/state/sharednet/serve.log`), appended | the same, via `StandardOutput=append:` |
 | Files it creates | owner-only (`Umask` 077) | owner-only (`UMask=0077`) |
@@ -45,6 +46,16 @@ HTTPS_PROXY=http://127.0.0.1:10080 HTTP_PROXY=http://127.0.0.1:10080 npx -y shar
 The service is named for the CLI's storage root. With the standard root it is `ai.sharednet.serve`. A CLI pointed elsewhere by `XDG_CONFIG_HOME` gets `ai.sharednet.serve.<8 hex>` instead. The root's `serve.json` is the lock, so each root is its own machine-wide slot.
 
 Windows, and any system other than macOS or Linux, gets a clear refusal (`service_unsupported`).
+
+### Linux: where the unit goes, how it is written, and lingering
+
+- **Where.** systemd.unit(5) puts user units in `$XDG_CONFIG_HOME/systemd/user` (and `$XDG_DATA_HOME/systemd/user`), but those are the variables of the user manager (`user@.service`), not of the shell running the install. A CLI run with its own `XDG_CONFIG_HOME` would otherwise write a unit that nothing loads. So install asks the manager for its search path (`systemctl --user show --property=UnitPath --value`) and writes to the first persistent directory under the account's home: `~/.config/systemd/user` when that is listed, as it is by default. It never writes to `.control` (owned by `systemctl set-property`), `transient`, generator or `/run` directories. When the manager cannot be asked, it falls back to `~/.config/systemd/user`.
+- **How.** systemd parses each directive its own way, so each has its own formatter:
+  - `ExecStart=`: each word double-quoted with C escapes, `%` written `%%` (specifiers) and `$` written `$$`, because ExecStart= is the only directive here that expands `$VAR` (systemd.service, "Command lines").
+  - `Environment=`: one quoted `NAME=value` with C escapes and `%%`. `$` is left alone: systemd.exec says Environment= does no variable expansion, so `$$` would reach PATH or a proxy URL literally.
+  - `WorkingDirectory=` and `StandardOutput=append:`/`StandardError=append:` are path settings. They are never quoted (`WorkingDirectory="/tmp"` is "not absolute", a fatal error that stops the unit loading) and only `%` is escaped. A relative path is refused.
+  - A value with a line break cannot be written in any of them. A captured variable with one is left out with a note, and a path with one refuses the install.
+- **Lingering.** Without it, logind stops a user's manager, and this service with it, when the user's last session ends (an SSH disconnect included), and starts it only at the next login. Install reads `loginctl show-user <user> --property=Linger`. When it is not `yes`, install prints the command for an administrator, `sudo loginctl enable-linger <user>`. The CLI never runs sudo.
 
 ### The environment
 
@@ -84,7 +95,8 @@ Everything written is printed with its value. Since nothing secret can pass thes
 
 There is still one connector slot per storage root, `serve.json`. The changes keep it that way:
 
-- **A `serve` started by hand holds the slot.** The service does not fail and get restarted over and over. It logs that it is waiting, checks every 10 s, and takes the slot when the other one stops. So on a machine where a detached `serve` is already running, install the service and then run `sharednet serve --stop`. The service takes over within seconds.
+- **A `serve` the service did not start holds the slot.** `--install` refuses (`serve_running`, naming the pid) rather than race it. Stop it first with `sharednet serve --stop`, or install with `--handoff`. With `--handoff` the service does not fail and get restarted over and over: it logs that it is waiting, checks every 10 s, and takes the slot when the other one stops.
+- **Another supervisor respawns serve.** A hand-made LaunchAgent or user unit that keeps a serve alive would start it again beside the service for ever, so `--install` refuses (`service_conflict`) even with `--handoff`. It names each such definition and the command that stops it (`launchctl bootout gui/<uid>/<label>`, or `systemctl --user disable --now <unit>`) and asks for its file to be moved out of the way. Detection is read-only: every definition in `~/Library/LaunchAgents` or the user unit directory that mentions SharedNet together with serve, a supervisor, a listener or wake, other than this service's own, counts. They are never stopped or edited by the CLI. One found on a real machine: `ai.sharednet.listener-supervisor`, running `~/.local/share/sharednet/bin/supervise.py`.
 - **No seats yet.** A plain `serve` ends with `not_in_a_room`. The service holds the slot and checks every 5 s for a seat joined from a Codex or Claude Code session.
 - **Every seat stopped** (credentials revoked, say). A plain `serve` ends. The service keeps running and picks up the next seat joined, instead of being restarted every 30 s by its manager into the same stopped seats.
 - **`join` with a service installed.**
@@ -100,12 +112,13 @@ A wake delivery from the service still runs through `deliveryEnv`, so the turn g
 - **Unit, `serve-service.test.ts`:**
   - environment capture: allowlist, harness and secret variables, PATH cleaning, credentialed proxies, filled-in identity;
   - program choice: npx, global install or checkout, no npx;
-  - definitions: plist keys and escaping, systemd quoting and escaping, read-back of the program;
-  - naming: by storage root;
-  - install, uninstall, state and start against a recording host: launchd and systemd command lines, the bootout race, refusals.
+  - definitions: plist keys and escaping; each systemd directive by its own rules (ExecStart, Environment, path settings), line breaks refused; read-back of the program;
+  - naming: by storage root; the plist in the account's home; the systemd unit in the manager's own `UnitPath` directory (Ubuntu 24.04's real list included);
+  - install, uninstall, state and start against a recording host: launchd and systemd command lines, the bootout race, refusals, lingering read and reported (never sudo), supervisors detected and refused without being touched.
+- **systemd's own parser.** Where `systemd-analyze` exists, `serve-service.test.ts` writes a generated unit with spaces, `%`, `$`, quotes and backslashes in every directive and runs `systemd-analyze --user verify` on it, falling back to the system-mode parser when no user manager can start. It also runs a negative control: the quoted `WorkingDirectory=` the first version wrote must fail. CI runs these on Ubuntu as their own step, with systemd-analyze required (`SHAREDNET_REQUIRE_SYSTEMD_ANALYZE=1`, and whenever `CI` is set on Linux), so a missing parser fails rather than skips.
 - **CLI, `guest.test.ts`:**
   - `join` starts the installed service rather than a detached `serve`, including from a sandbox and when the start fails;
-  - `--install`, `--uninstall` and `--status` go through the service control;
+  - `--install`, `--uninstall` and `--status` go through the service control; install refuses beside a running serve unless `--handoff`, and refuses beside a supervisor even with it;
   - `--service` waits for a held slot and for seats, and outlives stopped seats;
   - `--stop` explains the restart.
 - **No test runs `launchctl` or `systemctl`.** A real launchd round trip is recorded in the pull request. It used a test-only label, a disposable HOME and XDG root, and a harmless program, which was then booted out and deleted.
@@ -116,7 +129,7 @@ A wake delivery from the service still runs through `deliveryEnv`, so the turn g
 - **A service per seat, or per Room.** One serve per storage root stays the model.
 - **Windows.** Task Scheduler could do this, but it is not attempted.
 - **Starting before login on macOS.** That would need a LaunchDaemon, which runs outside the user's keychain session. Claude Code's credentials live in that keychain.
-- **Live systemd.** It is unit-tested only. No Linux machine ran it.
+- **A live systemd service.** The generated unit passes systemd 255's parser (`systemd-analyze --user verify`), but no Linux machine has loaded and run it.
 
 ## Port
 

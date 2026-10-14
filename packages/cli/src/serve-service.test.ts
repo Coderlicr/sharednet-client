@@ -1,8 +1,9 @@
 // @vitest-environment node
 
+import { spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -13,7 +14,11 @@ import {
   ServiceControl,
   serviceLocation,
   serviceProgram,
+  systemdEnvironment,
+  systemdExecWord,
+  systemdPath,
   systemdUnit,
+  userUnitDir,
   type ServiceHost,
 } from "./serve-service.ts";
 
@@ -193,29 +198,61 @@ describe("the service definition", () => {
     expect(plist.match(/<\/dict>/g)).toHaveLength(2);
   });
 
-  it("is a systemd --user unit with the same lifecycle, its words quoted and its specifiers escaped", () => {
-    const unit = systemdUnit({ ...definition, argv: ["/usr/bin/node", "/opt/sharednet/main.js", "serve", "--service"] });
+  it("is a systemd --user unit with the same lifecycle, each directive written the way systemd parses it", () => {
+    const unit = systemdUnit({ ...definition, argv: ["/usr/bin/node", "/opt/sharednet/main.js", "serve", "--service"], logFile: "/home/a b/100%/serve.log" });
     expect(unit).toContain('ExecStart="/usr/bin/node" "/opt/sharednet/main.js" "serve" "--service"');
+    // A path setting is never quoted: WorkingDirectory="/tmp" is "not absolute", a fatal error.
+    expect(unit).toContain("WorkingDirectory=/Users/synthetic\n");
+    expect(unit).not.toMatch(/WorkingDirectory="/);
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("RestartSec=30");
     expect(unit).toContain("UMask=0077");
-    expect(unit).toContain("StandardOutput=append:/Users/synthetic/.local/state/sharednet/serve.log");
+    expect(unit).toContain("StandardOutput=append:/home/a b/100%%/serve.log");
+    expect(unit).toContain("StandardError=append:/home/a b/100%%/serve.log");
     expect(unit).toContain('Environment="HTTPS_PROXY=http://127.0.0.1:10080"');
-    expect(unit).toContain(`Environment="WEIRD=a&b<c>\\"d'%%$$e"`);
+    // Environment= expands specifiers but never variables: % doubles, $ stays single.
+    expect(unit).toContain(`Environment="WEIRD=a&b<c>\\"d'%%$e"`);
     expect(unit).toContain("WantedBy=default.target");
     expect(programIn("systemd", unit)).toEqual(["/usr/bin/node", "/opt/sharednet/main.js", "serve", "--service"]);
   });
 
+  it("formats ExecStart words, Environment assignments and paths each by its own rules, and refuses what none can hold", () => {
+    // ExecStart= expands both specifiers and $VARIABLES.
+    expect(systemdExecWord(`/opt/a b/100%/$HOME/"q"\\x`)).toBe(`"/opt/a b/100%%/$$HOME/\\"q\\"\\\\x"`);
+    expect(programIn("systemd", `ExecStart=${systemdExecWord("/opt/x$y%z")} "serve"`)).toEqual(["/opt/x$y%z", "serve"]);
+    expect(systemdEnvironment("PATH", "/a$b:/c%d")).toBe(`"PATH=/a$b:/c%%d"`);
+    expect(systemdPath("WorkingDirectory=", "/home/a b/%h")).toBe("/home/a b/%%h");
+    expect(() => systemdPath("WorkingDirectory=", "relative")).toThrow(/absolute/);
+    expect(() => systemdPath("WorkingDirectory=", " /x")).toThrow(/absolute/);
+    expect(() => systemdPath("StandardOutput=", "/x\ny")).toThrow(/line break/);
+    expect(() => systemdEnvironment("X", "a\nb")).toThrow(/line break/);
+    expect(() => systemdExecWord(";")).toThrow(/;/);
+    // Captured values with a line break are left out rather than written.
+    expect(captureServiceEnv({ PATH: "/usr/bin", HOME: "/h", USER: "u", LOGNAME: "u", LANG: "x\ny" }, FALLBACK).skipped).toEqual([{ name: "LANG", why: expect.stringContaining("line break") }]);
+  });
+
+  it("goes where the user manager reads units: its own search path, not this shell's XDG_CONFIG_HOME", () => {
+    // UnitPath as systemd 255 reports it on Ubuntu 24.04 (user 1003).
+    const ubuntu =
+      "/home/yuchen/.config/systemd/user.control /run/user/1003/systemd/user.control /run/user/1003/systemd/transient /run/user/1003/systemd/generator.early /home/yuchen/.config/systemd/user /etc/xdg/systemd/user /etc/systemd/user /run/user/1003/systemd/user /run/systemd/user /run/user/1003/systemd/generator /home/yuchen/.local/share/systemd/user /usr/local/share/systemd/user /usr/share/systemd/user /usr/local/lib/systemd/user /usr/lib/systemd/user /run/user/1003/systemd/generator.late\n";
+    expect(userUnitDir(ubuntu, "/home/yuchen")).toBe("/home/yuchen/.config/systemd/user");
+    // A manager started with its own XDG_CONFIG_HOME: its directory, never .control or /run.
+    expect(userUnitDir("/home/u/cfg/systemd/user.control /run/user/1/systemd/user /home/u/cfg/systemd/user /home/u/.local/share/systemd/user", "/home/u")).toBe("/home/u/cfg/systemd/user");
+    expect(userUnitDir("/etc/systemd/user /usr/lib/systemd/user", "/home/u")).toBeNull();
+  });
+
   it("is named for its storage root: the standard one, or another with its own name so two never collide", () => {
-    expect(serviceLocation("darwin", { HOME: "/Users/synthetic" }, "/ignored")).toEqual({
+    expect(serviceLocation("darwin", { HOME: "/Users/synthetic" }, "/Users/synthetic")).toEqual({
       kind: "launchd",
       label: "ai.sharednet.serve",
       file: "/Users/synthetic/Library/LaunchAgents/ai.sharednet.serve.plist",
     });
-    expect(serviceLocation("darwin", { HOME: "/Users/synthetic", XDG_CONFIG_HOME: "/Users/synthetic/.config" }, "/ignored")?.label).toBe("ai.sharednet.serve");
-    const other = serviceLocation("darwin", { HOME: "/Users/synthetic", XDG_CONFIG_HOME: "/tmp/elsewhere" }, "/ignored")!;
+    expect(serviceLocation("darwin", { HOME: "/Users/synthetic", XDG_CONFIG_HOME: "/Users/synthetic/.config" }, "/Users/synthetic")?.label).toBe("ai.sharednet.serve");
+    const other = serviceLocation("darwin", { HOME: "/Users/synthetic", XDG_CONFIG_HOME: "/tmp/elsewhere" }, "/Users/synthetic")!;
     expect(other.label).toMatch(/^ai\.sharednet\.serve\.[0-9a-f]{8}$/);
-    expect(serviceLocation("linux", { HOME: "/home/synthetic" }, "/ignored")).toEqual({
+    // The file goes in the account's home, which launchd reads, even when this shell's HOME differs.
+    expect(other.file).toBe(`/Users/synthetic/Library/LaunchAgents/${other.label}.plist`);
+    expect(serviceLocation("linux", { HOME: "/home/synthetic" }, "/home/synthetic")).toEqual({
       kind: "systemd",
       label: "sharednet-serve.service",
       file: "/home/synthetic/.config/systemd/user/sharednet-serve.service",
@@ -235,6 +272,7 @@ function fakeHost(platform: NodeJS.Platform, home: string, answers: Record<strin
     home,
     username: "synthetic",
     readFile: async (path) => files.get(path) ?? null,
+    listDir: async (path) => [...files.keys()].filter((file) => dirname(file) === path).map((file) => file.slice(path.length + 1)),
     writeFile: async (path, content) => void files.set(path, content),
     remove: async (path) => files.delete(path),
     ensureDir: async (path) => void dirs.push(path),
@@ -348,18 +386,73 @@ describe("installing, inspecting and removing it", () => {
 
   it("on Linux writes a systemd --user unit, enables and restarts it, and notes lingering", async () => {
     const bin = await binWith("node");
+    const unitPath = "systemctl --user show --property=UnitPath --value";
     const { host, files, calls } = fakeHost("linux", "/home/synthetic", {
-      "systemctl --user show": { exitCode: 0, stdout: "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nMainPID=4242\n" },
+      [unitPath]: { exitCode: 0, stdout: "/home/synthetic/.config/systemd/user.control /home/synthetic/.config/systemd/user /etc/systemd/user\n" },
+      "loginctl show-user synthetic": { exitCode: 0, stdout: "Linger=no\n" },
+      "systemctl --user show sharednet-serve.service": { exitCode: 0, stdout: "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nMainPID=4242\n" },
     });
-    const control = new ServiceControl({ HOME: "/home/synthetic", USER: "synthetic", PATH: bin }, host, program);
+    // This shell points XDG_CONFIG_HOME elsewhere; the unit still goes where the manager reads units.
+    const control = new ServiceControl({ HOME: "/home/synthetic", USER: "synthetic", PATH: bin, XDG_CONFIG_HOME: "/home/synthetic/.config" }, host, program);
     const report = await control.install();
-    expect(calls).toEqual(["systemctl --user daemon-reload", "systemctl --user enable sharednet-serve.service", "systemctl --user restart sharednet-serve.service"]);
+    expect(calls).toEqual([
+      unitPath,
+      unitPath,
+      "systemctl --user daemon-reload",
+      "systemctl --user enable sharednet-serve.service",
+      "systemctl --user restart sharednet-serve.service",
+      "loginctl show-user synthetic --property=Linger",
+    ]);
     expect(files.get("/home/synthetic/.config/systemd/user/sharednet-serve.service")).toContain("Restart=always");
-    expect(report.warnings).toEqual(expect.arrayContaining([expect.stringContaining("loginctl enable-linger synthetic")]));
+    expect(report.linger).toBe(false);
+    expect(report.warnings).toEqual(expect.arrayContaining([expect.stringContaining("Lingering is off for synthetic"), expect.stringContaining("sudo loginctl enable-linger synthetic")]));
+    expect(calls.some((call) => call.startsWith("sudo"))).toBe(false);
     expect(await control.state()).toMatchObject({ kind: "systemd", installed: true, loaded: true, running: true, pid: 4242 });
     calls.length = 0;
     await control.uninstall();
-    expect(calls).toEqual(["systemctl --user disable --now sharednet-serve.service", "systemctl --user daemon-reload"]);
+    expect(calls).toEqual([unitPath, "systemctl --user disable --now sharednet-serve.service", "systemctl --user daemon-reload"]);
+
+    // With lingering on, there is nothing to say about it.
+    const lingering = fakeHost("linux", "/home/synthetic", { "loginctl show-user": { exitCode: 0, stdout: "Linger=yes\n" } });
+    const quiet = await new ServiceControl({ HOME: "/home/synthetic", USER: "synthetic", PATH: bin, HTTPS_PROXY: "http://127.0.0.1:1" }, lingering.host, program).install();
+    expect(quiet).toMatchObject({ linger: true });
+    expect(quiet.warnings).toBeUndefined();
+  });
+
+  it("on Linux writes into the manager's own unit directory when it is not ~/.config", async () => {
+    const bin = await binWith("node");
+    const { host, files } = fakeHost("linux", "/home/synthetic", {
+      "systemctl --user show --property=UnitPath": { exitCode: 0, stdout: "/home/synthetic/cfg/systemd/user.control /run/user/1/systemd/user /home/synthetic/cfg/systemd/user\n" },
+      "loginctl": { exitCode: 0, stdout: "Linger=yes\n" },
+    });
+    const report = await new ServiceControl({ HOME: "/home/synthetic", USER: "synthetic", PATH: bin }, host, program).install();
+    expect(report.file).toBe("/home/synthetic/cfg/systemd/user/sharednet-serve.service");
+    expect(files.has("/home/synthetic/cfg/systemd/user/sharednet-serve.service")).toBe(true);
+  });
+
+  it("refuses to install beside another definition that respawns serve, naming the command that stops it, and touches nothing", async () => {
+    const bin = await binWith("node");
+    const agents = "/Users/synthetic/Library/LaunchAgents";
+    // As found on a real machine: a hand-made supervisor that restarts serve whenever it is gone.
+    const supervisor = `<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>ai.sharednet.listener-supervisor</string><key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>/Users/synthetic/.local/share/sharednet/bin/supervise.py</string></array><key>KeepAlive</key><true/></dict></plist>`;
+    const { host, files, calls } = fakeHost("darwin", "/Users/synthetic");
+    files.set(`${agents}/ai.sharednet.listener-supervisor.plist`, supervisor);
+    files.set(`${agents}/com.example.backup.plist`, "<plist><dict><key>Label</key><string>com.example.backup</string></dict></plist>");
+    files.set(`${agents}/ai.sharednet.serve.0a1b2c3d.plist`, "<plist><dict><key>Label</key><string>ai.sharednet.serve.0a1b2c3d</string><string>sharednet serve --service</string></dict></plist>");
+    const control = new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, host, program);
+    expect(await control.conflicts()).toEqual([
+      { label: "ai.sharednet.listener-supervisor", file: `${agents}/ai.sharednet.listener-supervisor.plist`, stop: "launchctl bootout gui/501/ai.sharednet.listener-supervisor" },
+    ]);
+    await expect(control.install()).rejects.toMatchObject({ code: "service_conflict", message: expect.stringContaining("launchctl bootout gui/501/ai.sharednet.listener-supervisor") });
+    expect(calls).toEqual([]);
+    expect(files.has(`${agents}/ai.sharednet.serve.plist`)).toBe(false);
+    expect(files.get(`${agents}/ai.sharednet.listener-supervisor.plist`)).toBe(supervisor);
+
+    const linux = fakeHost("linux", "/home/synthetic");
+    linux.files.set("/home/synthetic/.config/systemd/user/sharednet-listener.service", "[Service]\nExecStart=/usr/bin/npx -y sharednet@latest serve\n");
+    expect((await new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, linux.host, program).conflicts()).map((other) => other.stop)).toEqual([
+      "systemctl --user disable --now sharednet-listener.service",
+    ]);
   });
 
   it("refuses Windows, and other systems, clearly", async () => {
@@ -387,5 +480,59 @@ describe("installing, inspecting and removing it", () => {
     expect(String(report.label)).toMatch(/^ai\.sharednet\.serve\.[0-9a-f]{8}$/);
     const plist = [...files.values()][0]!;
     expect(plist).toContain(`<key>XDG_CONFIG_HOME</key>\n\t\t<string>${join(root, "config")}</string>`);
+  });
+});
+
+/**
+ * systemd's own parser, where it exists: the unit unit tests above cannot prove loads. On Linux CI
+ * (ubuntu, systemd 255) it is required, so a missing systemd-analyze fails rather than skips.
+ */
+const analyzer = spawnSync("systemd-analyze", ["--version"], { encoding: "utf8" });
+const hasAnalyzer = analyzer.status === 0;
+const analyzerRequired = (process.platform === "linux" && Boolean(process.env.CI)) || process.env.SHAREDNET_REQUIRE_SYSTEMD_ANALYZE === "1";
+
+function verifyUnit(file: string): { status: number | null; output: string } {
+  // A user manager needs XDG_RUNTIME_DIR; without one (a CI runner), the system-mode parser reads the same directives.
+  let result = spawnSync("systemd-analyze", ["--user", "verify", file], { encoding: "utf8" });
+  if (result.status !== 0 && /Failed to initialize manager/.test(`${result.stderr}${result.stdout}`)) {
+    result = spawnSync("systemd-analyze", ["verify", file], { encoding: "utf8" });
+  }
+  return { status: result.status, output: `${result.stdout}${result.stderr}` };
+}
+
+describe.runIf(hasAnalyzer || analyzerRequired)("the unit in systemd's own parser (systemd-analyze verify)", () => {
+  async function unitFile(content: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "sharednet-unit-"));
+    cleanup.push(dir);
+    const file = join(dir, "sharednet-serve-verify.service");
+    await writeFile(file, content);
+    return file;
+  }
+
+  it("loads, with spaces, %, $, quotes and backslashes in every directive", async () => {
+    expect(hasAnalyzer, `systemd-analyze is required here: ${analyzer.error ?? analyzer.stderr}`).toBe(true);
+    const dir = await mkdtemp(join(tmpdir(), "sharednet-unit work %h "));
+    cleanup.push(dir);
+    const unit = systemdUnit({
+      label: "sharednet-serve-verify.service",
+      argv: [process.execPath, "-e", `0 // $HOME %h "q" \\x`],
+      env: { PATH: "/usr/local/bin:/usr/bin:/bin", HTTPS_PROXY: "http://127.0.0.1:10080", ODD: `a$b%c "q" \\back` },
+      logFile: join(dir, "log 100%", "serve.log"),
+      workingDirectory: dir.replace(/\/$/, ""),
+    });
+    const file = await unitFile(unit);
+    const verified = verifyUnit(file);
+    expect(verified.output).not.toMatch(/sharednet-serve-verify/);
+    expect(verified.status).toBe(0);
+  });
+
+  it("refuses what the first version wrote (a quoted WorkingDirectory), so a pass above means something", async () => {
+    const unit = systemdUnit({ label: "x.service", argv: [process.execPath], env: {}, logFile: "/tmp/serve.log", workingDirectory: "/tmp" }).replace(
+      "WorkingDirectory=/tmp",
+      'WorkingDirectory="/tmp"',
+    );
+    const verified = verifyUnit(await unitFile(unit));
+    expect(verified.status).not.toBe(0);
+    expect(verified.output).toMatch(/WorkingDirectory= path is not absolute/);
   });
 });

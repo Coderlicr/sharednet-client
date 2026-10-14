@@ -12,7 +12,7 @@ import { computeLocalInstanceKey } from "./instance-computation.ts";
 import { detectRuntime, type DetectedRuntime } from "./runtime-detection.ts";
 import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn, triggerTakesParameter, wakeIdentity, type Trigger } from "./triggers.ts";
 import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
-import { RESTART_SECONDS, type WakeServiceControl } from "./serve-service.ts";
+import { RESTART_SECONDS, supervisorConflict, type WakeServiceControl } from "./serve-service.ts";
 import { chatOpen } from "./wake-claude.ts";
 import { codebuddyProgram } from "./wake-codebuddy.ts";
 import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
@@ -130,7 +130,7 @@ const WAIT_MAX_SECONDS = 25;
 const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume", "config-dir"]);
 /** Options that may be given more than once; every value is kept, in order. */
 const REPEATABLE_OPTIONS = new Set(["on", "artifact"]);
-const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake", "switch-account", "install", "uninstall", "service"]);
+const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake", "switch-account", "install", "uninstall", "service", "handoff"]);
 
 function parseGuestArguments(args: string[]): ParsedGuestArguments {
   const options = new Map<string, string | true>();
@@ -2749,11 +2749,11 @@ const MAX_MESSAGE_BYTES = 32_768;
 
 async function serve(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["run", "reply", "rooms", "from-instance", "from-agent", "grep", "status", "stop", "push", "listen", "install", "uninstall", "service"]);
+  assertOnlyOptions(parsed, ["run", "reply", "rooms", "from-instance", "from-agent", "grep", "status", "stop", "push", "listen", "install", "uninstall", "service", "handoff"]);
   if (parsed.positionals.length !== 0) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet serve [--run '<command>'] [--reply] [--rooms all|rom_…,rom_…] [--grep TEXT] [--push <public address>|ngrok [--listen <port>]], or sharednet serve --status | --stop | --install | --uninstall",
+      "Usage: sharednet serve [--run '<command>'] [--reply] [--rooms all|rom_…,rom_…] [--grep TEXT] [--push <public address>|ngrok [--listen <port>]], or sharednet serve --status | --stop | --install [--handoff] | --uninstall",
     );
   }
   const pushOption = stringOption(parsed, "push");
@@ -2766,20 +2766,36 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const control = dependencies.wakeService?.(dependencies.env);
   const install = parsed.options.get("install") === true;
   if (install || parsed.options.get("uninstall") === true) {
-    if ([...parsed.options.keys()].some((name) => name !== "install" && name !== "uninstall") || (install && parsed.options.get("uninstall") === true)) {
-      throw localError("invalid_arguments", "--install and --uninstall go alone: the service serves every seat here joined from a Codex or Claude Code session.");
+    const handoff = parsed.options.get("handoff") === true;
+    if (
+      [...parsed.options.keys()].some((name) => name !== "install" && name !== "uninstall" && name !== "handoff") ||
+      (install && parsed.options.get("uninstall") === true) ||
+      (handoff && !install)
+    ) {
+      throw localError("invalid_arguments", "--install [--handoff] and --uninstall go alone: the service serves every seat here joined from a Codex or Claude Code session.");
     }
     if (!control) throw localError("service_unsupported", "Only the sharednet executable can install or remove its service.");
     if (install && sandboxed(dependencies.env)) {
       throw localError("service_not_installed", "This session runs in a sandbox; install the service from a terminal outside it.");
     }
     if (!install) return control.uninstall();
-    const report = await control.install();
-    // A serve started by hand keeps the slot; the service waits for it, so say how to hand over.
+    // Before anything is written: a supervisor that respawns serve would race the service for ever.
+    const others = await control.conflicts();
+    if (others.length > 0) throw supervisorConflict(others);
+    // A serve this service did not start holds the slot. Installing beside it is a choice, not a race:
+    // refused, unless --handoff says the service should wait for it and take over once it stops.
     const running = (await readServeStatus(paths).catch(() => ({}))) as { running?: boolean; pid?: number };
     const service = await control.state().catch(() => null);
-    if (running.running && running.pid && running.pid !== service?.pid) {
-      const note = `a serve started outside the service is running (pid ${running.pid}) and keeps the machine's slot; the service waits for it and takes over once it stops: sharednet serve --stop`;
+    const elsewhere = running.running && running.pid && running.pid !== service?.pid ? running.pid : null;
+    if (elsewhere !== null && !handoff) {
+      throw localError(
+        "serve_running",
+        `A serve the service did not start is running here (pid ${elsewhere}). Stop it first (sharednet serve --stop) and install again, or install with --handoff: the service then waits for pid ${elsewhere} to stop and takes over.`,
+      );
+    }
+    const report = await control.install();
+    if (elsewhere !== null) {
+      const note = `handing over: pid ${elsewhere} keeps the machine's slot until it stops; the service then takes over. Stop it with: sharednet serve --stop`;
       report.warnings = [...((report.warnings as string[] | undefined) ?? []), note];
     }
     return reportInstall(report, dependencies);

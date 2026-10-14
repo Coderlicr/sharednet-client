@@ -2716,9 +2716,14 @@ describe("sharednet say and wait", () => {
     });
 
     /** An installed service as its manager would report it; `start` and the rest are recorded, nothing runs. */
-    function installedService(state: Partial<ServiceState> | null, started: { ok: boolean; message: string } = { ok: true, message: "the installed service ai.sharednet.serve was started" }) {
+    function installedService(
+      state: Partial<ServiceState> | null,
+      started: { ok: boolean; message: string } = { ok: true, message: "the installed service ai.sharednet.serve was started" },
+      others: Array<{ label: string; file: string; stop: string }> = [],
+    ) {
       const calls: string[] = [];
       const control: WakeServiceControl = {
+        conflicts: async () => others,
         state: async () => (state === null ? null : { kind: "launchd", label: "ai.sharednet.serve", file: "/Users/synthetic/Library/LaunchAgents/ai.sharednet.serve.plist", installed: true, loaded: true, running: false, ...state }),
         start: async () => (calls.push("start"), started),
         install: async () => (calls.push("install"), { installed: true, manager: "launchd", label: "ai.sharednet.serve", file: "/f.plist", log: "/serve.log", program: ["/opt/homebrew/bin/npx", "-y", "sharednet@latest", "serve", "--service"], program_note: "note", env: { PATH: "/usr/bin", HTTPS_PROXY: "http://127.0.0.1:10080" } }),
@@ -2771,12 +2776,18 @@ describe("sharednet say and wait", () => {
       expect(installed.stderr).toContain("it runs /opt/homebrew/bin/npx -y sharednet@latest serve --service");
       expect(installed.stderr).toContain("  HTTPS_PROXY=http://127.0.0.1:10080");
 
-      // A serve started by hand is running (this process stands in for it): the install says how to hand over.
+      // A serve the service did not start is running (this process stands in for it): refused, not raced,
+      // unless --handoff asks the service to wait for it and take over.
       const { mkdir, writeFile } = await import("node:fs/promises");
       await mkdir(join(space.env.XDG_CONFIG_HOME!, "sharednet"), { recursive: true, mode: 0o700 });
       await writeFile(join(space.env.XDG_CONFIG_HOME!, "sharednet", "serve.json"), JSON.stringify({ pid: process.pid, started_at: "2026-10-05T00:00:00.000Z", rooms: [] }));
-      const beside = await run(["serve", "--install", "--json"], space, [], {}, { wakeService: service.wakeService });
-      expect(beside.stderr).toContain(`a serve started outside the service is running (pid ${process.pid})`);
+      const refused = await run(["serve", "--install", "--json"], space, [], {}, { wakeService: service.wakeService });
+      expect(JSON.parse(refused.stderr).error).toMatchObject({ code: "serve_running", message: expect.stringContaining(`pid ${process.pid}`) });
+      expect(refused.stderr).toContain("--handoff");
+      expect(service.calls).toEqual(["install"]);
+      const beside = await run(["serve", "--install", "--handoff", "--json"], space, [], {}, { wakeService: service.wakeService });
+      expect(beside.exitCode).toBe(0);
+      expect(beside.stderr).toContain(`handing over: pid ${process.pid} keeps the machine's slot until it stops`);
       const { unlink } = await import("node:fs/promises");
       await unlink(join(space.env.XDG_CONFIG_HOME!, "sharednet", "serve.json"));
 
@@ -2791,7 +2802,16 @@ describe("sharednet say and wait", () => {
       expect((await run(["serve", "--install", "--json"], space, [])).exitCode).not.toBe(0);
       expect((await run(["serve", "--install", "--uninstall", "--json"], space, [], {}, { wakeService: service.wakeService })).exitCode).not.toBe(0);
       expect((await run(["serve", "--install", "--run", "x", "--json"], space, [], {}, { wakeService: service.wakeService })).exitCode).not.toBe(0);
+      expect((await run(["serve", "--uninstall", "--handoff", "--json"], space, [], {}, { wakeService: service.wakeService })).exitCode).not.toBe(0);
       expect(service.calls).toEqual(["install", "install", "uninstall"]);
+
+      // A supervisor that respawns serve is refused outright, with the command that stops it; nothing is installed.
+      const supervised = installedService(null, undefined, [
+        { label: "ai.sharednet.listener-supervisor", file: "/Users/synthetic/Library/LaunchAgents/ai.sharednet.listener-supervisor.plist", stop: "launchctl bootout gui/501/ai.sharednet.listener-supervisor" },
+      ]);
+      const blocked = await run(["serve", "--install", "--handoff", "--json"], space, [], {}, { wakeService: supervised.wakeService });
+      expect(JSON.parse(blocked.stderr).error).toMatchObject({ code: "service_conflict", message: expect.stringContaining("launchctl bootout gui/501/ai.sharednet.listener-supervisor") });
+      expect(supervised.calls).toEqual([]);
     });
 
     it("as the installed service, waits for another serve to give up the slot instead of ending, and then takes it", async () => {
