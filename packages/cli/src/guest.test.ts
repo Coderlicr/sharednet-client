@@ -104,9 +104,9 @@ async function run(
     signal?: AbortSignal;
     startWakeService?: (input: { env: Record<string, string | undefined>; logFile: string }) => number | null;
     processProbe?: ProcessProbe;
-    signal?: AbortSignal;
     rescanMs?: number;
     listSeats?: <T>(read: () => Promise<T>) => Promise<T>;
+    lockPause?: () => Promise<void>;
   } = {},
 ) {
   const { mkdir } = await import("node:fs/promises");

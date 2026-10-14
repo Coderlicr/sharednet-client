@@ -64,7 +64,7 @@ function ps(field: string, pid: number): string | null {
 }
 
 /** The platforms whose start identity this module reads. */
-export function identitySupportedOn(platform: NodeJS.Platform): boolean {
+export function identitySupportedOn(platform: string): boolean {
   return platform === "linux" || platform === "darwin";
 }
 
