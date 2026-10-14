@@ -349,6 +349,8 @@
     "packages/cli/src/wake-codebuddy.test.ts",
     "docs/serve-service.md",
     "packages/cli/src/serve-service.ts",
-    "packages/cli/src/serve-service.test.ts"
+    "packages/cli/src/serve-service.test.ts",
+    "packages/cli/src/serve-conflicts.ts",
+    "packages/cli/src/serve-conflicts.test.ts"
   ]
 }

@@ -2,9 +2,10 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
-import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { localError } from "./errors.ts";
+import { launchdConflicts, rootFrom, systemdConflicts, type ServeDefinition } from "./serve-conflicts.ts";
 import { getStoragePaths } from "./storage.ts";
 import { harnessFreeEnv, onPath, type Environment } from "./wake-driver.ts";
 
@@ -200,8 +201,11 @@ const UNIT = "sharednet-serve";
  * `unitDir` (see userUnitDir).
  */
 export function serviceLocation(platform: NodeJS.Platform, env: Environment, home: string, unitDir?: string): ServiceLocation | null {
-  const configDir = getStoragePaths({ ...env, HOME: env.HOME || home }).configDir;
-  const standard = join(env.HOME || home, ".config", "sharednet");
+  // The plain name belongs to the account home's standard root alone; every other resolved root
+  // (another XDG_CONFIG_HOME, or another HOME) is hashed, so two roots never share a name or a file.
+  const resolved = rootFrom({ HOME: env.HOME, XDG_CONFIG_HOME: env.XDG_CONFIG_HOME }, home);
+  const configDir = "root" in resolved ? resolved.root : getStoragePaths({ ...env, HOME: env.HOME || home }).configDir;
+  const standard = resolve(join(home, ".config", "sharednet"));
   const suffix = configDir === standard ? "" : createHash("sha256").update(configDir).digest("hex").slice(0, 8);
   if (platform === "darwin") {
     const label = suffix ? `${LABEL}.${suffix}` : LABEL;
@@ -466,161 +470,6 @@ export function launchdRunning(printed: string): { running: boolean; pid?: numbe
   return { running, ...(running && Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}) };
 }
 
-/** A definition's storage root, or why it could not be read. */
-export type DefinitionRoot = { root: string } | { unresolved: string };
-
-/**
- * One value of a systemd setting split into words the way systemd.syntax(7) "Quoting" says:
- * whitespace separates words; "…" or '…' wraps a whole word (opening at its start, closing before
- * whitespace or the end); C escapes (\n, \t, \\, \", \', \s, \xhh, \nnn, \uhhhh, \Uhhhhhhhh) apply
- * in and out of quotes. Anything outside those rules (a quote inside a word, an unknown escape, an
- * unclosed quote) is null: the caller cannot know what systemd made of it.
- */
-export function systemdWords(value: string): string[] | null {
-  const words: string[] = [];
-  let index = 0;
-  const escapes: Record<string, string> = { a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", '"': '"', "'": "'", s: " " };
-  while (index < value.length) {
-    while (index < value.length && /\s/.test(value[index]!)) index += 1;
-    if (index >= value.length) break;
-    const quote = value[index] === '"' || value[index] === "'" ? value[index]! : null;
-    if (quote) index += 1;
-    let word = "";
-    let closed = quote === null;
-    while (index < value.length) {
-      const char = value[index]!;
-      if (quote !== null && char === quote) {
-        index += 1;
-        closed = true;
-        if (index < value.length && !/\s/.test(value[index]!)) return null;
-        break;
-      }
-      if (quote === null && /\s/.test(char)) break;
-      if (quote === null && (char === '"' || char === "'")) return null;
-      if (char === "\\") {
-        const next = value[index + 1];
-        if (next === undefined) return null;
-        if (next in escapes) {
-          word += escapes[next];
-          index += 2;
-          continue;
-        }
-        const hex = next === "x" ? /^[0-9a-fA-F]{2}/.exec(value.slice(index + 2)) : next === "u" ? /^[0-9a-fA-F]{4}/.exec(value.slice(index + 2)) : next === "U" ? /^[0-9a-fA-F]{8}/.exec(value.slice(index + 2)) : null;
-        if (hex) {
-          word += String.fromCodePoint(parseInt(hex[0], 16));
-          index += 2 + hex[0].length;
-          continue;
-        }
-        const octal = /^[0-7]{3}/.exec(value.slice(index + 1));
-        if (octal) {
-          word += String.fromCharCode(parseInt(octal[0], 8));
-          index += 4;
-          continue;
-        }
-        return null;
-      }
-      word += char;
-      index += 1;
-    }
-    if (!closed) return null;
-    words.push(word);
-  }
-  return words;
-}
-
-/** The [Service] section's settings of a unit (and its drop-ins, in order), continuation lines joined. */
-function serviceSettings(contents: string[]): Array<{ key: string; value: string }> {
-  const settings: Array<{ key: string; value: string }> = [];
-  for (const content of contents) {
-    let section = "";
-    for (const line of content.replace(/\\\r?\n/g, " ").split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
-      const header = /^\[(.+)\]$/.exec(trimmed);
-      if (header) {
-        section = header[1]!;
-        continue;
-      }
-      const at = trimmed.indexOf("=");
-      if (section === "Service" && at > 0) settings.push({ key: trimmed.slice(0, at).trim(), value: trimmed.slice(at + 1).trim() });
-    }
-  }
-  return settings;
-}
-
-/** A path value's specifiers, as systemd expands them in Environment=: %% and %h (the home); any other is unknown. */
-function expandSpecifiers(value: string, home: string): string | null {
-  let unknown = false;
-  const expanded = value.replace(/%(.)/g, (_, specifier: string) => {
-    if (specifier === "%") return "%";
-    if (specifier === "h") return home;
-    unknown = true;
-    return "";
-  });
-  return unknown || /%$/.test(value) ? null : expanded;
-}
-
-/**
- * The storage root a service definition's serve uses: from the HOME and XDG_CONFIG_HOME its manager
- * hands it, as the CLI's own getStoragePaths would. A definition that sets neither runs with the
- * manager's defaults, which is the account's standard root, `~/.config/sharednet`. Whatever this
- * cannot read for certain (a binary plist, EnvironmentFile=, PassEnvironment= of either variable, a
- * quoting or specifier it does not know) is unresolved, never quietly the standard root.
- * `contents` is a unit followed by its drop-ins, or one plist.
- */
-export function definitionRoot(kind: ServicePlatform, contents: string | string[], home: string): DefinitionRoot {
-  const all = typeof contents === "string" ? [contents] : contents;
-  const env: Record<string, string> = {};
-  if (kind === "launchd") {
-    const content = all[0] ?? "";
-    if (content.startsWith("bplist")) return { unresolved: "it is a binary plist" };
-    if (!/<plist[\s>]/.test(content)) return { unresolved: "it is not an XML plist" };
-    if (/<key>EnvironmentVariables<\/key>/.test(content)) {
-      const dict = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(content)?.[1];
-      if (dict === undefined) return { unresolved: "its EnvironmentVariables could not be read" };
-      const unxml = (value: string) =>
-        value
-          .replace(/&#x([0-9a-fA-F]+);/g, (_, code: string) => String.fromCodePoint(parseInt(code, 16)))
-          .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)))
-          .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
-      for (const match of dict.matchAll(/<key>([^<]+)<\/key>\s*(?:<string>([^<]*)<\/string>|<string\/>)/g)) env[unxml(match[1]!)] = unxml(match[2] ?? "");
-      for (const name of ["HOME", "XDG_CONFIG_HOME"]) {
-        if (new RegExp(`<key>${name}</key>`).test(dict) && env[name] === undefined) return { unresolved: `its ${name} could not be read` };
-      }
-    }
-  } else {
-    for (const { key, value } of serviceSettings(all)) {
-      if (key === "EnvironmentFile") return { unresolved: "it reads variables from an EnvironmentFile=" };
-      if (key === "PassEnvironment" && /\b(HOME|XDG_CONFIG_HOME)\b/.test(value)) return { unresolved: "it passes the manager's HOME or XDG_CONFIG_HOME through (PassEnvironment=)" };
-      if (key === "UnsetEnvironment" && /\b(HOME|XDG_CONFIG_HOME)\b/.test(value)) return { unresolved: "it unsets HOME or XDG_CONFIG_HOME (UnsetEnvironment=)" };
-      if (key !== "Environment") continue;
-      if (value === "") {
-        // An empty assignment resets the list.
-        for (const name of Object.keys(env)) delete env[name];
-        continue;
-      }
-      const words = systemdWords(value);
-      if (words === null) {
-        if (/\b(HOME|XDG_CONFIG_HOME)=/.test(value)) return { unresolved: `its Environment=${value} could not be parsed` };
-        continue;
-      }
-      for (const word of words) {
-        const at = word.indexOf("=");
-        if (at > 0) env[word.slice(0, at)] = word.slice(at + 1);
-      }
-    }
-    for (const name of ["HOME", "XDG_CONFIG_HOME"]) {
-      if (env[name] === undefined) continue;
-      const expanded = expandSpecifiers(env[name]!, home);
-      if (expanded === null) return { unresolved: `its ${name}=${env[name]} uses a specifier other than %% or %h` };
-      env[name] = expanded;
-    }
-  }
-  const configHome = env.XDG_CONFIG_HOME;
-  if (configHome !== undefined && configHome !== "" && !isAbsolute(configHome)) return { unresolved: `its XDG_CONFIG_HOME=${configHome} is not absolute` };
-  return { root: getStoragePaths({ HOME: env.HOME || home, ...(configHome ? { XDG_CONFIG_HOME: configHome } : {}) }).configDir };
-}
-
 export class ServiceControl {
   private readonly env: Environment;
   private readonly host: ServiceHost;
@@ -634,6 +483,8 @@ export class ServiceControl {
 
   /** Where the definition is, or null where there is no service manager to ask. */
   private async where(): Promise<ServiceLocation | null> {
+    if (this.host.platform !== "darwin" && this.host.platform !== "linux") return null;
+    this.root();
     if (this.host.platform !== "linux") return serviceLocation(this.host.platform, this.env, this.host.home);
     const shown = await this.host.run("systemctl", ["--user", "show", "--property=UnitPath", "--value"]);
     const dir = shown.exitCode === 0 ? userUnitDir(shown.stdout, this.host.home) : null;
@@ -645,137 +496,37 @@ export class ServiceControl {
   }
 
   /**
-   * Other definitions in the same manager that run or respawn a SharedNet serve for the same storage
-   * root: a hand-made supervisor would start serve again beside this service, and the two would race
-   * for that root's one slot (serve.json). A definition for another storage root has its own slot
-   * and is no conflict, which is why each root's service has its own name.
-   *
-   * Each one found is `blocking` when its manager will run it: launchd has it loaded, or will load it
-   * at the next login (it is not disabled); systemd has it (or a timer that starts it) enabled or
-   * active. A disabled definition that is not running does not block; install warns about it. What
-   * cannot be read for certain blocks, and says why: a root that cannot be resolved (it might be this
-   * one), or a state the manager would not report. Read-only: nothing found is stopped or edited.
+   * Other definitions that run or respawn serve for this install's storage root, as their service
+   * manager runs them (serve-conflicts.ts). Read-only.
    */
   async conflicts(): Promise<ServeDefinition[]> {
     const where = await this.where();
     if (where === null) return [];
-    const dir = dirname(where.file);
-    const root = getStoragePaths({ ...this.env, HOME: this.env.HOME || this.host.home }).configDir;
-    const names = (await this.host.listDir(dir)).sort();
-    const own = (label: string) => label === where.label || label === where.label.replace(/\.service$/, "");
-    const mentionsServe = (content: string) => /sharednet/i.test(content) && /serve|supervis|listener|wake/i.test(content);
-    const found: ServeDefinition[] = [];
-    const scope = (resolved: DefinitionRoot): { same: boolean; unresolved?: string } =>
-      "root" in resolved ? { same: resolved.root === root } : { same: true, unresolved: resolved.unresolved };
-
+    const root = this.root();
     if (where.kind === "launchd") {
-      let disabled: Set<string> | null = null;
-      for (const name of names) {
-        if (!name.endsWith(".plist")) continue;
-        const file = join(dir, name);
-        const content = await this.host.readFile(file);
-        if (content === null || !mentionsServe(content)) continue;
-        const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(content)?.[1] ?? name.replace(/\.plist$/, "");
-        if (own(label) || own(name.replace(/\.plist$/, ""))) continue;
-        const { same, unresolved } = scope(definitionRoot("launchd", content, this.host.home));
-        if (!same) continue;
-        const printed = await this.host.run("launchctl", ["print", `gui/${this.host.uid}/${label}`]);
-        let blocking: boolean;
-        let why: string;
-        if (printed.exitCode === 0) {
-          const { running, pid } = launchdRunning(printed.stdout);
-          blocking = true;
-          why = running ? `launchd has it loaded and running${pid ? ` (pid ${pid})` : ""}` : "launchd has it loaded";
-        } else {
-          disabled ??= await this.launchdDisabled();
-          const off = disabled.has(label) || /<key>Disabled<\/key>\s*<true\/>/.test(content);
-          blocking = !off;
-          why = off ? "it is disabled and not loaded" : "it is not loaded now, but launchd loads it at the next login";
-        }
-        found.push({
-          label,
-          file,
-          blocking: blocking || unresolved !== undefined,
-          why: unresolved ? `${why}; its storage root could not be read (${unresolved}), so it is treated as this one` : why,
-          stop: printed.exitCode === 0 ? `launchctl bootout gui/${this.host.uid}/${label}` : `launchctl disable gui/${this.host.uid}/${label}`,
-        });
-      }
-      return found;
-    }
-
-    // systemd: a .timer runs its Unit= (by default the .service of the same name), and that service's
-    // own settings (and drop-ins) hold the environment. So timers are read only for what they start.
-    const timers = new Map<string, string[]>();
-    for (const name of names) {
-      if (!name.endsWith(".timer")) continue;
-      const content = (await this.host.readFile(join(dir, name))) ?? "";
-      let target = name.replace(/\.timer$/, ".service");
-      let section = "";
-      for (const line of content.split(/\r?\n/)) {
-        const header = /^\s*\[(.+)\]\s*$/.exec(line);
-        if (header) section = header[1]!;
-        const unit = /^\s*Unit\s*=\s*(\S+)\s*$/.exec(line);
-        if (section === "Timer" && unit) target = unit[1]!;
-      }
-      timers.set(target, [...(timers.get(target) ?? []), name]);
-    }
-    for (const name of names) {
-      if (!name.endsWith(".service") || own(name)) continue;
-      const file = join(dir, name);
-      const content = await this.host.readFile(file);
-      if (content === null) continue;
-      const dropIns: string[] = [];
-      for (const conf of (await this.host.listDir(join(dir, `${name}.d`))).filter((entry) => entry.endsWith(".conf")).sort()) {
-        dropIns.push((await this.host.readFile(join(dir, `${name}.d`, conf))) ?? "");
-      }
-      if (!mentionsServe([content, ...dropIns].join("\n"))) continue;
-      const { same, unresolved } = scope(definitionRoot("systemd", [content, ...dropIns], this.host.home));
-      if (!same) continue;
-      const units = [...(timers.get(name) ?? []), name];
-      const states: string[] = [];
-      let blocking = false;
-      for (const unit of units) {
-        const enabled = (await this.host.run("systemctl", ["--user", "is-enabled", unit])).stdout.trim().split("\n")[0] ?? "";
-        const active = (await this.host.run("systemctl", ["--user", "is-active", unit])).stdout.trim().split("\n")[0] ?? "";
-        const knownEnabled = ["enabled", "enabled-runtime", "linked", "linked-runtime", "alias"].includes(enabled);
-        const knownOff = ["disabled", "static", "indirect", "masked", "masked-runtime", "generated", "transient", "not-found"].includes(enabled);
-        const isActive = ["active", "activating", "reloading", "refreshing", "deactivating"].includes(active);
-        const isOff = ["inactive", "failed", "dead", "unknown"].includes(active);
-        if (knownEnabled || isActive || !knownOff || !isOff) blocking = true;
-        states.push(`${unit} is ${enabled || "of unknown enablement"} and ${active || "of unknown activity"}`);
-      }
-      found.push({
-        label: name,
-        file,
-        blocking: blocking || unresolved !== undefined,
-        why: `${states.join("; ")}${unresolved ? `; its storage root could not be read (${unresolved}), so it is treated as this one` : ""}`,
-        stop: `systemctl --user disable --now ${units.join(" ")}`,
+      return launchdConflicts({
+        host: this.host,
+        ownLabel: where.label,
+        root,
+        // Per-user agents, and the machine's agents, which launchd also loads into this login session.
+        agentDirs: [join(this.host.home, "Library", "LaunchAgents"), "/Library/LaunchAgents"],
       });
     }
-    // A timer whose service is not here starts something whose environment cannot be read.
-    for (const [target, timerNames] of timers) {
-      if (names.includes(target)) continue;
-      for (const timer of timerNames) {
-        const content = (await this.host.readFile(join(dir, timer))) ?? "";
-        if (!mentionsServe(content) && !/sharednet/i.test(target)) continue;
-        found.push({
-          label: timer,
-          file: join(dir, timer),
-          blocking: true,
-          why: `it starts ${target}, which is not in ${dir}, so its storage root could not be read; it is treated as this one`,
-          stop: `systemctl --user disable --now ${timer}`,
-        });
-      }
-    }
-    return found;
+    return systemdConflicts({ host: this.host, ownLabel: where.label, root, unitDirs: await this.userUnitDirs() });
   }
 
-  /** The labels `launchctl print-disabled` reports as disabled in this login session. */
-  private async launchdDisabled(): Promise<Set<string>> {
-    const printed = await this.host.run("launchctl", ["print-disabled", `gui/${this.host.uid}`]);
-    const labels = new Set<string>();
-    for (const match of printed.stdout.matchAll(/^\s*"([^"]+)"\s*=>\s*(disabled|true)\s*$/gm)) labels.add(match[1]!);
-    return labels;
+  /** This install's storage root, resolved; a relative HOME or XDG_CONFIG_HOME is refused. */
+  private root(): string {
+    const resolved = rootFrom({ HOME: this.env.HOME, XDG_CONFIG_HOME: this.env.XDG_CONFIG_HOME }, this.host.home);
+    if ("unresolved" in resolved) throw localError("service_not_installed", `This shell's storage root cannot be resolved: ${resolved.unresolved.replace(/^its /, "")}. Install from a shell with an absolute HOME and XDG_CONFIG_HOME.`);
+    return resolved.root;
+  }
+
+  /** The persistent unit directories under the account's home in the user manager's search path, for the fallback. */
+  private async userUnitDirs(): Promise<string[]> {
+    const shown = await this.host.run("systemctl", ["--user", "show", "--property=UnitPath", "--value"]);
+    const listed = shown.exitCode === 0 ? shown.stdout.split(/\s+/).filter((entry) => entry.startsWith(`${this.host.home}/`) && entry.endsWith("/systemd/user")) : [];
+    return listed.length > 0 ? listed : [join(this.host.home, ".config", "systemd", "user"), join(this.host.home, ".local", "share", "systemd", "user")];
   }
 
   /** The service as its manager sees it, or null where there is no service manager to ask. */
@@ -920,18 +671,6 @@ export class ServiceControl {
 }
 
 /** The refusal for another definition that runs or respawns serve, with the command that stops each. */
-/** Another definition that runs or respawns serve for this storage root (ServiceControl.conflicts). */
-export interface ServeDefinition {
-  label: string;
-  file: string;
-  /** Whether its manager will run it, so that it would race this service. */
-  blocking: boolean;
-  /** Its manager's state, and anything about it that could not be read. */
-  why: string;
-  /** The command that stops it from running. */
-  stop: string;
-}
-
 /** The refusal for the blocking ones, each with why it blocks and the command that stops it. */
 export function supervisorConflict(others: ServeDefinition[]) {
   return localError(
@@ -947,6 +686,8 @@ export function supervisorConflict(others: ServeDefinition[]) {
 export function inactiveDefinitionWarning(other: ServeDefinition): string {
   return `${other.label} (${other.file}) also runs serve for this storage root, but ${other.why}, so it does not block this install; enabling it again would race the service.`;
 }
+
+export type { ServeDefinition };
 
 /** What `serve` and `join` use of the service; tests stand in for it. */
 export type WakeServiceControl = Pick<ServiceControl, "state" | "install" | "uninstall" | "start" | "conflicts">;

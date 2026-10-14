@@ -18,8 +18,6 @@ import {
   systemdExecWord,
   systemdPath,
   systemdUnit,
-  systemdWords,
-  definitionRoot,
   userUnitDir,
   type ServiceHost,
 } from "./serve-service.ts";
@@ -234,10 +232,10 @@ describe("the service definition", () => {
   });
 
   it("goes where the user manager reads units: its own search path, not this shell's XDG_CONFIG_HOME", () => {
-    // UnitPath as systemd 255 reports it on Ubuntu 24.04 (user 1003).
+    // UnitPath as systemd 255 reports it on Ubuntu 24.04 (user and uid renamed to synthetic and 1000).
     const ubuntu =
-      "/home/yuchen/.config/systemd/user.control /run/user/1003/systemd/user.control /run/user/1003/systemd/transient /run/user/1003/systemd/generator.early /home/yuchen/.config/systemd/user /etc/xdg/systemd/user /etc/systemd/user /run/user/1003/systemd/user /run/systemd/user /run/user/1003/systemd/generator /home/yuchen/.local/share/systemd/user /usr/local/share/systemd/user /usr/share/systemd/user /usr/local/lib/systemd/user /usr/lib/systemd/user /run/user/1003/systemd/generator.late\n";
-    expect(userUnitDir(ubuntu, "/home/yuchen")).toBe("/home/yuchen/.config/systemd/user");
+      "/home/synthetic/.config/systemd/user.control /run/user/1000/systemd/user.control /run/user/1000/systemd/transient /run/user/1000/systemd/generator.early /home/synthetic/.config/systemd/user /etc/xdg/systemd/user /etc/systemd/user /run/user/1000/systemd/user /run/systemd/user /run/user/1000/systemd/generator /home/synthetic/.local/share/systemd/user /usr/local/share/systemd/user /usr/share/systemd/user /usr/local/lib/systemd/user /usr/lib/systemd/user /run/user/1000/systemd/generator.late\n";
+    expect(userUnitDir(ubuntu, "/home/synthetic")).toBe("/home/synthetic/.config/systemd/user");
     // A manager started with its own XDG_CONFIG_HOME: its directory, never .control or /run.
     expect(userUnitDir("/home/u/cfg/systemd/user.control /run/user/1/systemd/user /home/u/cfg/systemd/user /home/u/.local/share/systemd/user", "/home/u")).toBe("/home/u/cfg/systemd/user");
     expect(userUnitDir("/etc/systemd/user /usr/lib/systemd/user", "/home/u")).toBeNull();
@@ -260,6 +258,20 @@ describe("the service definition", () => {
       file: "/home/synthetic/.config/systemd/user/sharednet-serve.service",
     });
     expect(serviceLocation("win32", { HOME: "C:\\Users\\synthetic" }, "/ignored")).toBeNull();
+    // Another HOME is another root: hashed, so it never shares the account's plain name or file (both managers).
+    for (const platform of ["darwin", "linux"] as const) {
+      const account = serviceLocation(platform, { HOME: "/home/account" }, "/home/account")!;
+      const unset = serviceLocation(platform, {}, "/home/account")!;
+      const alternate = serviceLocation(platform, { HOME: "/tmp/alternate" }, "/home/account")!;
+      const alternateConfig = serviceLocation(platform, { HOME: "/home/account", XDG_CONFIG_HOME: "/tmp/alternate/.config" }, "/home/account")!;
+      expect(account.label).toMatch(/^(ai\.sharednet\.serve|sharednet-serve\.service)$/);
+      expect(unset).toEqual(account);
+      expect(alternate.label).not.toBe(account.label);
+      expect(alternate.file).not.toBe(account.file);
+      // The same resolved root, however it is spelled, gets the same name.
+      expect(alternateConfig.label).toBe(alternate.label);
+      expect(serviceLocation(platform, { HOME: "/home/account/" }, "/home/account")!.label).toBe(account.label);
+    }
   });
 });
 
@@ -397,9 +409,10 @@ describe("installing, inspecting and removing it", () => {
     // This shell points XDG_CONFIG_HOME elsewhere; the unit still goes where the manager reads units.
     const control = new ServiceControl({ HOME: "/home/synthetic", USER: "synthetic", PATH: bin, XDG_CONFIG_HOME: "/home/synthetic/.config" }, host, program);
     const report = await control.install();
-    expect(calls).toEqual([
-      unitPath,
-      unitPath,
+    // Everything before the load only asks (conflicts read the manager); then the load, then lingering.
+    const changing = calls.findIndex((call) => call === "systemctl --user daemon-reload");
+    expect(calls.slice(0, changing).every((call) => / (show|list-unit-files|list-units|show-environment)( |$)/.test(call))).toBe(true);
+    expect(calls.slice(changing)).toEqual([
       "systemctl --user daemon-reload",
       "systemctl --user enable sharednet-serve.service",
       "systemctl --user restart sharednet-serve.service",
@@ -432,214 +445,6 @@ describe("installing, inspecting and removing it", () => {
     expect(files.has("/home/synthetic/cfg/systemd/user/sharednet-serve.service")).toBe(true);
   });
 
-  it("refuses to install beside another definition that respawns serve, naming the command that stops it, and touches nothing", async () => {
-    const bin = await binWith("node");
-    const agents = "/Users/synthetic/Library/LaunchAgents";
-    // As found on a real machine: a hand-made supervisor that restarts serve whenever it is gone.
-    const supervisor = `<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>ai.sharednet.listener-supervisor</string><key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>/Users/synthetic/.local/share/sharednet/bin/supervise.py</string></array><key>KeepAlive</key><true/></dict></plist>`;
-    const { host, files, calls } = fakeHost("darwin", "/Users/synthetic");
-    files.set(`${agents}/ai.sharednet.listener-supervisor.plist`, supervisor);
-    files.set(`${agents}/com.example.backup.plist`, "<plist><dict><key>Label</key><string>com.example.backup</string></dict></plist>");
-    // This service for another storage root: its own slot, no conflict.
-    files.set(
-      `${agents}/ai.sharednet.serve.0a1b2c3d.plist`,
-      "<plist><dict><key>Label</key><string>ai.sharednet.serve.0a1b2c3d</string><key>ProgramArguments</key><array><string>sharednet serve --service</string></array><key>EnvironmentVariables</key><dict><key>XDG_CONFIG_HOME</key><string>/tmp/third</string></dict></dict></plist>",
-    );
-    const control = new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, host, program);
-    expect(await control.conflicts()).toEqual([
-      {
-        label: "ai.sharednet.listener-supervisor",
-        file: `${agents}/ai.sharednet.listener-supervisor.plist`,
-        blocking: true,
-        why: "launchd has it loaded",
-        stop: "launchctl bootout gui/501/ai.sharednet.listener-supervisor",
-      },
-    ]);
-    await expect(control.install()).rejects.toMatchObject({ code: "service_conflict", message: expect.stringContaining("launchctl bootout gui/501/ai.sharednet.listener-supervisor") });
-    // Only asked about, never touched: no bootout, bootstrap, disable or write.
-    expect(calls.every((call) => call.startsWith("launchctl print gui/501/"))).toBe(true);
-    expect(files.has(`${agents}/ai.sharednet.serve.plist`)).toBe(false);
-    expect(files.get(`${agents}/ai.sharednet.listener-supervisor.plist`)).toBe(supervisor);
-
-    // Installing for another storage root, the same supervisor (which runs with the default root) is no
-    // conflict, and the default root's service is not either; a supervisor for that root is.
-    const elsewhere = { HOME: "/Users/synthetic", PATH: bin, XDG_CONFIG_HOME: "/tmp/elsewhere" };
-    files.set(`${agents}/ai.sharednet.serve.plist`, "<plist><dict><key>Label</key><string>ai.sharednet.serve</string><key>ProgramArguments</key><array><string>npx</string><string>sharednet@latest</string><string>serve</string></array></dict></plist>");
-    expect(await new ServiceControl(elsewhere, host, program).conflicts()).toEqual([]);
-    files.set(
-      `${agents}/com.example.sharednet-elsewhere.plist`,
-      "<plist><dict><key>Label</key><string>com.example.sharednet-elsewhere</string><key>ProgramArguments</key><array><string>/usr/local/bin/sharednet</string><string>serve</string></array><key>EnvironmentVariables</key><dict><key>XDG_CONFIG_HOME</key><string>/tmp/elsewhere</string></dict></dict></plist>",
-    );
-    expect((await new ServiceControl(elsewhere, host, program).conflicts()).map((other) => other.label)).toEqual(["com.example.sharednet-elsewhere"]);
-    // ...and the default root still sees only its own supervisor, not the one for /tmp/elsewhere.
-    expect((await control.conflicts()).map((other) => other.label)).toEqual(["ai.sharednet.listener-supervisor"]);
-
-    const linux = fakeHost("linux", "/home/synthetic");
-    linux.files.set("/home/synthetic/.config/systemd/user/sharednet-listener.service", "[Service]\nExecStart=/usr/bin/npx -y sharednet@latest serve\n");
-    linux.files.set("/home/synthetic/.config/systemd/user/sharednet-other.service", '[Service]\nEnvironment="XDG_CONFIG_HOME=/srv/other" "PATH=/usr/bin"\nExecStart=/usr/bin/npx -y sharednet@latest serve\n');
-    expect((await new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, linux.host, program).conflicts()).map((other) => other.stop)).toEqual([
-      "systemctl --user disable --now sharednet-listener.service",
-    ]);
-    expect((await new ServiceControl({ HOME: "/home/synthetic", PATH: bin, XDG_CONFIG_HOME: "/srv/other" }, linux.host, program).conflicts()).map((other) => other.label)).toEqual([
-      "sharednet-other.service",
-    ]);
-  });
-
-  it("reads a unit's Environment= as systemd quotes it, and calls unresolved what it cannot read for certain", () => {
-    const home = "/home/synthetic";
-    const unit = (service: string) => `[Unit]\nDescription=x\n\n[Service]\nExecStart=/usr/bin/npx -y sharednet@latest serve\n${service}\n`;
-    const rootOf = (service: string | string[]) => definitionRoot("systemd", Array.isArray(service) ? service.map(unit) : unit(service), home);
-    // The review's reproduction: a single-quoted word, which systemd-analyze verify accepts.
-    expect(rootOf("Environment='XDG_CONFIG_HOME=/srv/other'")).toEqual({ root: "/srv/other/sharednet" });
-    expect(rootOf(`Environment="XDG_CONFIG_HOME=/srv/a b" 'HOME=/elsewhere'`)).toEqual({ root: "/srv/a b/sharednet" });
-    expect(rootOf("Environment=XDG_CONFIG_HOME=/srv/a\\sb\\x21")).toEqual({ root: "/srv/a b!/sharednet" });
-    expect(rootOf("Environment = PATH=/usr/bin \\\n    XDG_CONFIG_HOME=/srv/continued")).toEqual({ root: "/srv/continued/sharednet" });
-    expect(rootOf("Environment=XDG_CONFIG_HOME=%h/cfg%%x")).toEqual({ root: "/home/synthetic/cfg%x/sharednet" });
-    expect(rootOf("Environment=HOME=/home/other")).toEqual({ root: "/home/other/.config/sharednet" });
-    // An empty assignment resets the list; a drop-in's assignment comes after the unit's.
-    expect(rootOf("Environment=XDG_CONFIG_HOME=/srv/x\nEnvironment=")).toEqual({ root: "/home/synthetic/.config/sharednet" });
-    expect(rootOf(["Environment=XDG_CONFIG_HOME=/srv/x", "Environment='XDG_CONFIG_HOME=/srv/drop-in'"])).toEqual({ root: "/srv/drop-in/sharednet" });
-    // Only [Service] hands variables to the process.
-    expect(definitionRoot("systemd", "[Unit]\nEnvironment=XDG_CONFIG_HOME=/srv/x\n[Service]\nExecStart=/bin/true\n", home)).toEqual({ root: "/home/synthetic/.config/sharednet" });
-    expect(rootOf("")).toEqual({ root: "/home/synthetic/.config/sharednet" });
-    // What cannot be read for certain is unresolved, never quietly the standard root.
-    for (const service of [
-      "EnvironmentFile=/etc/sharednet.env",
-      "EnvironmentFile=-%h/.sharednet.env",
-      'Environment=XDG_CONFIG_HOME="/srv/x"',
-      "Environment='XDG_CONFIG_HOME=/srv/x",
-      "Environment=XDG_CONFIG_HOME=/srv/\\q",
-      "Environment=XDG_CONFIG_HOME=%E/x",
-      "Environment=XDG_CONFIG_HOME=relative",
-      "PassEnvironment=XDG_CONFIG_HOME",
-    ]) {
-      expect(rootOf(service), service).toEqual({ unresolved: expect.any(String) });
-    }
-    // An unparseable word that does not set either variable does not matter.
-    expect(rootOf("Environment=OTHER=\"x\"")).toEqual({ root: "/home/synthetic/.config/sharednet" });
-    expect(systemdWords(`a 'b c' "d\\"e" f\\sg`)).toEqual(["a", "b c", 'd"e', "f g"]);
-
-    const plist = (env: string) => `<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>x</string>${env}</dict></plist>`;
-    expect(definitionRoot("launchd", plist(""), "/Users/synthetic")).toEqual({ root: "/Users/synthetic/.config/sharednet" });
-    expect(definitionRoot("launchd", plist("<key>EnvironmentVariables</key><dict><key>XDG_CONFIG_HOME</key><string>&#47;srv&#x2F;e</string></dict>"), "/Users/synthetic")).toEqual({ root: "/srv/e/sharednet" });
-    expect(definitionRoot("launchd", "bplist00Ô\u0001\u0002Label_\u0010 sharednet serve", "/Users/synthetic")).toEqual({ unresolved: "it is a binary plist" });
-    expect(definitionRoot("launchd", plist("<key>EnvironmentVariables</key><dict><key>XDG_CONFIG_HOME</key><integer>1</integer></dict>"), "/Users/synthetic")).toEqual({ unresolved: expect.stringContaining("XDG_CONFIG_HOME") });
-  });
-
-  it("blocks only what its manager will run: loaded, or loaded at the next login, or enabled or active; warns about the rest", async () => {
-    const bin = await binWith("node");
-    const agents = "/Users/synthetic/Library/LaunchAgents";
-    const supervisor = (label: string, extra = "") =>
-      `<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>/Users/synthetic/.local/share/sharednet/bin/supervise.py</string></array>${extra}</dict></plist>`;
-    // Disabled and not loaded: it does not block; install goes ahead and says it was there.
-    const off = fakeHost("darwin", "/Users/synthetic", {
-      "launchctl print gui/501/ai.sharednet.listener-supervisor": { exitCode: 113, stderr: "Could not find service" },
-      "launchctl print-disabled gui/501": { exitCode: 0, stdout: 'disabled services = {\n\t"com.apple.x" => enabled\n\t"ai.sharednet.listener-supervisor" => disabled\n}\n' },
-    });
-    off.files.set(`${agents}/ai.sharednet.listener-supervisor.plist`, supervisor("ai.sharednet.listener-supervisor"));
-    const quiet = new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, off.host, program);
-    expect(await quiet.conflicts()).toEqual([expect.objectContaining({ blocking: false, why: "it is disabled and not loaded" })]);
-    const report = await quiet.install();
-    expect(report.installed).toBe(true);
-    expect(report.warnings).toEqual(expect.arrayContaining([expect.stringContaining("ai.sharednet.listener-supervisor")]));
-    expect(off.calls).toContain(`launchctl bootstrap gui/501 ${agents}/ai.sharednet.serve.plist`);
-
-    // Not loaded, but not disabled either: launchd loads it at the next login, so it blocks.
-    const later = fakeHost("darwin", "/Users/synthetic", { "launchctl print gui/501/ai.sharednet.listener-supervisor": { exitCode: 113 } });
-    later.files.set(`${agents}/ai.sharednet.listener-supervisor.plist`, supervisor("ai.sharednet.listener-supervisor"));
-    expect(await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, later.host, program).conflicts()).toEqual([
-      expect.objectContaining({ blocking: true, why: expect.stringContaining("next login"), stop: "launchctl disable gui/501/ai.sharednet.listener-supervisor" }),
-    ]);
-    // A Disabled key in the plist itself counts as disabled too.
-    const keyed = fakeHost("darwin", "/Users/synthetic", { "launchctl print gui/501/ai.sharednet.listener-supervisor": { exitCode: 113 } });
-    keyed.files.set(`${agents}/ai.sharednet.listener-supervisor.plist`, supervisor("ai.sharednet.listener-supervisor", "<key>Disabled</key><true/>"));
-    expect((await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, keyed.host, program).conflicts())[0]?.blocking).toBe(false);
-    // Loaded and running, as on the real machine: it blocks, naming its pid.
-    const running = fakeHost("darwin", "/Users/synthetic", { "launchctl print gui/501/ai.sharednet.listener-supervisor": { exitCode: 0, stdout: "\tstate = running\n\tpid = 80225\n" } });
-    running.files.set(`${agents}/ai.sharednet.listener-supervisor.plist`, supervisor("ai.sharednet.listener-supervisor"));
-    expect(await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, running.host, program).conflicts()).toEqual([
-      expect.objectContaining({ blocking: true, why: "launchd has it loaded and running (pid 80225)" }),
-    ]);
-    // A binary plist that mentions serve: its root cannot be read, so it is scoped conservatively, even disabled.
-    const binary = fakeHost("darwin", "/Users/synthetic", {
-      "launchctl print gui/501/com.example.sharednet-bin": { exitCode: 113 },
-      "launchctl print-disabled": { exitCode: 0, stdout: '\t"com.example.sharednet-bin" => disabled\n' },
-    });
-    binary.files.set(`${agents}/com.example.sharednet-bin.plist`, "bplist00 sharednet serve --service");
-    const unresolved = await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, binary.host, program).conflicts();
-    expect(unresolved).toEqual([expect.objectContaining({ blocking: true, why: expect.stringContaining("storage root could not be read (it is a binary plist)") })]);
-    await expect(new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, binary.host, program).install()).rejects.toMatchObject({
-      code: "service_conflict",
-      message: expect.stringContaining("binary plist"),
-    });
-
-    // systemd: disabled and inactive does not block; enabled, active, or a state it would not report does.
-    const units = "/home/synthetic/.config/systemd/user";
-    const linux = (answers: Record<string, { exitCode: number; stdout?: string }>) => {
-      const fake = fakeHost("linux", "/home/synthetic", answers);
-      fake.files.set(`${units}/sharednet-listener.service`, "[Service]\nExecStart=/usr/bin/npx -y sharednet@latest serve\n");
-      return fake;
-    };
-    const disabled = linux({
-      "systemctl --user is-enabled sharednet-listener.service": { exitCode: 1, stdout: "disabled\n" },
-      "systemctl --user is-active sharednet-listener.service": { exitCode: 3, stdout: "inactive\n" },
-    });
-    const linuxReport = await new ServiceControl({ HOME: "/home/synthetic", USER: "synthetic", PATH: bin }, disabled.host, program).install();
-    expect(linuxReport.warnings).toEqual(expect.arrayContaining([expect.stringContaining("sharednet-listener.service is disabled and inactive")]));
-    for (const [enabled, active] of [["enabled", "inactive"], ["disabled", "active"], ["", ""]]) {
-      const fake = linux({
-        "systemctl --user is-enabled sharednet-listener.service": { exitCode: 0, stdout: `${enabled}\n` },
-        "systemctl --user is-active sharednet-listener.service": { exitCode: 0, stdout: `${active}\n` },
-      });
-      expect((await new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, fake.host, program).conflicts())[0]?.blocking, `${enabled}/${active}`).toBe(true);
-    }
-  });
-
-  it("scopes a timer by the service it starts: that service's environment, and the timer's own state", async () => {
-    const bin = await binWith("node");
-    const units = "/home/synthetic/.config/systemd/user";
-    const answers = {
-      "systemctl --user is-enabled sharednet-poke.service": { exitCode: 0, stdout: "static\n" },
-      "systemctl --user is-active sharednet-poke.service": { exitCode: 3, stdout: "inactive\n" },
-      "systemctl --user is-enabled sharednet-poll.timer": { exitCode: 0, stdout: "enabled\n" },
-      "systemctl --user is-active sharednet-poll.timer": { exitCode: 0, stdout: "active\n" },
-    };
-    // The timer names its service with Unit=; a variable written in the timer is not the service's.
-    const timer = "[Timer]\nOnCalendar=*:0/5\nUnit=sharednet-poke.service\n[Service]\nEnvironment=XDG_CONFIG_HOME=/srv/not-this\n";
-    const fake = fakeHost("linux", "/home/synthetic", answers);
-    fake.files.set(`${units}/sharednet-poll.timer`, timer);
-    fake.files.set(`${units}/sharednet-poke.service`, "[Service]\nType=oneshot\nExecStart=/usr/bin/npx -y sharednet@latest serve --rooms all\n");
-    const found = await new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, fake.host, program).conflicts();
-    expect(found).toEqual([
-      expect.objectContaining({
-        label: "sharednet-poke.service",
-        blocking: true,
-        why: expect.stringContaining("sharednet-poll.timer is enabled and active"),
-        stop: "systemctl --user disable --now sharednet-poll.timer sharednet-poke.service",
-      }),
-    ]);
-    // The service sets another root (in a drop-in): neither it nor its timer conflicts here, but they do there.
-    fake.files.set(`${units}/sharednet-poke.service.d/root.conf`, "[Service]\nEnvironment='XDG_CONFIG_HOME=/srv/other'\n");
-    expect(await new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, fake.host, program).conflicts()).toEqual([]);
-    expect((await new ServiceControl({ HOME: "/home/synthetic", PATH: bin, XDG_CONFIG_HOME: "/srv/other" }, fake.host, program).conflicts()).map((other) => other.label)).toEqual(["sharednet-poke.service"]);
-    // A same-name timer with no Unit= starts the service of its own name.
-    const sameName = fakeHost("linux", "/home/synthetic", {
-      "systemctl --user is-enabled sharednet-listener.service": { exitCode: 1, stdout: "disabled\n" },
-      "systemctl --user is-active sharednet-listener.service": { exitCode: 3, stdout: "inactive\n" },
-      "systemctl --user is-enabled sharednet-listener.timer": { exitCode: 0, stdout: "enabled\n" },
-      "systemctl --user is-active sharednet-listener.timer": { exitCode: 0, stdout: "active\n" },
-    });
-    sameName.files.set(`${units}/sharednet-listener.timer`, "[Timer]\nOnBootSec=1min\n");
-    sameName.files.set(`${units}/sharednet-listener.service`, "[Service]\nExecStart=/usr/bin/sharednet serve\n");
-    expect((await new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, sameName.host, program).conflicts())[0]).toMatchObject({ blocking: true, stop: "systemctl --user disable --now sharednet-listener.timer sharednet-listener.service" });
-    // A timer whose service is not in this directory: what it starts cannot be read, so it blocks, saying so.
-    const orphan = fakeHost("linux", "/home/synthetic");
-    orphan.files.set(`${units}/sharednet-wake.timer`, "[Timer]\nUnit=sharednet-wake.service\n");
-    expect(await new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, orphan.host, program).conflicts()).toEqual([
-      expect.objectContaining({ label: "sharednet-wake.timer", blocking: true, why: expect.stringContaining("not in") }),
-    ]);
-  });
-
   it("refuses Windows, and other systems, clearly", async () => {
     const { host } = fakeHost("win32", "C:\\Users\\synthetic");
     const control = new ServiceControl({ HOME: "C:\\Users\\synthetic", PATH: "" }, host, program);
@@ -647,6 +452,15 @@ describe("installing, inspecting and removing it", () => {
     expect(await control.state()).toBeNull();
     const bsd = fakeHost("freebsd", "/home/synthetic");
     await expect(new ServiceControl({ HOME: "/home/synthetic" }, bsd.host, program).uninstall()).rejects.toMatchObject({ code: "service_unsupported" });
+  });
+
+  it("refuses a relative HOME or XDG_CONFIG_HOME: its root depends on a working directory nobody can know", async () => {
+    const bin = await binWith("node");
+    for (const env of [{ HOME: "relative/home", PATH: bin }, { HOME: "/Users/synthetic", XDG_CONFIG_HOME: "cfg", PATH: bin }]) {
+      const { host, files } = fakeHost("darwin", "/Users/synthetic");
+      await expect(new ServiceControl(env, host, program).install()).rejects.toMatchObject({ code: "service_not_installed", message: expect.stringContaining("relative") });
+      expect(files.size).toBe(0);
+    }
   });
 
   it("refuses without HOME or PATH to run in", async () => {

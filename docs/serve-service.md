@@ -43,7 +43,7 @@ HTTPS_PROXY=http://127.0.0.1:10080 HTTP_PROXY=http://127.0.0.1:10080 npx -y shar
 | Log | serve's own log, `$XDG_STATE_HOME/sharednet/serve.log` (default `~/.local/state/sharednet/serve.log`), appended | the same, via `StandardOutput=append:` |
 | Files it creates | owner-only (`Umask` 077) | owner-only (`UMask=0077`) |
 
-The service is named for the CLI's storage root. With the standard root it is `ai.sharednet.serve`. A CLI pointed elsewhere by `XDG_CONFIG_HOME` gets `ai.sharednet.serve.<8 hex>` instead. The root's `serve.json` is the lock, so each root is its own machine-wide slot.
+The service is named for the storage root it serves, resolved the way the CLI resolves it from `HOME` and `XDG_CONFIG_HOME`. Only the account home's standard root, `~/.config/sharednet`, gets the plain name `ai.sharednet.serve` / `sharednet-serve.service`. Every other resolved root, whether reached through another `XDG_CONFIG_HOME` or another `HOME`, gets `ai.sharednet.serve.<8 hex>` / `sharednet-serve-<8 hex>.service`. So two roots never share a name or a file, and one root spelled two ways gets the same name. A relative `HOME` or `XDG_CONFIG_HOME` is refused, because its root would depend on a working directory. The root's `serve.json` is the lock, so each root is its own slot.
 
 Windows, and any system other than macOS or Linux, gets a clear refusal (`service_unsupported`).
 
@@ -96,25 +96,29 @@ Everything written is printed with its value. Since nothing secret can pass thes
 There is still one connector slot per storage root, `serve.json`. The changes keep it that way:
 
 - **A `serve` the service did not start holds the slot.** `--install` refuses (`serve_running`, naming the pid) rather than race it. Stop it first with `sharednet serve --stop`, or install with `--handoff`. With `--handoff` the service does not fail and get restarted over and over: it logs that it is waiting, checks every 10 s, and takes the slot when the other one stops.
-- **Another supervisor respawns serve.** A hand-made LaunchAgent or user unit that keeps a serve alive for the same storage root would start it again beside the service, over and over. So `--install` refuses (`service_conflict`) even with `--handoff`. For each such definition it names the command that stops it and why it blocks, and asks for its file to be moved out of the way. Detection only reads; the CLI never stops or edits these definitions. One found on a real machine: `ai.sharednet.listener-supervisor`, running `~/.local/share/sharednet/bin/supervise.py`.
-  - **Which definitions are considered:** every definition in `~/Library/LaunchAgents` or the user unit directory that mentions SharedNet together with serve, a supervisor, a listener or wake, other than this service itself.
-  - **Same storage root only.** Each root has its own slot and its own service name, so a definition for another root is no conflict. A definition's root comes from the `HOME` and `XDG_CONFIG_HOME` its manager hands it. One that sets neither runs with the account's standard root, `~/.config/sharednet`.
-    - **launchd:** the root is read from the XML plist's `EnvironmentVariables`, with entities decoded.
-    - **systemd:** it is read from `Environment=` in `[Service]` and in the unit's drop-ins (`<unit>.d/*.conf`), split the way systemd.syntax(7) quotes words: double or single quotes around a whole word, C escapes, line continuations, and an empty `Environment=` resetting the list. The specifiers `%%` and `%h` are expanded.
-  - **What cannot be read for certain is unresolved, and an unresolved definition blocks.** That covers:
-    - a binary plist;
+- **Another supervisor respawns serve.** A hand-made LaunchAgent or user unit that keeps a serve alive for the same storage root would start it again beside the service, over and over. So `--install` refuses (`service_conflict`) even with `--handoff`. For each such definition it names the command that stops it and why it blocks, and asks for the definition to be moved out of the way. Detection only reads; the CLI never stops or edits these definitions. One found on a real machine: `ai.sharednet.listener-supervisor`, running `~/.local/share/sharednet/bin/supervise.py`. Implemented in `serve-conflicts.ts`.
+  - **The manager is asked, not the files.** A definition's effective configuration is what its service manager makes of it: continuation lines across comments, drop-ins, precedence across the whole search path, the manager's own environment, launchd's override database. Four review rounds of reading unit files by hand each found another corner, so the CLI asks the manager instead:
+    - **systemd, candidates:** `systemctl --user list-unit-files` and `list-units --all` (services, timers, paths and sockets) list candidates across the full search path.
+    - **systemd, each candidate:** one batched `systemctl --user show` reports each candidate's effective `Environment=`, `EnvironmentFiles=`, `UnsetEnvironment=`, `ExecStart=`, `Triggers=`, `FragmentPath=`, `DropInPaths=`, `UnitFileState=` and `ActiveState=`.
+    - **systemd, inherited environment:** `systemctl --user show-environment` gives the environment the manager hands every unit.
+    - **launchd, loaded jobs:** for a job in `~/Library/LaunchAgents` or `/Library/LaunchAgents`, `launchctl print gui/<uid>/<label>` gives its effective environment (default, inherited and own blocks) and its state.
+    - **launchd, jobs not loaded:** the plist is read only for a job that is not loaded, converted by `plutil` when it is binary, and `launchctl print-disabled` gives the override.
+  - **Which definitions count:** one whose reported command, environment, description or source files mention SharedNet together with serve, a supervisor, a listener or wake, other than this service itself. A masked unit cannot run and does not count.
+  - **Same storage root only.** A definition's root is resolved from the `HOME` and `XDG_CONFIG_HOME` it is started with: the manager's environment, then the definition's own. Neither set means the account's standard root.
+  - **What cannot be read for certain is unresolved, and an unresolved definition blocks.** It is treated as this root, and the refusal says why it could not be scoped. That covers:
     - `EnvironmentFile=`;
-    - `PassEnvironment=` or `UnsetEnvironment=` naming either variable;
-    - a quote inside a word, an unclosed quote, or an unknown escape;
-    - another specifier;
-    - a relative `XDG_CONFIG_HOME`.
+    - `UnsetEnvironment=` of either variable;
+    - a manager environment that cannot be read;
+    - a relative `HOME` or `XDG_CONFIG_HOME`;
+    - a binary plist that `plutil` cannot convert;
+    - unreadable `EnvironmentVariables`.
 
-    The refusal says it could not be scoped and why. "Conservative" means it is treated as this root rather than quietly as the standard one.
-  - **Timers.** A `.timer` holds no environment of its own. It starts its `Unit=` (by default the `.service` of the same name), so the root comes from that service and the stop command names both units. A timer whose service is not in the directory blocks, and says that what it starts could not be read.
-  - **Only what will run.** Whether a definition blocks depends on its manager's state:
-    - **launchd:** it blocks if `launchctl print gui/<uid>/<label>` shows it loaded (the stop command is `bootout`), or if it is not loaded but also not disabled, because launchd loads it at the next login (the stop command is `launchctl disable`). Disabled means listed by `launchctl print-disabled` or carrying `Disabled` = true.
-    - **systemd:** it blocks if `systemctl --user is-enabled` or `is-active` reports it, or a timer that starts it, as enabled or active, or if either command gives a state it does not know.
-    - A disabled definition that is not running does not block. The install goes ahead and its report warns that enabling the definition again would race the service.
+    When `systemctl --user` cannot be asked at all, every unit file that mentions SharedNet in the manager's home directories is reported as unresolved and blocking.
+  - **Timers, paths and sockets** are scoped by what they start. The manager's `Triggers=` (drop-ins applied) maps each one to its service. The service's environment gives the root, the activator's enablement counts as the service's, and the stop command names both.
+  - **Only what will run blocks.**
+    - **launchd:** a loaded job blocks (stop command `bootout`). A job that is not loaded blocks if launchd will load it at the next login (stop command `launchctl disable`). An explicit `print-disabled` override (enabled or disabled) wins; with no override, the plist's `Disabled` key decides.
+    - **systemd:** a unit blocks if it, or anything that triggers it, is enabled or active, or reports a state the CLI does not know.
+    - A definition that will not run (disabled, static or masked, and inactive) only adds a warning to the install report.
 - **No seats yet.** A plain `serve` ends with `not_in_a_room`. The service holds the slot and checks every 5 s for a seat joined from a Codex or Claude Code session.
 - **Every seat stopped** (credentials revoked, say). A plain `serve` ends. The service keeps running, instead of being restarted every 30 s by its manager into the same stopped seats.
 - **A stopped seat comes back without a restart.** Each seat's loop is begun with a fingerprint of its seat file (base URL, token, join time, Room type, wake) and, for an account seat, its session's token. A seat whose loop ended (refused for good, wake off, its Room gone) is left alone while that fingerprint is unchanged, so a refusal is not retried every 5 s. The next look (every 5 s) sits in it again once the fingerprint changes: after a rejoin, a new account token, or `wake set`. This also applies to a plain `serve` that still has other live seats. Before this change, such a seat stayed stopped until serve restarted. That was already true on the base whenever another seat kept serve running, and the service would have made it permanent.
