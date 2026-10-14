@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runCli } from "./cli.ts";
 import type { CommandRunner } from "./guest.ts";
+import { processAlive, systemProcessProbe, type ProcessProbe } from "./process-identity.ts";
 import type { CheckOptions, CheckResult, CheckStep, SeatWake, TurnRunner, TurnSpec } from "./wake-driver.ts";
 
 const cleanup: string[] = [];
@@ -102,6 +103,10 @@ async function run(
     checkWake?: (wake: SeatWake, options: CheckOptions) => Promise<CheckResult>;
     signal?: AbortSignal;
     startWakeService?: (input: { env: Record<string, string | undefined>; logFile: string }) => number | null;
+    processProbe?: ProcessProbe;
+    signal?: AbortSignal;
+    rescanMs?: number;
+    listSeats?: <T>(read: () => Promise<T>) => Promise<T>;
   } = {},
 ) {
   const { mkdir } = await import("node:fs/promises");
@@ -164,7 +169,15 @@ async function run(
     },
     // The wake programs are stand-ins here; a test that is about the check passes its own.
     checkWake: async () => ({ ok: true, message: "stand-in" }),
-    ...dependencyOverrides,
+    // Lock holders: whether a pid is alive is real; start identities are stand-ins, and only this
+    // process and its parent (the test runner standing in for a listener) read as a sharednet serve.
+    processProbe: {
+      supported: true,
+      alive: (pid) => processAlive(pid),
+      identity: (pid) => `test-start-${pid}`,
+      argv: (pid) => (pid === process.pid || pid === process.ppid ? "node /opt/sharednet/bin/sharednet.js serve" : null),
+    },
+    ...(dependencyOverrides as Parameters<typeof runCli>[1]),
   });
   return { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), requests, acks, service };
 }
@@ -2711,6 +2724,379 @@ describe("sharednet say and wait", () => {
       const after = await run(["serve", "--status", "--json"], space, []);
       expect(JSON.parse(after.stdout)).toMatchObject({ running: false });
     });
+
+    describe("the serve lock knows its holder", () => {
+      const statusFile = (space: Awaited<ReturnType<typeof workspace>>) => join(space.env.XDG_CONFIG_HOME!, "sharednet", "serve.json");
+      const hold = async (space: Awaited<ReturnType<typeof workspace>>, status: Record<string, unknown>) => {
+        const { mkdir, writeFile } = await import("node:fs/promises");
+        await mkdir(join(space.env.XDG_CONFIG_HOME!, "sharednet"), { recursive: true, mode: 0o700 });
+        await writeFile(statusFile(space), JSON.stringify({ started_at: "2026-10-05T00:00:00.000Z", rooms: [ROOM_ID], drives: true, wake_protocol: "wake-plugins-v1", ...status }));
+      };
+      /** A probe whose start identities and argv are scripted; whether a pid is alive is real (or scripted). */
+      const probe = (identities: Record<number, string>, argv: Record<number, string> = {}, alive?: (pid: number) => boolean): ProcessProbe => ({
+        supported: true,
+        alive: alive ?? ((pid) => processAlive(pid)),
+        identity: (pid) => identities[pid] ?? null,
+        argv: (pid) => argv[pid] ?? null,
+      });
+
+      it("records this process's start identity and lock id, and refuses a second serve while a live holder's identity matches", async () => {
+        const space = await joinedSpace();
+        await hold(space, { pid: process.ppid, start_identity: "Tue Oct 14 09:00:00 2026" });
+        const second = await run(["serve", "--json"], space, [], {}, { processProbe: probe({ [process.ppid]: "Tue Oct 14 09:00:00 2026" }) });
+        expect(second.exitCode).not.toBe(0);
+        expect(JSON.parse(second.stderr).error).toMatchObject({ code: "serve_running", message: expect.stringContaining(`pid ${process.ppid})`) });
+        expect(second.requests).toHaveLength(0);
+        // The holder records its own identity, read from the same probe.
+        await hold(space, { pid: 2 ** 22 + 17, start_identity: "gone" });
+        let recorded: Record<string, unknown> | null = null;
+        const served = await run(["serve", "--json"], space, [{ ...revoked(), entered: () => void readFile(statusFile(space), "utf8").then((raw) => (recorded = JSON.parse(raw))) }], {}, {
+          service: { delivered_through: 1, acked_through: 1 },
+          processProbe: probe({ [process.pid]: "Tue Oct 14 10:00:00 2026" }),
+        });
+        expect(served.exitCode).toBe(0);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(recorded).toMatchObject({ pid: process.pid, start_identity: "Tue Oct 14 10:00:00 2026", lock_id: expect.any(String) });
+      });
+
+      it("takes over a dead pid, and a reused pid whose start identity differs", async () => {
+        for (const status of [{ pid: 2 ** 22 + 17, start_identity: "x" }, { pid: process.ppid, start_identity: "the listener's start" }]) {
+          const space = await joinedSpace();
+          await hold(space, status);
+          const checked = JSON.parse((await run(["serve", "--status", "--json"], space, [], {}, { processProbe: probe({ [process.ppid]: "someone else's start" }) })).stdout);
+          expect(checked).toMatchObject({ running: false, reason: expect.stringMatching(/gone/) });
+          const served = await run(["serve", "--json"], space, [revoked()], {}, { service: { delivered_through: 1, acked_through: 1 }, processProbe: probe({ [process.ppid]: "someone else's start" }) });
+          expect(served.exitCode).toBe(0);
+        }
+      });
+
+      it("counts EPERM from the probe as alive", async () => {
+        const space = await joinedSpace();
+        // pid 1 cannot be signalled by this test (EPERM), and is alive; its identity matches the record.
+        await hold(space, { pid: 1, start_identity: "boot" });
+        const refused = await run(["serve", "--json"], space, [], {}, { processProbe: probe({ 1: "boot" }) });
+        expect(JSON.parse(refused.stderr).error.code).toBe("serve_running");
+        // The same through a probe whose signal 0 fails with EPERM.
+        await hold(space, { pid: 4242, start_identity: "other user's listener" });
+        const eperm = probe({ 4242: "other user's listener" }, {}, (pid) => processAlive(pid, () => {
+          throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+        }));
+        expect(JSON.parse((await run(["serve", "--status", "--json"], space, [], {}, { processProbe: eperm })).stdout)).toMatchObject({ running: true, pid: 4242 });
+      });
+
+      it("accepts a status file from before start identities only when the live pid's argv is a sharednet serve", async () => {
+        const space = await joinedSpace();
+        await hold(space, { pid: process.ppid });
+        const old = probe({}, { [process.ppid]: "/opt/homebrew/bin/node /Users/a/.npm/_npx/ae67/node_modules/.bin/sharednet serve" });
+        const refused = await run(["serve", "--json"], space, [], {}, { processProbe: old });
+        expect(JSON.parse(refused.stderr).error.code).toBe("serve_running");
+        expect(JSON.parse((await run(["serve", "--status", "--json"], space, [], {}, { processProbe: old })).stdout)).toMatchObject({ running: true, holder_check: "argv" });
+        const notServe = probe({}, { [process.ppid]: "node /work/node_modules/vitest/vitest.mjs" });
+        expect(JSON.parse((await run(["serve", "--status", "--json"], space, [], {}, { processProbe: notServe })).stdout)).toMatchObject({ running: false, reason: expect.stringContaining("not a sharednet serve") });
+        expect((await run(["serve", "--json"], space, [revoked()], {}, { service: { delivered_through: 1, acked_through: 1 }, processProbe: notServe })).exitCode).toBe(0);
+      });
+
+      it("never signals a pid that is not verifiably the listener: --stop refuses, and the process lives on", async () => {
+        const { spawn } = await import("node:child_process");
+        // A process this test started, standing in for whatever now owns a stale pid.
+        const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+        try {
+          const space = await workspace();
+          for (const [status, stand] of [
+            [{ pid: child.pid!, start_identity: "the listener that crashed" }, probe({ [child.pid!]: "an unrelated process" })],
+            [{ pid: child.pid! }, probe({}, { [child.pid!]: `${process.execPath} -e setTimeout(() => {}, 60000)` })],
+          ] as const) {
+            await hold(space, status);
+            const stopped = await run(["serve", "--stop", "--json"], space, [], {}, { processProbe: stand });
+            expect(JSON.parse(stopped.stdout)).toMatchObject({ stopped: false, pid: child.pid });
+            expect(stopped.stderr).not.toContain("asked pid");
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            expect(child.exitCode).toBeNull();
+            expect(child.signalCode).toBeNull();
+          }
+          // Verified, it is stopped.
+          await hold(space, { pid: child.pid!, start_identity: "this one" });
+          const stopped = await run(["serve", "--stop", "--json"], space, [], {}, { processProbe: probe({ [child.pid!]: "this one" }) });
+          expect(JSON.parse(stopped.stdout)).toMatchObject({ stopped: true, pid: child.pid });
+          await new Promise<void>((resolve) => (child.exitCode !== null || child.signalCode !== null ? resolve() : child.once("exit", () => resolve())));
+          expect(child.signalCode).toBe("SIGTERM");
+        } finally {
+          child.kill("SIGKILL");
+        }
+      });
+
+      it("keeps a live holder whose start identity cannot be read occupied, and never signals it", async () => {
+        const { spawn } = await import("node:child_process");
+        const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+        try {
+          const space = await joinedSpace();
+          await hold(space, { pid: child.pid!, start_identity: "recorded", lock_id: "held" });
+          // Alive, but its identity cannot be read now (a protected /proc, ps failing).
+          const unreadable = probe({});
+          expect(JSON.parse((await run(["serve", "--status", "--json"], space, [], {}, { processProbe: unreadable })).stdout)).toMatchObject({ running: true, holder_check: "unverified" });
+          const refused = await run(["serve", "--json"], space, [], {}, { processProbe: unreadable });
+          expect(JSON.parse(refused.stderr).error.code).toBe("serve_running");
+          const stopped = await run(["serve", "--stop", "--json"], space, [], {}, { processProbe: unreadable });
+          expect(JSON.parse(stopped.stdout)).toMatchObject({ stopped: false, pid: child.pid });
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(child.exitCode).toBeNull();
+          expect(child.signalCode).toBeNull();
+        } finally {
+          child.kill("SIGKILL");
+        }
+      });
+
+      it("lets an old status file's argv only block a start, never authorise a signal", async () => {
+        const { spawn } = await import("node:child_process");
+        // An unrelated process this test starts, whose argv happens to read like a sharednet serve.
+        const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)", "sharednet", "serve"], { stdio: "ignore" });
+        try {
+          const space = await joinedSpace();
+          await hold(space, { pid: child.pid! });
+          await vi.waitFor(() => expect(systemProcessProbe.argv(child.pid!)).toContain("sharednet serve"));
+          // The real probe: it blocks a start ...
+          const refused = await run(["serve", "--json"], space, [], {}, { processProbe: systemProcessProbe });
+          expect(JSON.parse(refused.stderr).error.code).toBe("serve_running");
+          // ... but --stop does not signal it.
+          const stopped = await run(["serve", "--stop", "--json"], space, [], {}, { processProbe: systemProcessProbe });
+          expect(JSON.parse(stopped.stdout)).toMatchObject({ stopped: false, pid: child.pid, reason: expect.stringContaining("predates") });
+          expect(stopped.stderr).not.toContain("asked pid");
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(child.exitCode).toBeNull();
+          expect(child.signalCode).toBeNull();
+        } finally {
+          child.kill("SIGKILL");
+        }
+      });
+
+      it("lets only one of two connectors in the same process hold the lock", async () => {
+        const space = await joinedSpace();
+        await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+        let release!: () => void;
+        const wait = new Promise<void>((resolve) => { release = resolve; });
+        const first = run(["serve", "--json"], space, [{ ...revoked(), wait }], {}, { service: { delivered_through: 1, acked_through: 1 } });
+        try {
+          await vi.waitFor(async () => expect(JSON.parse(await readFile(statusFile(space), "utf8"))).toMatchObject({ pid: process.pid, lock_id: expect.any(String) }));
+          const held = JSON.parse(await readFile(statusFile(space), "utf8")).lock_id;
+          // A second connector in this same process: same pid, another lock. It is refused, and the lock stays the first's.
+          const second = await run(["serve", "--json"], space, []);
+          expect(JSON.parse(second.stderr).error).toMatchObject({ code: "serve_running", message: expect.stringContaining(`pid ${process.pid})`) });
+          expect(JSON.parse(await readFile(statusFile(space), "utf8")).lock_id).toBe(held);
+        } finally {
+          release();
+        }
+        expect((await first).exitCode).toBe(0);
+      });
+
+      it("never lets a starter that read a stale lock act on it after another starter replaced it", async () => {
+        const space = await joinedSpace();
+        await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+        await hold(space, { pid: 2 ** 22 + 17, start_identity: "a listener that crashed", lock_id: "stale-lock" });
+        // B reads the stale lock and stops right there.
+        let resumeB!: () => void;
+        const gateB = new Promise<void>((resolve) => (resumeB = resolve));
+        let pausedB!: () => void;
+        const bPaused = new Promise<void>((resolve) => (pausedB = resolve));
+        let releaseB!: () => void;
+        const pollB = new Promise<void>((resolve) => (releaseB = resolve));
+        const starterB = run(["serve", "--json"], space, [{ ...revoked(), wait: pollB }], {}, {
+          service: { delivered_through: 1, acked_through: 1 },
+          lockPause: () => (pausedB(), gateB),
+        });
+        await bPaused;
+        // A reclaims the same stale lock in full, and holds it.
+        let releaseA!: () => void;
+        const pollA = new Promise<void>((resolve) => (releaseA = resolve));
+        const starterA = run(["serve", "--json"], space, [{ ...revoked(), wait: pollA }], {}, { service: { delivered_through: 1, acked_through: 1 } });
+        await vi.waitFor(async () => expect(JSON.parse(await readFile(statusFile(space), "utf8")).lock_id).not.toBe("stale-lock"));
+        const lockA = JSON.parse(await readFile(statusFile(space), "utf8")).lock_id;
+        // B now acts on what it read: it must find the lock changed, and be refused.
+        resumeB();
+        let bEnded = false;
+        void starterB.then(() => (bEnded = true));
+        await vi.waitFor(() => expect(bEnded).toBe(true), { timeout: 3_000 });
+        releaseB();
+        const b = await starterB;
+        expect(JSON.parse(b.stderr).error.code).toBe("serve_running");
+        expect(JSON.parse(await readFile(statusFile(space), "utf8")).lock_id).toBe(lockA);
+        releaseA();
+        expect((await starterA).exitCode).toBe(0);
+      });
+
+      it("lets exactly one of many real serve processes reclaim a stale lock at once", async () => {
+        const { spawn } = await import("node:child_process");
+        const { mkdir, writeFile } = await import("node:fs/promises");
+        const entry = join(import.meta.dirname, "main.ts");
+        const doubles: number[] = [];
+        for (let round = 0; round < 6; round += 1) {
+          const space = await workspace();
+          // A seat whose service is a closed local port: a holder sits in it and retries, offline.
+          const dir = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID);
+          await mkdir(dir, { recursive: true, mode: 0o700 });
+          await writeFile(join(dir, `${MEMBER_ID}.json`), JSON.stringify({ schema_version: 1, base_url: "http://127.0.0.1:9", room_id: ROOM_ID, member_id: MEMBER_ID, name: "racer", member_token: MEMBER_TOKEN, joined_at: "2026-09-06T00:00:00.000Z" }), { mode: 0o600 });
+          await hold(space, { pid: 2 ** 22 + 17, start_identity: "a listener that crashed", lock_id: "stale-lock" });
+          // Only processes this test starts, and only they are signalled.
+          const children = Array.from({ length: 8 }, () => {
+            const child = spawn(process.execPath, [entry, "serve", "--run", "cat"], { env: { PATH: process.env.PATH ?? "", ...space.env }, cwd: space.root, stdio: ["ignore", "ignore", "pipe"] });
+            const said = { text: "" };
+            child.stderr.on("data", (chunk: Buffer) => (said.text += chunk.toString()));
+            return { child, said };
+          });
+          try {
+            await vi.waitFor(() => {
+              for (const { said } of children) expect(said.text).toMatch(/sitting in|serve_running/);
+            }, { timeout: 20_000, interval: 50 });
+            const holders = children.filter(({ said }) => said.text.includes("sitting in")).length;
+            if (holders !== 1) doubles.push(holders);
+            expect(JSON.parse(await readFile(statusFile(space), "utf8")).pid).toBeOneOf(children.map(({ child }) => child.pid));
+          } finally {
+            await Promise.all(children.map(({ child }) => new Promise<void>((resolve) => {
+              if (child.exitCode !== null || child.signalCode !== null) return resolve();
+              child.once("exit", () => resolve());
+              child.kill("SIGTERM");
+            })));
+          }
+        }
+        expect(doubles).toEqual([]);
+      }, 180_000);
+
+      it("a second, real serve process on the same root exits non-zero naming the holder while the first holds it", async () => {
+        const space = await joinedSpace();
+        await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+        let release!: () => void;
+        const wait = new Promise<void>((resolve) => { release = resolve; });
+        // The first holds the lock in this process, with this process's real start identity.
+        const first = run(["serve", "--json"], space, [{ ...revoked(), wait }], {}, { service: { delivered_through: 1, acked_through: 1 }, processProbe: systemProcessProbe });
+        try {
+          await vi.waitFor(async () => expect(JSON.parse(await readFile(statusFile(space), "utf8"))).toMatchObject({ pid: process.pid, start_identity: expect.any(String) }));
+          const { spawn } = await import("node:child_process");
+          const entry = join(import.meta.dirname, "main.ts");
+          const second = spawn(process.execPath, [entry, "serve", "--json"], { env: { PATH: process.env.PATH ?? "", ...space.env }, cwd: space.project, stdio: ["ignore", "pipe", "pipe"] });
+          let stderr = "";
+          second.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+          const code = await new Promise<number | null>((resolve) => second.once("exit", (exit) => resolve(exit)));
+          expect(code).not.toBe(0);
+          expect(JSON.parse(stderr).error).toMatchObject({ code: "serve_running", message: expect.stringContaining(`pid ${process.pid})`) });
+          // The first still holds it.
+          expect(JSON.parse(await readFile(statusFile(space), "utf8")).pid).toBe(process.pid);
+        } finally {
+          release();
+        }
+        expect((await first).exitCode).toBe(0);
+      }, 30_000);
+      it("never lets stored status fields override the computed verdict: a file saying running and verified cannot authorise a signal", async () => {
+        const { spawn } = await import("node:child_process");
+        const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+        try {
+          const space = await workspace();
+          // The file claims everything; the live identity says otherwise.
+          await hold(space, { pid: child.pid!, start_identity: "the listener that crashed", lock_id: "old", running: true, verified: true, holder_check: "start_identity", reason: undefined });
+          const differs = probe({ [child.pid!]: "an unrelated process" });
+          expect(JSON.parse((await run(["serve", "--status", "--json"], space, [], {}, { processProbe: differs })).stdout)).toMatchObject({ running: false, verified: false, holder_check: "start_identity" });
+          const stopped = await run(["serve", "--stop", "--json"], space, [], {}, { processProbe: differs });
+          expect(JSON.parse(stopped.stdout)).toMatchObject({ stopped: false, pid: child.pid });
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(child.exitCode).toBeNull();
+          expect(child.signalCode).toBeNull();
+          // A damaged file, or one with no usable pid, is no holder at all.
+          await hold(space, { pid: "1", running: true, verified: true });
+          expect(JSON.parse((await run(["serve", "--status", "--json"], space, [], {}, { processProbe: differs })).stdout)).toMatchObject({ running: false, verified: false });
+        } finally {
+          child.kill("SIGKILL");
+        }
+      });
+
+      it("finishes a look already in flight before giving the lock back, so it can neither begin a seat nor overwrite a successor's lock", async () => {
+        const space = await joinedSpace();
+        await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+        let looks = 0;
+        let openGate!: () => void;
+        const gate = new Promise<void>((resolve) => (openGate = resolve));
+        let inFlight!: () => void;
+        const rescanStarted = new Promise<void>((resolve) => (inFlight = resolve));
+        // The first look is serve's start; every later look stops at the gate, as a slow disk would.
+        const listSeats = async <T,>(read: () => Promise<T>): Promise<T> => {
+          looks += 1;
+          if (looks > 1) {
+            inFlight();
+            await gate;
+          }
+          return read();
+        };
+        let releasePoll!: () => void;
+        const poll = new Promise<void>((resolve) => (releasePoll = resolve));
+        // --run serves every seat, so a seat joined meanwhile is one the late look would begin.
+        const { exec } = recorder({ exitCode: 0, stdout: "" });
+        const serving = run(["serve", "--run", "handle", "--json"], space, [{ ...revoked(), wait: poll }], {}, { service: { delivered_through: 1, acked_through: 1 }, rescanMs: 10, listSeats, exec });
+        let ended = false;
+        void serving.then(() => (ended = true));
+        await rescanStarted;
+        // While that look waits, a second seat is joined, and the only seat this connector sits in ends.
+        await seatIn(space, "rom_SecondRoom", "i_AbCdEfGhIj");
+        releasePoll();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        // The connector should not have given the lock back yet: it is still finishing that look.
+        const endedWhileLooking = ended;
+        // A successor takes the lock meanwhile (by hand here, as a reclaim would).
+        await hold(space, { pid: process.ppid, start_identity: `test-start-${process.ppid}`, lock_id: "successor" });
+        openGate();
+        const result = await serving;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(result.exitCode).toBe(0);
+        // The late look began nothing, wrote nothing, and released nothing that was not its own.
+        expect(JSON.parse(await readFile(statusFile(space), "utf8"))).toMatchObject({ pid: process.ppid, lock_id: "successor" });
+        expect(result.requests.some((request) => request.url.includes("rom_SecondRoom"))).toBe(false);
+        expect(result.stderr).not.toContain("now also sitting in");
+        expect(endedWhileLooking).toBe(false);
+      });
+
+      it("writes a status only while the lock is its own, and never releases another connector's lock", async () => {
+        const space = await joinedSpace();
+        await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+        let releasePoll!: () => void;
+        const poll = new Promise<void>((resolve) => (releasePoll = resolve));
+        const serving = run(["serve", "--json"], space, [{ ...revoked(), wait: poll }], {}, { service: { delivered_through: 1, acked_through: 1 } });
+        await vi.waitFor(async () => expect(JSON.parse(await readFile(statusFile(space), "utf8"))).toMatchObject({ pid: process.pid, seats: [expect.objectContaining({ state: "listening" })] }));
+        // The lock is no longer this connector's (a successor holds it).
+        await hold(space, { pid: process.ppid, start_identity: `test-start-${process.ppid}`, lock_id: "successor", seats: [] });
+        // The seat then changes state, which would write a status, and the connector ends.
+        releasePoll();
+        const result = await serving;
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(await readFile(statusFile(space), "utf8"))).toMatchObject({ pid: process.ppid, lock_id: "successor", seats: [] });
+      });
+
+      it("keeps the pid-only lock, exactly as before, where start identities are not read (Windows)", async () => {
+        const { spawn } = await import("node:child_process");
+        const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+        const windows: ProcessProbe = { supported: false, alive: () => { throw new Error("not used"); }, identity: () => { throw new Error("not used"); }, argv: () => { throw new Error("not used"); } };
+        try {
+          const space = await joinedSpace();
+          // A manual listener, by pid alone: --status says running, and --stop stops it.
+          await hold(space, { pid: child.pid! });
+          const status = JSON.parse((await run(["serve", "--status", "--json"], space, [], {}, { processProbe: windows })).stdout);
+          expect(status).toMatchObject({ running: true, pid: child.pid });
+          expect(status.verified).toBeUndefined();
+          const stopped = await run(["serve", "--stop", "--json"], space, [], {}, { processProbe: windows });
+          expect(JSON.parse(stopped.stdout)).toEqual({ stopped: true, pid: child.pid });
+          await new Promise<void>((resolve) => (child.exitCode !== null || child.signalCode !== null ? resolve() : child.once("exit", () => resolve())));
+          expect(child.signalCode).toBe("SIGTERM");
+          // A dead pid's slot is taken over, and the lock it writes is the pid-only one.
+          await hold(space, { pid: 2 ** 22 + 17 });
+          await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+          let recorded: Record<string, unknown> | null = null;
+          const served = await run(["serve", "--json"], space, [{ ...revoked(), entered: () => void readFile(statusFile(space), "utf8").then((raw) => (recorded = JSON.parse(raw))) }], {}, { service: { delivered_through: 1, acked_through: 1 }, processProbe: windows });
+          expect(served.exitCode).toBe(0);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          expect(recorded).toMatchObject({ pid: process.pid });
+          expect(recorded).not.toHaveProperty("lock_id");
+          expect(recorded).not.toHaveProperty("start_identity");
+        } finally {
+          child.kill("SIGKILL");
+        }
+      });
+    });
+
   });
 
   describe("sharednet timer: a line the Room's clock says on schedule (wait PR 6)", () => {
