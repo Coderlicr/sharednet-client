@@ -2607,7 +2607,7 @@ describe("sharednet say and wait", () => {
       expect((await run(["wake", "check", "--json"], space, [])).exitCode).not.toBe(0);
       const unknown = await run(["wake", "set", "gemini-cli", "--json"], space, []);
       expect(unknown.exitCode).not.toBe(0);
-      expect(unknown.stdout + unknown.stderr).toContain("The wake drivers are codex, claude-code, cursor and command");
+      expect(unknown.stdout + unknown.stderr).toContain("The wake drivers are codex, claude-code, codebuddy, cursor and command");
     });
 
     it("binds a seat to a CodeBuddy or WorkBuddy conversation, remembering which config directory holds it", async () => {

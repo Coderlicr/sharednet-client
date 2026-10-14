@@ -50,7 +50,7 @@ function scripted(...answers: Array<Partial<TurnOutcome>>) {
 
 describe("the codebuddy plugin in the registry", () => {
   it("is known by its driver, and recognises a process that CodeBuddy or WorkBuddy runs a command for", () => {
-    expect(wakePlugins.map((plugin) => plugin.driver)).toEqual(["codex", "claude-code", "codebuddy", "command"]);
+    expect(wakePlugins.map((plugin) => plugin.driver)).toEqual(["codex", "claude-code", "codebuddy", "cursor", "command"]);
     expect(pluginFor("codebuddy").label).toBe("CodeBuddy");
     const inWorkBuddy = { CODEBUDDY_SESSION_ID: SESSION, CODEBUDDY_HOST: "workbuddy-desktop", CODEBUDDY_CONFIG_DIR: "/home/yu/.workbuddy", WORKBUDDY_CONFIG_DIR: "/home/yu/.workbuddy", PATH: "" };
     expect(seatWakeFrom(inWorkBuddy, "/w")).toEqual({ driver: "codebuddy", session: SESSION, cwd: "/w", command: "codebuddy", config_dir: "/home/yu/.workbuddy" });
