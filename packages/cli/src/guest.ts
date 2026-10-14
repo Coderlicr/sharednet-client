@@ -13,6 +13,7 @@ import { detectRuntime, type DetectedRuntime } from "./runtime-detection.ts";
 import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn, triggerTakesParameter, wakeIdentity, type Trigger } from "./triggers.ts";
 import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
 import { chatOpen } from "./wake-claude.ts";
+import { codebuddyProgram } from "./wake-codebuddy.ts";
 import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
 import { describeWake, isWakeDriver, pluginFor, seatWakeFrom } from "./wake-plugins.ts";
 import {
@@ -120,7 +121,7 @@ const INVITE_TOKEN_PATTERN = /^rit_[A-Za-z0-9_-]{43}$/;
 /** The server caps one wait at this; the client loops. */
 const WAIT_MAX_SECONDS = 25;
 
-const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume"]);
+const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume", "config-dir"]);
 /** Options that may be given more than once; every value is kept, in order. */
 const REPEATABLE_OPTIONS = new Set(["on", "artifact"]);
 const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake", "switch-account"]);
@@ -2709,8 +2710,10 @@ export function sessionTurnOrder() {
   };
 }
 
-function wakeSessionKey(wake: SeatWake): string | null {
-  return wake.session ? JSON.stringify([wake.driver, wake.codex_home ?? null, wake.session]) : null;
+export function wakeSessionKey(wake: SeatWake): string | null {
+  // CodeBuddy finds a session only under its config directory, as Codex does under its home; the
+  // element is added only for it, so the keys of the other drivers are unchanged.
+  return wake.session ? JSON.stringify([wake.driver, wake.codex_home ?? null, wake.session, ...(wake.config_dir ? [wake.config_dir] : [])]) : null;
 }
 
 /** A wake program that did not start is looked at again after this, doubling up to the cap. */
@@ -3424,7 +3427,7 @@ async function timer(args: string[], dependencies: GuestDependencies): Promise<u
 }
 
 const WAKE_USAGE =
-  "Usage: sharednet wake [--as <i_…>], sharednet wake set codex|claude-code|command [--command <path>] [--resume <session>] [--as <i_…>], sharednet wake off [--as <i_…>], sharednet wake check [--as <i_…>], sharednet wake limit <1m..24h> [--as <i_…>], or sharednet wake checkpoint <progress> [--as <i_…>]";
+  "Usage: sharednet wake [--as <i_…>], sharednet wake set codex|claude-code|codebuddy|command [--command <path>] [--resume <session>] [--config-dir <path>] [--as <i_…>], sharednet wake off [--as <i_…>], sharednet wake check [--as <i_…>], sharednet wake limit <1m..24h> [--as <i_…>], or sharednet wake checkpoint <progress> [--as <i_…>]";
 
 /**
  * A seat's wake, by hand (docs/wake-plugins.md): which plugin delivers it, what it resumes, the
@@ -3432,7 +3435,7 @@ const WAKE_USAGE =
  */
 async function wakeVerb(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["as", "command", "resume"]);
+  assertOnlyOptions(parsed, ["as", "command", "resume", "config-dir"]);
   const [action = "show", driver, ...extra] = parsed.positionals;
   if (extra.length > 0 || !["show", "set", "off", "check", "limit", "checkpoint"].includes(action) || ["set", "limit", "checkpoint"].includes(action) !== (driver !== undefined)) {
     throw localError("invalid_arguments", WAKE_USAGE);
@@ -3482,7 +3485,7 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
     return { ...shown(wake), check: checked.message, ...(checked.steps ? { steps: checked.steps } : {}) };
   }
 
-  if (!isWakeDriver(driver)) throw localError("invalid_arguments", `The wake drivers are codex, claude-code and command. ${WAKE_USAGE}`);
+  if (!isWakeDriver(driver)) throw localError("invalid_arguments", `The wake drivers are codex, claude-code, codebuddy and command. ${WAKE_USAGE}`);
   // What this process is, when it is the harness being set: its session, its program, its open chat.
   const here = pluginFor(driver).capture(dependencies.env, dependencies.cwd);
   const before = credential.wake?.driver === driver ? credential.wake : undefined;
@@ -3493,6 +3496,8 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
     throw localError("invalid_arguments", `A ${pluginFor(driver).label} wake resumes a session: give --resume <session id>, or run this from inside that session.`);
   }
   const home = before?.codex_home ?? here?.codex_home;
+  const configDir = stringOption(parsed, "config-dir") ?? before?.config_dir ?? here?.config_dir;
+  if (stringOption(parsed, "config-dir") !== undefined && driver !== "codebuddy") throw localError("invalid_arguments", "--config-dir belongs to the codebuddy driver.");
   // An open chat is only this one, and only when it is the session being set.
   const live = here?.live_pid !== undefined && here.session === session ? here.live_pid : undefined;
   const wake: SeatWake = {
@@ -3500,8 +3505,9 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
     ...(driver === "command" ? {} : { session: session! }),
     cwd: before?.cwd ?? dependencies.cwd,
     ...(credential.wake?.turn_limit_ms !== undefined ? { turn_limit_ms: credential.wake.turn_limit_ms } : {}),
-    command: command ?? (driver === "codex" ? (onPath("codex", dependencies.env) ?? "codex") : (onPath("claude", dependencies.env) ?? "claude")),
+    command: command ?? (driver === "codex" ? (onPath("codex", dependencies.env) ?? "codex") : driver === "codebuddy" ? codebuddyProgram(dependencies.env) : (onPath("claude", dependencies.env) ?? "claude")),
     ...(driver === "codex" && home ? { codex_home: home } : {}),
+    ...(driver === "codebuddy" && configDir ? { config_dir: configDir } : {}),
     ...(driver === "claude-code" && live !== undefined ? { live_pid: live } : {}),
   };
   await writeRoomCredential(paths, { ...credential, wake });

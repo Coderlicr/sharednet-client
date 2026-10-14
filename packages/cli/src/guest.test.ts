@@ -2600,6 +2600,26 @@ describe("sharednet say and wait", () => {
       expect((await run(["wake", "set", "cursor", "--json"], space, [])).exitCode).not.toBe(0);
     });
 
+    it("binds a seat to a CodeBuddy or WorkBuddy conversation, remembering which config directory holds it", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE, "--no-wake"], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
+
+      // From inside the conversation (a command its agent runs), the session and config directory are taken from it.
+      const inside = { CODEBUDDY_SESSION_ID: "wb-session-0001", CODEBUDDY_CONFIG_DIR: "/home/yu/.workbuddy" };
+      const here = await run(["wake", "set", "codebuddy", "--command", "/launchers/workbuddy-cli.sh", "--json"], space, [], inside);
+      expect(JSON.parse(here.stdout).wake).toEqual({ driver: "codebuddy", session: "wb-session-0001", cwd: space.project, command: "/launchers/workbuddy-cli.sh", config_dir: "/home/yu/.workbuddy" });
+      expect(here.stderr).toContain(`${MEMBER_ID} wakes codebuddy wb-session-0001 when addressed`);
+
+      // Elsewhere it needs the session, and takes the directory by hand.
+      expect((await run(["wake", "off", "--json"], space, [])).exitCode).toBe(0);
+      const missing = await run(["wake", "set", "codebuddy", "--json"], space, [], { CODEBUDDY_SESSION_ID: "" });
+      expect(missing.exitCode).not.toBe(0);
+      expect(missing.stdout + missing.stderr).toContain("--resume <session id>");
+      const by = await run(["wake", "set", "codebuddy", "--resume", "wb-session-0002", "--config-dir", "/home/yu/.workbuddy", "--json"], space, [], { CODEBUDDY_SESSION_ID: "" });
+      expect(JSON.parse(by.stdout).wake).toMatchObject({ driver: "codebuddy", session: "wb-session-0002", config_dir: "/home/yu/.workbuddy" });
+      expect((await run(["wake", "set", "codex", "--resume", "019a", "--config-dir", "/x", "--json"], space, [])).exitCode).not.toBe(0);
+    });
+
     it("leaves alone a seat no session took, unless --run gives it a command", async () => {
       // Such a seat is someone's own `wait`'s to answer; sitting in it would count its lines as handled.
       const space = await workspace();

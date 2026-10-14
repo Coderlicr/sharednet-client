@@ -92,6 +92,50 @@ Every case of "the session is open" becomes `handed` or `left`; neither is an er
   - While `live_pid` runs and is still named `claude` (`ps -o comm=`; a pid can be reused after the chat closes), the outcome is `left`.
   - Otherwise run `claude -p --resume <session> --output-format json`, and the outcome is `replied` or `failed`.
 
+### `codebuddy`
+
+Tencent's CodeBuddy Code CLI, and **WorkBuddy**, whose desktop app runs that same CLI as its agent engine
+(`WorkBuddy.app/Contents/Resources/app.asar/cli/bin/codebuddy`, started as `codebuddy --serve`). The CLI mirrors Claude
+Code's headless mode (<https://www.workbuddy.ai/docs/cli/headless>, <https://www.workbuddy.ai/docs/cli/cli-reference>).
+
+- **capture:** `CODEBUDDY_SESSION_ID` (the id `--resume` takes), `CODEBUDDY_CONFIG_DIR` (else `WORKBUDDY_CONFIG_DIR`), and
+  `codebuddy` or `cbc` on PATH. The CLI exports the session id to the commands its agent runs (read off its source, not yet
+  observed in a live tool shell). The app's own processes carry `CODEBUDDY_HOST=workbuddy-desktop` but no session id, so they
+  are not captured.
+- **deliver:** run `codebuddy -p --resume <session> --output-format json` with the wake prompt on stdin, in the config
+  directory the wake recorded (`config_dir`, passed as `CODEBUDDY_CONFIG_DIR`: `~/.codebuddy` for the standalone CLI,
+  `~/.workbuddy` for WorkBuddy; a resume finds a session only there). The result object has Claude Code's shape, and its
+  `result` is the reply. Outcome `replied` or `failed`. The turn and its parsing are the `claude-code` plugin's own
+  (`deliverResumedPrint` in `wake-claude.ts`), shared rather than copied: `codebuddy` supplies the program, the session id and
+  the config directory, so a fix to the turn is made once. serve's one-turn-per-session queue keys a conversation by its
+  config directory as well.
+- **No `left`, no `handed`:** one WorkBuddy app process hosts every conversation and its session registry
+  (`~/.workbuddy/sessions/<pid>.json`) does not say which is open, so Claude Code's open-chat check does not carry over, and
+  there is no queue. A conversation open in the app and woken here is written by two processes (the split Claude Code shows).
+  Bind a seat to a conversation that is not open.
+- **A launcher for WorkBuddy:** it puts no `codebuddy` on PATH. Use a script as the wake's `command`:
+  ```sh
+  #!/bin/sh
+  ELECTRON_RUN_AS_NODE=1 exec /Applications/WorkBuddy.app/Contents/MacOS/Electron \
+    /Applications/WorkBuddy.app/Contents/Resources/app.asar/cli/bin/codebuddy "$@"
+  ```
+  then `sharednet wake set codebuddy --resume <session> --config-dir ~/.workbuddy --command /path/to/that.sh`. Unattended tool
+  use needs `-y` or `--permission-mode` (the headless doc says so); add the flags to the launcher if you want them. `wake check`
+  looks at a launcher without starting it. The standalone CLI is `npm i -g @tencent-ai/codebuddy-code`.
+- **First live run (2026-10-14, CodeBuddy 2.106.4 in WorkBuddy 5.2.5):** `-p --resume <id> --fork-session --output-format json` prints a
+  pretty-printed **array** of the turn's events (message, file-history-snapshot, reasoning, function_call, function_call_result, ...)
+  whose last element is the `result` object, not the single object the doc describes. The shared parser (`claudeSummary`)
+  now reads a whole output that is an array by its last `result`; Claude Code's single object parses as before. A woken turn
+  that used to be reported "exited 0" now replies.
+- **Live passes through `serve` (Yu's Mac, 2026-10-14, WorkBuddy 5.2.5 / CodeBuddy 2.106.4, a launcher without `-y`):** a plain reply
+  (`WB-2-OK`), and at 18:37 an @ asked the seat to read `wb-tool-check.txt` from its working directory; it replied with the file's
+  freshly generated contents (`WB-TOOL-183715-OK`) 9 s later. So a read-only tool works headlessly under the default permission
+  mode; tools that need approval need `-y` or `--permission-mode` in the launcher, which stays the owner's choice (it is not defaulted).
+- **`wake check`** looks at the program (a launcher is not started) and that the config directory is readable. It takes none of the
+  sign-in, transcript or throwaway-call steps the `claude-code` check has; the live passes above are the proof of the path.
+- **Still not verified live:** resuming a conversation the desktop app made *without* `--fork-session` while the app is closed, and
+  `--output-format json` as a single object (it was an array on 2.106.4; both forms parse).
+
 ### `command`
 
 This is the extension point: any harness or bot without a built-in plugin (Cursor, OpenHands, Gemini CLI, a team script).
@@ -113,7 +157,7 @@ The `command` field of a `codex` or `claude-code` wake stays, as before, the pro
 | --- | --- |
 | `sharednet join <invite>` | As before: captures the wake from the first plugin that recognises this process. In an open chat, also prints the listen line. `--no-wake` and `SHAREDNET_WAKE=off` keep a join to the seat |
 | `sharednet wake [--as <seat>] [--json]` | Shows the seat's wake: plugin, session, command, live chat |
-| `sharednet wake set <driver> [--command <path>] [--resume <session id>] [--as <seat>]` | Sets or changes it. `--resume` defaults to the current process's session when the driver is this harness. (`--session` is already the CLI's global option for choosing an Instance, so it is not reused) |
+| `sharednet wake set <driver> [--command <path>] [--resume <session id>] [--config-dir <path>] [--as <seat>]` | Sets or changes it. `--resume` defaults to the current process's session when the driver is this harness. (`--session` is already the CLI's global option for choosing an Instance, so it is not reused) |
 | `sharednet wake off [--as <seat>]` | Removes it. The seat stays, and serve stops driving it |
 | `sharednet wake check [--as <seat>]` | Proves the wake path in this shell's environment: all four steps of "Checking a wake", including one throwaway model call. Prints each step; exits non-zero naming the step that failed. A warning alone does not fail it |
 | `sharednet serve --status` | Each seat's driver, as `resumes`, is shown as before; a seat driven despite a doubt carries it in `wake_warnings` |
@@ -148,6 +192,7 @@ At start, `serve` checks each driven seat with the steps that cost no model call
 | `wake-driver.ts` | The `WakePlugin` and `Delivery` types, the registry (`wakePlugins`, `pluginFor`, `captureWake`, `parseSeatWake`), and what every plugin shares: the wake prompt, the live prompt, reply extraction, the harness-free environment, the turn runner |
 | `wake-codex.ts` | The `codex` plugin |
 | `wake-claude.ts` | The `claude-code` plugin, including `chatOpen` |
+| `wake-codebuddy.ts` | The `codebuddy` plugin (CodeBuddy CLI and WorkBuddy) |
 | `wake-command.ts` | The `command` plugin |
 | `guest.ts` | `serve` maps a `Delivery` to post, acknowledge and retry. `join` asks the registry. `wake` is the new verb |
 

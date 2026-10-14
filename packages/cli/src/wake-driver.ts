@@ -21,7 +21,7 @@ export function validTurnLimit(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 60_000 && value <= 24 * 60 * 60_000;
 }
 
-export type WakeDriver = "codex" | "claude-code" | "command";
+export type WakeDriver = "codex" | "claude-code" | "codebuddy" | "command";
 
 export interface SeatWake {
   driver: WakeDriver;
@@ -40,6 +40,11 @@ export interface SeatWake {
   live_pid?: number;
   /** Host-local budget for subsequent headless turns, in milliseconds. */
   turn_limit_ms?: number;
+  /**
+   * CodeBuddy / WorkBuddy (wake-codebuddy.ts): the CLI's config directory (CODEBUDDY_CONFIG_DIR),
+   * which holds the session. A resume finds a session only under the directory it was made in.
+   */
+  config_dir?: string;
 }
 
 /** What one wake is about: where it was said, by whom, and the two prompts a plugin may hand on. */
@@ -292,6 +297,13 @@ const HARNESS_SESSION_KEYS = new Set([
   "CODEX_SANDBOX",
   "CODEX_SANDBOX_NETWORK_DISABLED",
   "CODEX_VERSION",
+  // CodeBuddy / WorkBuddy export these to the commands their agent runs.
+  "CODEBUDDY_SESSION_ID",
+  "CODEBUDDY_TOOL_CALL_ID",
+  "CODEBUDDY_CONVERSATION_REQUEST_ID",
+  "CODEBUDDY_SESSION_KIND",
+  "CODEBUDDY_SESSION_NAME",
+  "CODEBUDDY_SESSION_LOG",
 ]);
 // CLAUDE_CODE_* is mostly the host session's own wiring; these few are how a person signs in.
 const KEPT_CLAUDE_CODE_KEYS = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]);

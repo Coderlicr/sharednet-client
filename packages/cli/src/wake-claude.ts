@@ -63,16 +63,36 @@ export function chatOpen(pid: number): boolean {
 }
 
 /** One resumed turn of the seat's session, with the prompt on standard input. */
-export function claudeResume(wake: SeatWake, prompt: string, env: Environment, memberId: string, timeoutMs: number): TurnSpec {
-  return { command: wake.command, args: ["-p", "--resume", wake.session!, "--output-format", "json"], cwd: wake.cwd, env: deliveryEnv(env, memberId), input: prompt, timeoutMs };
+export function claudeResume(wake: SeatWake, prompt: string, env: Environment, memberId: string, timeoutMs: number, extraEnv: Record<string, string> = {}): TurnSpec {
+  return { command: wake.command, args: ["-p", "--resume", wake.session!, "--output-format", "json"], cwd: wake.cwd, env: deliveryEnv(env, memberId, extraEnv), input: prompt, timeoutMs };
 }
 
-/** How the turn went, read off `--output-format json`: whether it finished, and its result. */
+/**
+ * One resumed print-mode turn and how it went: the part of a wake that every harness with Claude Code's
+ * headless shape shares (`<program> -p --resume <session> --output-format json`, a `result` object back).
+ * The program is the wake's `command` and `extraEnv` is where a harness keeps its sessions (CodeBuddy's
+ * config directory), so a harness like that is this function with another program and session path
+ * (wake-codebuddy.ts), and a fix to the turn or its parsing is made once, here.
+ */
+export async function deliverResumedPrint(label: string, wake: SeatWake, input: WakeInput, context: DeliveryContext, extraEnv: Record<string, string> = {}): Promise<Delivery> {
+  const outcome = await context.run(claudeResume(wake, input.prompt, context.env, input.memberId, context.timeoutMs, extraEnv));
+  const summary = claudeSummary(outcome.stdout);
+  if (summary.ok && outcome.exitCode === 0) return { kind: "replied", reply: summary.said };
+  return failedTurn(label, summary.said, outcome, context.timeoutMs);
+}
+
+/**
+ * How the turn went, read off `--output-format json`: whether it finished, and its result. Claude Code
+ * prints one result object. CodeBuddy 2.106.4 (WorkBuddy 5.2.5) prints a pretty-printed array of the
+ * turn's events whose last `result` element is the same object (seen live, 2026-10-14), so a whole
+ * output that is an array is read by that last result.
+ */
 export function claudeSummary(stdout: string): { ok: boolean; said: string | null } {
   for (const line of [stdout.trim(), ...stdout.split("\n")]) {
     let event: Record<string, unknown>;
     try {
-      event = JSON.parse(line) as Record<string, unknown>;
+      const parsed = JSON.parse(line) as unknown;
+      event = Array.isArray(parsed) ? (([...(parsed as unknown[])].reverse().find((item) => (item as Record<string, unknown> | null)?.type === "result") ?? {}) as Record<string, unknown>) : (parsed as Record<string, unknown>);
     } catch {
       continue;
     }
@@ -226,10 +246,7 @@ export const claudePlugin: WakePlugin = {
     if (wake.live_pid !== undefined && context.chatOpen(wake.live_pid)) {
       return { kind: "left", note: `its Claude Code chat is open (pid ${wake.live_pid})` };
     }
-    const outcome = await context.run(claudeResume(wake, input.prompt, context.env, input.memberId, context.timeoutMs));
-    const summary = claudeSummary(outcome.stdout);
-    if (summary.ok && outcome.exitCode === 0) return { kind: "replied", reply: summary.said };
-    return failedTurn("claude", summary.said, outcome, context.timeoutMs);
+    return deliverResumedPrint("claude", wake, input, context);
   },
   check: checkClaude,
 };

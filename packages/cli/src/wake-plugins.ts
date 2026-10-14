@@ -1,4 +1,5 @@
 import { claudePlugin } from "./wake-claude.ts";
+import { codebuddyPlugin } from "./wake-codebuddy.ts";
 import { codexPlugin } from "./wake-codex.ts";
 import { commandPlugin } from "./wake-command.ts";
 import { validTurnLimit } from "./wake-driver.ts";
@@ -8,7 +9,7 @@ import type { Environment, SeatWake, WakeDriver, WakePlugin } from "./wake-drive
  * The wake plugins (docs/wake-plugins.md). A harness is one module and one line here; `serve` and
  * `join` only ever ask the registry.
  */
-export const wakePlugins: readonly WakePlugin[] = [codexPlugin, claudePlugin, commandPlugin];
+export const wakePlugins: readonly WakePlugin[] = [codexPlugin, claudePlugin, codebuddyPlugin, commandPlugin];
 
 export function pluginFor(driver: WakeDriver): WakePlugin {
   const plugin = wakePlugins.find((candidate) => candidate.driver === driver);
@@ -41,6 +42,7 @@ export function parseSeatWake(value: unknown): SeatWake | undefined {
   // A harness's wake resumes a session; a command's has none to resume.
   if (!driver || !cwd || !command || (driver !== "command" && !session)) return undefined;
   const home = text(record.codex_home);
+  const configDir = text(record.config_dir);
   const live = record.live_pid;
   if (record.turn_limit_ms !== undefined && !validTurnLimit(record.turn_limit_ms)) return undefined;
   return {
@@ -51,6 +53,7 @@ export function parseSeatWake(value: unknown): SeatWake | undefined {
     ...(home ? { codex_home: home } : {}),
     ...(validTurnLimit(record.turn_limit_ms) ? { turn_limit_ms: record.turn_limit_ms } : {}),
     ...(typeof live === "number" && Number.isSafeInteger(live) && live > 0 ? { live_pid: live } : {}),
+    ...(driver === "codebuddy" && configDir ? { config_dir: configDir } : {}),
   };
 }
 

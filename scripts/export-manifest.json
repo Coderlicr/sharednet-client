@@ -344,6 +344,8 @@
     "packages/cli/src/wake-codex.ts",
     "packages/cli/src/wake-claude.ts",
     "packages/cli/src/wake-command.ts",
-    "docs/rooms-join-and-invite.md"
+    "docs/rooms-join-and-invite.md",
+    "packages/cli/src/wake-codebuddy.ts",
+    "packages/cli/src/wake-codebuddy.test.ts"
   ]
 }
