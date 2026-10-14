@@ -4,6 +4,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
+import { withControlLock } from "./board-controls.ts";
 import { CliError, localError } from "./errors.ts";
 import {
   getOrCreateInstallationSecret,
@@ -11,6 +12,7 @@ import {
   readRoomCredential,
   writeStoredApiCredential,
   type StoragePaths,
+  type StoredApiCredential,
 } from "./storage.ts";
 
 /**
@@ -134,6 +136,34 @@ async function heldSeatTokens(paths: StoragePaths, baseUrl: string): Promise<str
   return tokens.slice(0, 50);
 }
 
+/**
+ * The one lock every writer of this machine's credential file takes, so that
+ * a read, a decision and a write by one command cannot interleave with a
+ * write by another (`login`, or a claim in a second session).
+ */
+export function withCredentialLock<T>(paths: StoragePaths, work: () => Promise<T>): Promise<T> {
+  return withControlLock({ root: paths.configDir }, "credential", work);
+}
+
+/** The credential a login or claim result becomes; the installation secret is the machine's, kept across accounts. */
+export async function accountCredentialFrom(
+  paths: StoragePaths,
+  baseUrl: string,
+  result: { principal: { id: string }; api_key_id: string; api_key: string },
+  now: Date,
+): Promise<StoredApiCredential> {
+  return {
+    schema_version: 1,
+    base_url: baseUrl,
+    principal_id: result.principal.id,
+    api_key_id: result.api_key_id,
+    api_key: result.api_key,
+    installation_secret: await getOrCreateInstallationSecret(paths),
+    created_at: now.toISOString(),
+    expires_at: null,
+  };
+}
+
 /** The key stays in the credential file, owner-only; the terminal sees only ids. */
 export async function storeAccountCredential(
   paths: StoragePaths,
@@ -141,16 +171,8 @@ export async function storeAccountCredential(
   result: { principal: { id: string }; api_key_id: string; api_key: string },
   now: Date,
 ): Promise<void> {
-  const installationSecret = await getOrCreateInstallationSecret(paths);
-  await writeStoredApiCredential(paths, {
-    schema_version: 1,
-    base_url: baseUrl,
-    principal_id: result.principal.id,
-    api_key_id: result.api_key_id,
-    api_key: result.api_key,
-    installation_secret: installationSecret,
-    created_at: now.toISOString(),
-    expires_at: null,
+  await withCredentialLock(paths, async () => {
+    await writeStoredApiCredential(paths, await accountCredentialFrom(paths, baseUrl, result, now));
   });
 }
 

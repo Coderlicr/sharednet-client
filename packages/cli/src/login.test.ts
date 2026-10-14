@@ -157,4 +157,23 @@ describe("sharednet login", () => {
     });
   });
 
+  it("writes the credential under the machine's credential lock, so it never lands inside another command's read-and-replace", async () => {
+    const space = await workspace();
+    const { getStoragePaths, readStoredApiCredential } = await import("./storage.ts");
+    const { storeAccountCredential, withCredentialLock } = await import("./login.ts");
+    const paths = getStoragePaths(space.env);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let locked!: () => void;
+    const holding = new Promise<void>((resolve) => { locked = resolve; });
+    const other = withCredentialLock(paths, async () => { locked(); await gate; });
+    await holding;
+    const stored = storeAccountCredential(paths, "http://127.0.0.1:3001", { principal: { id: "p_LoCkEd0001" }, api_key_id: "key_LoCkEd0001", api_key: API_KEY }, new Date());
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(await readStoredApiCredential(paths)).toBeNull();
+    release();
+    await Promise.all([other, stored]);
+    expect((await readStoredApiCredential(paths))?.principal_id).toBe("p_LoCkEd0001");
+  });
+
 });

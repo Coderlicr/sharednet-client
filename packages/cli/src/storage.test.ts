@@ -7,11 +7,14 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  backupStoredApiCredential,
   getOrCreateInstallationSecret,
   getStoragePaths,
   listSessions,
   readStoredApiCredential,
   writeSession,
+  writeStoredApiCredential,
+  type StoredApiCredential,
 } from "./storage.ts";
 
 const cleanup: string[] = [];
@@ -123,6 +126,35 @@ describe("secure local state", () => {
     expect(new Set(secrets)).toHaveLength(1);
     expect(Buffer.from(secrets[0]!, "base64url")).toHaveLength(32);
     expect((await stat(paths.installationFile)).mode & 0o777).toBe(0o600);
+  });
+
+  it("backs a credential up byte for byte, owner-only, without overwriting an earlier copy", async () => {
+    const root = await fixtureRoot();
+    const paths = getStoragePaths({
+      HOME: root,
+      XDG_CONFIG_HOME: join(root, "config"),
+      XDG_STATE_HOME: join(root, "state"),
+    });
+    // Synthetic values only.
+    const credential = (principal: string): StoredApiCredential => ({
+      schema_version: 1, base_url: "https://www.sharednet.ai", principal_id: principal, api_key_id: `key_${principal}`,
+      api_key: `snk_synthetic_${principal}`, installation_secret: "synthetic-installation", created_at: "2026-10-12T00:00:00.000Z", expires_at: null,
+    });
+
+    expect(await backupStoredApiCredential(paths, new Date())).toBeNull();
+    await writeStoredApiCredential(paths, credential("p_first"));
+    const before = await readFile(paths.credentialsFile);
+    const at = new Date("2026-10-12T08:30:07.123Z");
+    const first = await backupStoredApiCredential(paths, at);
+    const second = await backupStoredApiCredential(paths, at);
+    expect(first).toBe(`${paths.credentialsFile}.bak-2026-10-12T08-30-07-123Z`);
+    expect(second).toBe(`${paths.credentialsFile}.bak-2026-10-12T08-30-07-123Z-1`);
+    for (const copy of [first!, second!]) {
+      expect(await readFile(copy)).toEqual(before);
+      expect((await stat(copy)).mode & 0o777).toBe(0o600);
+    }
+    await writeStoredApiCredential(paths, credential("p_next"));
+    expect(await readFile(first!)).toEqual(before);
   });
 
 });

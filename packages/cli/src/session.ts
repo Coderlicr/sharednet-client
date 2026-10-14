@@ -306,6 +306,12 @@ export interface RegisterInstanceOptions {
   freshWhenUndetected: boolean;
   /** Sent as given; omitted, the server applies the Principal's default (public). */
   reach?: "public" | "private";
+  /**
+   * The account key the caller already settled on, used instead of reading the
+   * credential file again, so the Instance is the account the caller checked
+   * even if the file changes in between.
+   */
+  apiKey?: string;
 }
 
 /**
@@ -341,7 +347,7 @@ export async function registerInstance(
     }
   }
 
-  const apiKey = await resolveApiKey(env, paths, baseUrl);
+  const apiKey = options.apiKey ?? await resolveApiKey(env, paths, baseUrl);
   const client = new ApiClient(baseUrl, fetchImplementation);
   const tag = options.agent ? await resolveTag(client, apiKey, options.agent) : undefined;
 

@@ -121,7 +121,7 @@ async function ownerRunning(pid: number): Promise<boolean> {
 }
 /** A populated directory is published atomically; removing only an owner's unique file
  * makes concurrent dead-owner recovery safe. Each agent's state lives in its PID namespace. */
-export async function withControlLock<T>(paths: Pick<ControlPaths, "root">, kind: "read" | "task" | "handed", work: () => Promise<T>): Promise<T> {
+export async function withControlLock<T>(paths: Pick<ControlPaths, "root">, kind: "read" | "task" | "handed" | "credential", work: () => Promise<T>): Promise<T> {
   await mkdir(paths.root, { recursive: true, mode: 0o700 });
   const lock = join(paths.root, `${kind}-lock`), deadline = Date.now() + 30_000;
   const candidate = await mkdtemp(join(paths.root, `${kind}-candidate-`));

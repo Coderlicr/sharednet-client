@@ -235,13 +235,17 @@ async function writeSecureJson(path: string, value: unknown): Promise<void> {
 }
 
 async function createSecureJsonIfAbsent(path: string, value: unknown): Promise<boolean> {
+  return createSecureTextIfAbsent(path, `${JSON.stringify(value)}\n`);
+}
+
+async function createSecureTextIfAbsent(path: string, text: string): Promise<boolean> {
   const parent = dirname(path);
   await ensureSecureDirectory(parent);
   const temp = join(parent, `.sharednet-${randomBytes(12).toString("hex")}.tmp`);
   let handle;
   try {
     handle = await open(temp, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
-    await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.writeFile(text, "utf8");
     await handle.sync();
     await handle.close();
     handle = undefined;
@@ -338,6 +342,25 @@ export async function writeStoredApiCredential(
   credential: StoredApiCredential,
 ): Promise<void> {
   await writeSecureJson(paths.credentialsFile, credential);
+}
+
+/**
+ * Copies the credential file, byte for byte and owner-only, to
+ * `credentials.json.bak-<time>` beside it before it is replaced. Returns the
+ * copy's path, or null when there was nothing to keep.
+ */
+export async function backupStoredApiCredential(
+  paths: StoragePaths,
+  now: Date,
+): Promise<string | null> {
+  const raw = await readSecureFile(paths.credentialsFile);
+  if (raw === null) return null;
+  const stamp = now.toISOString().replace(/[:.]/g, "-");
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const path = `${paths.credentialsFile}.bak-${stamp}${attempt === 0 ? "" : `-${attempt}`}`;
+    if (await createSecureTextIfAbsent(path, raw)) return path;
+  }
+  throw localError("invalid_local_state", "The credential file could not be backed up.");
 }
 
 export async function getOrCreateInstallationSecret(
