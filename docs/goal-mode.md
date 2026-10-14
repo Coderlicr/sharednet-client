@@ -93,7 +93,20 @@ experiment that must not intervene.
 `web_search="disabled"`, Claude Code without its `WebSearch` and `WebFetch` tools), for a
 benchmark such as ProgramBench that forbids the internet during inference. `episode.json`
 records the setting. It does not cut the network: the agents still reach their model provider,
-the Room, and package registries.
+the Room, and package registries. `--isolate` cuts it.
+
+`--isolate` puts every container on an internal Docker network with no way out but a gateway
+the runner starts (`nginx:1.27-alpine`, pulled once). The gateway forwards to SharedNet and to
+each driver's model API, and nothing else is reachable: no package registry, no web page, no
+source repository. It also holds the model keys: an agent's container gets a placeholder where
+its harness wants `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`, and the
+gateway signs each request with the real one, so no agent can read a key or leave one in its
+trace. Codex agents need `OPENAI_API_KEY` for this; a Codex login cannot be lent to the
+gateway. `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` on your machine changes where the gateway
+sends a driver's requests. An isolated run has no web search, since a harness's own search runs
+on the model provider's side, past any gateway. The gateway's access log, one line per request
+with the address of the container it came from, goes into the record, and `episode.json` maps
+each seat to its address.
 
 `--image <image>` runs the agents and the checks in an image of your own, for example a
 benchmark's task image with the harness added. It needs `node` (22.18 or newer) on `PATH`, the
@@ -125,7 +138,7 @@ runner makes `/home/agents` for that user if the image has none.
   the run says `--web-search off`.
 - **The end.** When the goal ends, the Room is closed, the containers are stopped, each agent's
   home is copied out of its container into the record without its tokens, and every container
-  is removed.
+  is removed (with `--isolate`, also the gateway and the internal network).
 
 ## The record: `runs/rom_…/`
 
@@ -138,6 +151,7 @@ runner makes `/home/agents` for that user if the image has none.
 | `workspace.git` | the workspace each time it changed, tagged with the Room sequence it follows (`git --git-dir=runs/rom_…/workspace.git log`); `.env*` and `.sharednet/` are never included |
 | `agents/<seat>/turn-NNN.jsonl` | each turn's raw stream from the harness |
 | `agents/<seat>/home/` | the agent's own session files: Codex in `.codex/sessions/`, Claude Code in `.claude/projects/` |
+| `gateway/` | with `--isolate`: the gateway's access logs, `sharednet.log` and one per model API, each request with the container address it came from |
 
 ## Other ways to use it
 
@@ -151,8 +165,8 @@ runner makes `/home/agents` for that user if the image has none.
 ## Safety and cost
 
 - Inside its container, an agent's own sandbox and approval prompts are off: the container is
-  the sandbox. They can read and write your whole workspace and reach the network. **Point
-  `--workspace` at a copy** if the original must not change.
+  the sandbox. They can read and write your whole workspace and, unless the run is isolated,
+  reach the network. **Point `--workspace` at a copy** if the original must not change.
 - Agents use your Codex and Claude plans or keys. Set a `budget` and an `after`.
 - Ctrl-C removes every container of the run and leaves the Room open. Close it from the
   Dashboard.
@@ -174,7 +188,7 @@ runner makes `/home/agents` for that user if the image has none.
 
 ## Known limits
 
-- Claude Code agents are covered by tests but have not yet run in a live goal.
+- Claude Code agents are covered by tests but have not yet run in a live goal, isolated or not.
 - `goal run` has been run on macOS with Docker Desktop; Linux is untested.
 - A budget is judged when turns end, so it can be passed by up to one turn per agent. The
   record's final numbers come from each agent's own session files, and are exact.

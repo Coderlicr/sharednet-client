@@ -11,10 +11,13 @@ import type { ApiClient } from "./api-client.ts";
 import {
   AGENT_DOCKERFILE,
   DEFAULT_IMAGE,
+  GATEWAY_IMAGE,
   TurnReader,
   codexSessionUsage,
   containerName,
   freshTokens,
+  gatewayTemplate,
+  isolationNames,
   loopbackPort,
   openingPrompt,
   parseAgents,
@@ -449,6 +452,127 @@ describe("runGoal", () => {
     const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
     expect(episode).toMatchObject({ image: DEFAULT_IMAGE, web_search: "live", turn_limit_s: 1200, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
     expect(episode.agents).toHaveLength(2);
+  });
+});
+
+describe("an isolated run", () => {
+  it("is prepared only with a key the gateway can sign with, and its gateway image", async () => {
+    const home = await temporary();
+    await mkdir(join(home, "cli", "src"), { recursive: true });
+    await writeFile(join(home, "cli", "package.json"), "{}");
+    await mkdir(join(home, ".codex"), { recursive: true });
+    await writeFile(join(home, ".codex", "auth.json"), "{}");
+    const base = { agents: parseAgents(["codex"]), image: null, workspace: home, home, entry: join(home, "cli", "src", "main.ts") };
+    const ready = fakeDocker(() => ({ code: 0 }));
+    // A Codex login lives in the container that uses it; the gateway can only sign with a key.
+    await expect(prepareRun({ ...base, env: {}, isolate: true }, ready.docker, () => undefined)).rejects.toMatchObject({ code: "agent_auth_missing" });
+
+    // The gateway's image is pulled when it is not here; the model origins follow this machine's own settings.
+    const missing = fakeDocker((call) => ({ code: call.args[0] === "image" && call.args.includes(GATEWAY_IMAGE) ? 1 : 0 }));
+    const plan = await prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-test", OPENAI_BASE_URL: "https://llm.example.test/v1" }, isolate: true, agentUser: "agent" }, missing.docker, () => undefined);
+    expect(missing.calls.some((call) => call.args.join(" ") === `pull ${GATEWAY_IMAGE}`)).toBe(true);
+    expect(plan).toMatchObject({ agentUser: "agent", isolation: { openai: "https://llm.example.test", anthropic: "https://api.anthropic.com" }, codexAuth: { kind: "api-key" } });
+    // Not isolated, nothing changes: the default user and no gateway.
+    expect(await prepareRun({ ...base, env: {} }, ready.docker, () => undefined)).toMatchObject({ agentUser: "node", isolation: null });
+  });
+
+  it("has a gateway that names the keys it signs with and holds none of them", () => {
+    const template = gatewayTemplate({
+      sharednet: "https://www.sharednet.ai",
+      isolation: { openai: "https://api.openai.com", anthropic: "https://api.anthropic.com" },
+      codex: true,
+      claudeAuth: "ANTHROPIC_API_KEY",
+    });
+    expect(template).toContain("listen 8081;");
+    expect(template).toContain("proxy_pass https://www.sharednet.ai;");
+    expect(template).toContain('proxy_set_header Authorization "Bearer ${OPENAI_API_KEY}";');
+    expect(template).toContain('proxy_set_header x-api-key "${ANTHROPIC_API_KEY}";');
+    expect(gatewayTemplate({ sharednet: "https://www.sharednet.ai", isolation: { openai: "https://api.openai.com", anthropic: "https://api.anthropic.com" }, codex: false, claudeAuth: "CLAUDE_CODE_OAUTH_TOKEN" }))
+      .toContain('proxy_set_header Authorization "Bearer ${CLAUDE_CODE_OAUTH_TOKEN}";');
+  });
+
+  it("puts every container on an internal network behind the gateway, and keeps every key out", async () => {
+    const out = await temporary();
+    const workspace = await temporary();
+    const plan: RunPlan = {
+      image: "programbench-agent:1",
+      agentUser: "agent",
+      isolation: { openai: "https://api.openai.com", anthropic: "https://api.anthropic.com" },
+      agents: parseAgents(["codex:gpt-6-luna"]),
+      workspace,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: { kind: "api-key" },
+      claudeAuth: null,
+    };
+    const names = isolationNames(ROOM);
+    const { docker, calls } = fakeDocker((call, command) => {
+      if (call.args[0] === "inspect") return { stdout: "10.9.0.3\n" };
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_RunnerSeat1" }) };
+      if (command[2] === "codex") {
+        return { lines: [JSON.stringify({ type: "thread.started", thread_id: "thread-1" }), JSON.stringify({ type: "turn.completed", usage: { input_tokens: 2_000, cached_input_tokens: 0, output_tokens: 100 } })] };
+      }
+      if (command[0] === "sharednet" && command[1] === "wait") return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, events: [{ kind: "closed" }], messages: [] }) };
+      return {};
+    });
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["budget 1k tokens", "after 2h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) return { room: { id: ROOM, state: "open", goal }, memberships: [] };
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: "2026-10-05T12:01:00.000Z" } } } };
+        return { items: [] };
+      },
+    } as unknown as ApiClient;
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    await runGoal(
+      client,
+      "sni_owner-seat",
+      OWNER_KEY,
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, webSearch: "off" },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
+    );
+
+    // The internal network first, then its gateway, which joins it as `gateway` and is the only container with a way out.
+    expect(calls[0]!.args).toEqual(["network", "create", "--internal", names.network]);
+    const gateway = calls.find((call) => call.args[0] === "run" && call.args.includes(names.gateway))!;
+    expect(gateway.args).not.toContain("--network");
+    expect(gateway.args).toContain(GATEWAY_IMAGE);
+    expect(gateway.args.join(" ")).toContain("-e GATEWAY_TEMPLATE -e OPENAI_API_KEY");
+    expect(gateway.env.GATEWAY_TEMPLATE).toContain("proxy_pass https://api.openai.com;");
+    expect(calls.some((call) => call.args.join(" ") === `network connect --alias gateway ${names.network} ${names.gateway}`)).toBe(true);
+    // Every other container is on the internal network, and none of them can reach this machine.
+    const runs = calls.filter((call) => call.args[0] === "run" && !call.args.includes(names.gateway));
+    expect(runs.map((call) => call.args[call.args.indexOf("--name") + 1])).toEqual([containerName(ROOM), containerName(ROOM, "codex-1")]);
+    expect(runs.every((call) => call.args.join(" ").includes(`--network ${names.network}`))).toBe(true);
+    expect(runs.every((call) => !call.args.includes("host.docker.internal:host-gateway"))).toBe(true);
+    // The Agents run as the image's user, and reach SharedNet on their own loopback, forwarded to the gateway.
+    const seatCalls = calls.filter((call) => call.args[0] === "exec" && call.args.includes(containerName(ROOM, "codex-1")) && !call.args.includes("root"));
+    expect(seatCalls.every((call) => call.args[call.args.indexOf("--user") + 1] === "agent")).toBe(true);
+    const forwarder = calls.find((call) => call.args[0] === "exec" && call.args.includes("--detach"))!;
+    expect(forwarder.args.slice(-2)).toEqual(["8081", "gateway"]);
+    const turn = calls.find((call) => call.args.includes("codex"))!;
+    expect(turn.args).toContain("SHAREDNET_BASE_URL=http://127.0.0.1:8081");
+    // Codex is pointed at the gateway by its config (it reads no OPENAI_BASE_URL), and holds a placeholder for the key.
+    expect(turn.args.join(" ")).toContain('-c openai_base_url="http://gateway:8080/v1"');
+    expect(turn.args.find((arg) => arg.startsWith("OPENAI_API_KEY="))).toBe("OPENAI_API_KEY=sk-isolated-the-gateway-holds-the-key");
+    // The home of an image that has none is made as root, for the Agents' user.
+    expect(calls.some((call) => call.args.join(" ").includes("--user root") && call.args.join(" ").endsWith("mkdir -p /home/agents && chown agent /home/agents"))).toBe(true);
+
+    // The owner's key never reaches Docker; the invite travels by the client's environment, as before.
+    expect(calls.find((call) => call.args.includes("join"))!.env).toMatchObject({ SHAREDNET_INVITE_TOKEN: INVITE });
+    expect(calls.every((call) => !JSON.stringify(call).includes(OWNER_KEY))).toBe(true);
+
+    // The gateway's log goes into the record; the gateway and the network go with the containers.
+    expect(calls.filter((call) => call.args[0] === "cp" && call.args[1]!.startsWith(names.gateway)).map((call) => [call.args[1], call.args[2]])).toEqual([
+      [`${names.gateway}:/var/log/nginx/sharednet.log`, join(out, "gateway", "sharednet.log")],
+      [`${names.gateway}:/var/log/nginx/openai.log`, join(out, "gateway", "openai.log")],
+    ]);
+    expect(calls.some((call) => call.args.join(" ") === `logs ${names.gateway}`)).toBe(true);
+    expect(calls.slice(-3).map((call) => call.args.join(" "))).toEqual([
+      ["rm", "--force", ...runContainers(ROOM, plan.agents)].join(" "),
+      `rm --force ${names.gateway}`,
+      `network rm ${names.network}`,
+    ]);
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ isolated: true, agent_user: "agent", addresses: { "codex-1": "10.9.0.3" }, web_search: "off" });
   });
 });
 

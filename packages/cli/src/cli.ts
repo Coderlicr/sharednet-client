@@ -10,7 +10,7 @@ import { CliError, asCliError, localError } from "./errors.ts";
 import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner, type GuestDependencies } from "./guest.ts";
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
-import { dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type DockerRunner } from "./goal-run.ts";
+import { dockerRunner, isolationNames, parseAgents, prepareRun, runContainers, runGoal, type DockerRunner } from "./goal-run.ts";
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
@@ -132,7 +132,7 @@ const optionValueNames = new Set([
   "message-routing",
   "type",
 ]);
-const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate"]);
+const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate"]);
 
 /** Room mode is fixed at creation. Omission retains the service default. */
 function roomType(parsed: ParsedArguments): "board" | "compiled" | undefined {
@@ -572,7 +572,7 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing"]);
   const type = roomType(parsed);
   const messageRouting = option(parsed, "message-routing");
   if (messageRouting !== undefined && messageRouting !== "broadcast" && messageRouting !== "mentions") throw localError("invalid_arguments", "--message-routing must be broadcast or mentions.");
@@ -582,12 +582,17 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--mention-gate] [--task-gate] [--message-routing broadcast|mentions]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--mention-gate] [--task-gate] [--message-routing broadcast|mentions]",
     );
   }
-  const webSearch = option(parsed, "web-search") ?? "live";
+  const isolate = parsed.options.get("isolate") === true;
+  // An isolated run has no web: a harness's own search runs on its model provider's side, past any gateway.
+  const webSearch = option(parsed, "web-search") ?? (isolate ? "off" : "live");
   if (webSearch !== "live" && webSearch !== "off") {
     throw localError("invalid_arguments", "--web-search is live or off.");
+  }
+  if (isolate && webSearch === "live") {
+    throw localError("invalid_arguments", "--isolate keeps the Agents off the web, and a harness's own web search would reach it from the model provider's side: leave --web-search off.");
   }
   const turnLimitMs = parsed.options.has("turn-limit") ? parseDuration(option(parsed, "turn-limit"), "--turn-limit") : undefined;
   if (turnLimitMs !== undefined && turnLimitMs < 60_000) {
@@ -609,6 +614,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
       agents,
       image: option(parsed, "image") ?? null,
       agentUser: option(parsed, "agent-user") ?? null,
+      isolate,
       workspace,
       env: dependencies.env,
       home: dependencies.env.HOME ?? homedir(),
@@ -638,7 +644,8 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     dependencies.stderr(`goal: ${roomId} is open; the record goes to ${out}\n`);
     // Ctrl-C ends the run without leaving Agents at work in containers nobody watches.
     const interrupt = () => {
-      spawnSync("docker", ["rm", "--force", ...runContainers(roomId, plan.agents)]);
+      spawnSync("docker", ["rm", "--force", ...runContainers(roomId, plan.agents), ...(plan.isolation ? [isolationNames(roomId).gateway] : [])]);
+      if (plan.isolation) spawnSync("docker", ["network", "rm", isolationNames(roomId).network]);
       dependencies.stderr(`goal: stopped; the Agents' containers are gone and ${roomId} is still open\n`);
       process.exit(130);
     };
