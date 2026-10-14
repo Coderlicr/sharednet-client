@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join as joinPath, resolve as resolvePathFrom } from "node:path";
 
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
@@ -12,6 +12,7 @@ import { computeLocalInstanceKey } from "./instance-computation.ts";
 import { detectRuntime, type DetectedRuntime } from "./runtime-detection.ts";
 import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn, triggerTakesParameter, wakeIdentity, type Trigger } from "./triggers.ts";
 import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
+import { looksLikeServe, systemProcessProbe, type ProcessProbe } from "./process-identity.ts";
 import { chatOpen } from "./wake-claude.ts";
 import { codebuddyProgram } from "./wake-codebuddy.ts";
 import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
@@ -72,6 +73,14 @@ export interface GuestDependencies {
    * when it is addressed. Only the real process supplies it; without it, a join starts nothing.
    */
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
+  /** Whether a serve lock's pid is still the process that wrote it (process-identity.ts); tests replace it. */
+  processProbe?: ProcessProbe;
+  /** How often a running `serve` looks for seats joined since it started; tests shorten it. */
+  rescanMs?: number;
+  /** Tests pause a starter between finding a stale lock and acting on it, to order a race. */
+  lockPause?: () => Promise<void>;
+  /** Serve's start and each later look for seats go through this, handed the real read; tests wrap it. */
+  listSeats?: (read: () => Promise<StoredRoomCredential[]>) => Promise<StoredRoomCredential[]>;
 }
 
 export type CommandRunner = (
@@ -765,7 +774,7 @@ async function wakeAfterJoin(
   const plugin = pluginFor(wake.driver);
   const harness = plugin.label;
   let listen = plugin.listen?.(wake, seat.member_id) ?? null;
-  const status = (await readServeStatus(paths).catch(() => ({}))) as { running?: boolean; pid?: number; drives?: boolean; wake_protocol?: string };
+  const status = (await readServeStatus(paths, dependencies.processProbe).catch(() => ({}))) as { running?: boolean; pid?: number; drives?: boolean; wake_protocol?: string };
   let service: "running" | "started" | "not_started" | "outdated";
   let how: string;
   let pid: number | null = null;
@@ -2738,7 +2747,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   }
   const listen = listenOption === undefined ? 8787 : Number(listenOption);
   const paths = getStoragePaths(dependencies.env);
-  if (parsed.options.get("status") === true) return readServeStatus(paths);
+  if (parsed.options.get("status") === true) return readServeStatus(paths, dependencies.processProbe);
   if (parsed.options.get("stop") === true) return stopServe(paths, dependencies);
 
   const command = stringOption(parsed, "run");
@@ -2757,7 +2766,8 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   // would count what it never handled as handled, and that seat's next `wait` would miss it.
   const served = (seat: StoredRoomCredential) => (only ? only.has(seat.room_id) : true) && (command !== undefined || seat.wake !== undefined);
 
-  const held = await heldSeats(paths);
+  const listSeats = () => (dependencies.listSeats ? dependencies.listSeats(() => heldSeats(paths)) : heldSeats(paths));
+  const held = await listSeats();
   const seats = held.filter(served);
   if (seats.length === 0) {
     throw localError(
@@ -2779,8 +2789,16 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   /** What serve's start check doubted about a seat it drives anyway (`wake_warnings` in `serve --status`). */
   const wakeWarnings = new Map<string, string[]>();
   const inTurnOrder = sessionTurnOrder();
+  // Where start identities are read, this connector's lock records its own (from the source a later
+  // check reads) and a lock id of its own; elsewhere the lock is the pid alone, as before.
+  const probe = dependencies.processProbe ?? systemProcessProbe;
+  const hardened = probe.supported;
+  const identity = hardened ? probe.identity(process.pid) : null;
+  const lockId = hardened ? randomUUID() : undefined;
   const statusOf = (all: StoredRoomCredential[]): ServeStatus => ({
     pid: process.pid,
+    ...(identity !== null ? { start_identity: identity } : {}),
+    ...(lockId !== undefined ? { lock_id: lockId } : {}),
     started_at: started,
     rooms: [...new Set(all.map((seat) => seat.room_id))],
     drives: !command,
@@ -2794,7 +2812,8 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       ...(wakeWarnings.get(seatKey(seat))?.length ? { wake_warnings: wakeWarnings.get(seatKey(seat)) } : {}),
     })),
   });
-  const holder = await claimServe(paths, statusOf(seats));
+  const holder = hardened ? await claimServe(paths, statusOf(seats), probe, dependencies.lockPause) : await legacyClaimServe(paths, statusOf(seats));
+  const release = () => (lockId !== undefined ? releaseServe(paths, lockId) : legacyReleaseServe(paths));
   if (holder !== null) {
     throw localError(
       "serve_running",
@@ -2804,10 +2823,17 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
 
   // Serialize snapshots: two seats finishing together must not overwrite a newer state.
   let statusWrite = Promise.resolve();
+  /** Set once the seat loops are done: no look begins a seat, and no status is written, after it. */
+  let closing = false;
   const setHealth = (seat: StoredRoomCredential, state: "starting" | "listening" | "working" | "retrying" | "stopped", last_error?: string) => {
     tracked.set(seatKey(seat), seat);
     health.set(seatKey(seat), { state, ...(last_error ? { last_error } : {}), updated_at: dependencies.now().toISOString() });
-    statusWrite = statusWrite.then(() => writeServeStatus(paths, statusOf([...tracked.values()]))).catch(() => {
+    statusWrite = statusWrite.then(async () => {
+      // A status written once this connector is closing, or after its lock is no longer its own,
+      // would bring back a released lock or overwrite a successor's.
+      if (closing) return;
+      await writeServeStatus(paths, statusOf([...tracked.values()]));
+    }).catch(() => {
       // Health reporting must not stop message delivery or skip ownership cleanup.
       dependencies.stderr?.("serve: could not update seat status; on-disk health may be stale\n");
     });
@@ -2858,7 +2884,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       process.once("SIGTERM", stop);
     }
   } catch (error) {
-    await releaseServe(paths);
+    await release();
     throw error;
   }
 
@@ -3177,7 +3203,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const finished = new Promise<void>((resolve) => (finish = resolve));
   const begin = (seat: StoredRoomCredential) => {
     const key = `${seat.room_id}/${seat.member_id}`;
-    if (loops.has(key)) return false;
+    if (closing || loops.has(key)) return false;
     sitting.push(seat);
     live += 1;
     loops.set(
@@ -3196,23 +3222,27 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     return true;
   };
   for (const seat of seats) begin(seat);
-  let looking = false;
+  // A look still in flight when the loops are done must finish before the lock is given back: it
+  // could otherwise begin a seat, and write a status, after a successor has taken the lock.
+  let looking: Promise<void> | null = null;
   const rescan = setInterval(() => {
-    if (looking || stopping.signal.aborted) return;
-    looking = true;
-    void heldSeats(paths)
+    if (looking !== null || closing || stopping.signal.aborted) return;
+    looking = listSeats()
       .then(async (all) => {
+        if (closing) return;
         const fresh = all.filter(served).filter(begin);
         if (fresh.length === 0) return;
         dependencies.stderr?.(`serve: now also sitting in ${fresh.map((seat) => `${seat.room_id} as ${seat.name}`).join(", ")}\n`);
         await statusWrite;
       })
       .catch(() => undefined)
-      .finally(() => (looking = false));
-  }, RESCAN_MS);
+      .finally(() => (looking = null));
+  }, dependencies.rescanMs ?? RESCAN_MS);
   await finished;
-  await statusWrite;
   clearInterval(rescan);
+  closing = true;
+  await looking;
+  await statusWrite;
   if (doorbell !== null) {
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
@@ -3226,7 +3256,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     );
     await doorbell.close();
   }
-  await releaseServe(paths);
+  await release();
   if (failure !== null) throw failure;
   return { served: loops.size };
 }
@@ -3331,13 +3361,227 @@ type ServeStatus = {
   /** Capability of the running daemon, not the invoking CLI. */
   wake_protocol?: "wake-plugins-v1";
   seats?: Array<{ room_id: string; member_id: string; name: string; resumes: string | null; state?: string; last_error?: string; updated_at?: string; wake_warnings?: string[] }>;
+  /** The holder's start identity (process-identity.ts); absent where it is not read, or in an older file. */
+  start_identity?: string;
+  /** This connector's own lock, told apart from another connector even in the same process. */
+  lock_id?: string;
 };
 
 function serveStatusPath(paths: ReturnType<typeof getStoragePaths>): string {
   return joinPath(paths.configDir, "serve.json");
 }
 
-async function writeServeStatus(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus): Promise<void> {
+/*
+ * The serve lock. On Linux and macOS (process-identity.ts) it is hardened: a holder is known by its
+ * start identity and its lock id, a stale lock is reclaimed atomically, and only a verified holder is
+ * signalled. Elsewhere (Windows) the pid-only lock below, `legacy…`, is kept exactly as it was.
+ */
+
+/** A lock that is still this connector's: the status file carries its lock id. */
+async function ownsServe(paths: ReturnType<typeof getStoragePaths>, lockId: string): Promise<boolean> {
+  const raw = await readFile(serveStatusPath(paths), "utf8").catch(() => null);
+  return raw !== null && parseServeStatus(raw)?.lock_id === lockId;
+}
+
+/**
+ * Writes this connector's status, only while the lock is still its own: never over a successor's
+ * lock, and never bringing back a lock that was released. False when it was not written.
+ */
+async function writeServeStatus(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus): Promise<boolean> {
+  if (status.lock_id === undefined) {
+    await legacyWriteServeStatus(paths, status);
+    return true;
+  }
+  if (!(await ownsServe(paths, status.lock_id))) return false;
+  // Only the holder writes (checked just above), so one name per process is enough.
+  const temporary = `${serveStatusPath(paths)}.${process.pid}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(status)}\n`, { mode: 0o600 });
+  await rename(temporary, serveStatusPath(paths));
+  return true;
+}
+
+/** Creates `path` with `content` only if nothing is there, whole or not at all (write aside, then link). */
+async function createExclusive(path: string, content: string): Promise<boolean> {
+  const temporary = `${path}.${randomUUID()}.new`;
+  await writeFile(temporary, content, { mode: 0o600, flag: "wx" });
+  try {
+    await link(temporary, path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  } finally {
+    await unlink(temporary).catch(() => undefined);
+  }
+}
+
+/**
+ * Takes the storage root's one connector slot: null when it is now this connector's, or the pid of
+ * the connector that holds it (0 while one is starting or reclaiming). Another connector in this
+ * same process is another holder, told apart by its lock id, not by the pid.
+ *
+ * A stale lock (holder gone, its pid now another process, or a damaged file) is never deleted by its
+ * name: that raced, since two starters could read the same stale file, one replace it, and the
+ * other's already-decided delete remove the fresh lock. A reclaim of a given stale lock first creates
+ * a one-time token named for it (exclusive: one starter wins), checks the lock is still exactly the
+ * bytes it read, and replaces it with one rename. A token whose creator died is passed over for the
+ * next, never deleted while it could matter.
+ */
+async function claimServe(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus, probe: ProcessProbe, pause?: () => Promise<void>): Promise<number | null> {
+  await mkdir(paths.configDir, { recursive: true, mode: 0o700 });
+  const path = serveStatusPath(paths);
+  const content = `${JSON.stringify(status)}\n`;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    if (await createExclusive(path, content)) return null;
+    let raw: string;
+    try {
+      raw = await readFile(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    const current = parseServeStatus(raw);
+    if (current !== null) {
+      if (current.lock_id !== undefined && current.lock_id === status.lock_id) return null;
+      if (holderOf(current, probe).live) return current.pid;
+    }
+    await pause?.();
+    const reclaimed = await reclaimServe(path, raw, current, content, probe);
+    if (reclaimed === "won") return null;
+    if (reclaimed === "busy") return 0;
+  }
+  return 0;
+}
+
+async function reclaimServe(path: string, raw: string, stale: ServeStatus | null, content: string, probe: ProcessProbe): Promise<"won" | "busy" | "retry"> {
+  const key = stale?.lock_id && /^[A-Za-z0-9-]{1,64}$/.test(stale.lock_id) ? stale.lock_id : createHash("sha256").update(raw).digest("hex").slice(0, 32);
+  const me = probe.identity(process.pid);
+  const claim = `${JSON.stringify({ pid: process.pid, started_at: new Date(0).toISOString(), rooms: [], ...(me !== null ? { start_identity: me } : {}) })}\n`;
+  let token: string | null = null;
+  for (let index = 0; index < 16 && token === null; index += 1) {
+    const candidate = `${path}.reclaim.${key}.${index}`;
+    if (await createExclusive(candidate, claim)) {
+      token = candidate;
+      break;
+    }
+    const creator = parseServeStatus((await readFile(candidate, "utf8").catch(() => null)) ?? "");
+    // A reclaim by a starter that may still be alive is that starter's to finish.
+    if (creator === null || holderOf(creator, probe).live) return "busy";
+  }
+  if (token === null) return "busy";
+  try {
+    const now = await readFile(path, "utf8").catch((error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? null : Promise.reject(error)));
+    if (now !== raw) return now === null ? "retry" : "busy";
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    await writeFile(temporary, content, { mode: 0o600 });
+    await rename(temporary, path);
+    return "won";
+  } finally {
+    // Tokens for a lock that is no longer the current one cannot win anything: a late starter that
+    // makes one again finds the lock changed and stops.
+    for (let index = 0; index < 16; index += 1) await unlink(`${path}.reclaim.${key}.${index}`).catch(() => undefined);
+  }
+}
+
+/** Gives the slot back, if it is still this connector's. */
+async function releaseServe(paths: ReturnType<typeof getStoragePaths>, lockId: string): Promise<void> {
+  if (await ownsServe(paths, lockId)) await unlink(serveStatusPath(paths)).catch(() => undefined);
+}
+
+/**
+ * A status file as stored, keeping only the fields a connector writes, each of its own type. What
+ * `serve --status` adds (running, verified, the holder check, a reason) is computed, never read: a
+ * file that says `"running": true, "verified": true` cannot vouch for itself. Null when the file is
+ * damaged or names no pid.
+ */
+function parseServeStatus(raw: string): ServeStatus | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null) return null;
+  const stored = value as Record<string, unknown>;
+  if (typeof stored.pid !== "number" || !Number.isSafeInteger(stored.pid) || stored.pid <= 0) return null;
+  const text = (field: unknown) => (typeof field === "string" ? field : undefined);
+  return {
+    pid: stored.pid,
+    started_at: text(stored.started_at) ?? "",
+    rooms: Array.isArray(stored.rooms) ? stored.rooms.filter((room): room is string => typeof room === "string") : [],
+    ...(typeof stored.drives === "boolean" ? { drives: stored.drives } : {}),
+    ...(stored.wake_protocol === "wake-plugins-v1" ? { wake_protocol: "wake-plugins-v1" as const } : {}),
+    ...(Array.isArray(stored.seats) ? { seats: stored.seats as NonNullable<ServeStatus["seats"]> } : {}),
+    ...(text(stored.start_identity) !== undefined ? { start_identity: text(stored.start_identity)! } : {}),
+    ...(text(stored.lock_id) !== undefined ? { lock_id: text(stored.lock_id)! } : {}),
+  };
+}
+
+/**
+ * Whether the pid in a status file is still the listener that wrote it:
+ * - verified: alive (EPERM counts: someone else's process) and its start identity is exactly the one
+ *   recorded. Only a verified holder may be signalled.
+ * - unverified: alive, but its identity cannot be read now. It still holds the lock.
+ * - argv: a file from before identities whose live pid reads as a sharednet serve (or cannot be
+ *   read). It holds the lock, so a start is refused; that is a presumption, never a reason to signal.
+ * - otherwise stale: gone, or its pid now another process.
+ */
+function holderOf(status: ServeStatus, probe: ProcessProbe): { live: boolean; verified: boolean; holder: "start_identity" | "unverified" | "argv"; why?: string } {
+  const recorded = status.start_identity !== undefined;
+  if (!probe.alive(status.pid)) return { live: false, verified: false, holder: recorded ? "start_identity" : "argv", why: "the process that wrote this status is gone" };
+  if (recorded) {
+    const now = probe.identity(status.pid);
+    if (now === status.start_identity) return { live: true, verified: true, holder: "start_identity" };
+    if (now === null) return { live: true, verified: false, holder: "unverified", why: `pid ${status.pid} is alive but its start identity cannot be read now, so it still holds the lock and is not signalled` };
+    return { live: false, verified: false, holder: "start_identity", why: `pid ${status.pid} is now another process (its start identity differs); the listener that wrote this status is gone` };
+  }
+  const argv = probe.argv(status.pid);
+  if (argv === null) return { live: true, verified: false, holder: "unverified", why: `pid ${status.pid} is alive and this status predates start identities; its command cannot be read, so it still holds the lock and is not signalled` };
+  return looksLikeServe(argv)
+    ? { live: true, verified: false, holder: "argv", why: `this status predates start identities; pid ${status.pid} reads as a sharednet serve, which holds the lock, but it cannot be verified as the listener, so it is not signalled` }
+    : { live: false, verified: false, holder: "argv", why: `pid ${status.pid} is not a sharednet serve (this status predates start identities, and its command does not name sharednet serve)` };
+}
+
+/** `running` is checked, not claimed: a status file outlives the process that wrote it. */
+async function readServeStatus(paths: ReturnType<typeof getStoragePaths>, probe: ProcessProbe = systemProcessProbe): Promise<unknown> {
+  if (!probe.supported) return legacyReadServeStatus(paths);
+  let raw: string;
+  try {
+    raw = await readFile(serveStatusPath(paths), "utf8");
+  } catch {
+    return { running: false, verified: false, reason: "no connector has been started on this machine" };
+  }
+  const status = parseServeStatus(raw);
+  if (status === null) return { running: false, verified: false, reason: "the status file is damaged" };
+  const checked = holderOf(status, probe);
+  // The stored fields first, the computed verdict last: nothing stored can override it.
+  return { ...status, running: checked.live, verified: checked.verified, holder_check: checked.holder, ...(checked.why ? { reason: checked.why } : {}) };
+}
+
+/** Stops the listener holding the slot: only an exact, verified holder is ever signalled. */
+async function stopServe(paths: ReturnType<typeof getStoragePaths>, dependencies: GuestDependencies): Promise<unknown> {
+  const probe = dependencies.processProbe ?? systemProcessProbe;
+  if (!probe.supported) return legacyStopServe(paths, dependencies);
+  const status = (await readServeStatus(paths, probe)) as { running: boolean; verified: boolean; pid?: number; start_identity?: string; reason?: string };
+  if (!status.running || !status.verified || !status.pid || status.start_identity === undefined) {
+    // Never a signal to a pid that is not verifiably the listener: after a reboot it can be anyone's.
+    return {
+      stopped: false,
+      ...(status.pid ? { pid: status.pid } : {}),
+      reason: status.running && status.pid ? `${status.reason}. Nothing was signalled; if pid ${status.pid} is the listener, stop it yourself.` : (status.reason ?? "no connector is running on this machine"),
+    };
+  }
+  // Read once more right before the signal: the holder must still be that exact process.
+  if (probe.identity(status.pid) !== status.start_identity) return { stopped: false, pid: status.pid, reason: `pid ${status.pid} changed before it could be signalled; nothing was signalled` };
+  process.kill(status.pid, "SIGTERM");
+  dependencies.stderr?.(`serve: asked pid ${status.pid} to stop\n`);
+  return { stopped: true, pid: status.pid };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The pid-only lock, unchanged, for platforms without an identity source (Windows).
+
+async function legacyWriteServeStatus(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus): Promise<void> {
   await mkdir(paths.configDir, { recursive: true, mode: 0o700 });
   const temporary = `${serveStatusPath(paths)}.${process.pid}.tmp`;
   await writeFile(temporary, `${JSON.stringify(status)}\n`, { mode: 0o600 });
@@ -3348,7 +3592,7 @@ async function writeServeStatus(paths: ReturnType<typeof getStoragePaths>, statu
  * Takes the machine's one connector slot: null when it is now this process's, or the pid of the
  * live connector that holds it. A slot whose process is gone is taken over.
  */
-async function claimServe(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus): Promise<number | null> {
+async function legacyClaimServe(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus): Promise<number | null> {
   await mkdir(paths.configDir, { recursive: true, mode: 0o700 });
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
@@ -3359,7 +3603,7 @@ async function claimServe(paths: ReturnType<typeof getStoragePaths>, status: Ser
     }
     let holder: { running?: boolean; pid?: number };
     try {
-      holder = (await readServeStatus(paths)) as { running?: boolean; pid?: number };
+      holder = (await legacyReadServeStatus(paths)) as { running?: boolean; pid?: number };
     } catch {
       // Being written this moment by a connector that is starting.
       return 0;
@@ -3372,13 +3616,13 @@ async function claimServe(paths: ReturnType<typeof getStoragePaths>, status: Ser
 }
 
 /** Gives the slot back, if it is still this process's. */
-async function releaseServe(paths: ReturnType<typeof getStoragePaths>): Promise<void> {
-  const status = (await readServeStatus(paths).catch(() => null)) as { pid?: number } | null;
+async function legacyReleaseServe(paths: ReturnType<typeof getStoragePaths>): Promise<void> {
+  const status = (await legacyReadServeStatus(paths).catch(() => null)) as { pid?: number } | null;
   if (status?.pid === process.pid) await unlink(serveStatusPath(paths)).catch(() => undefined);
 }
 
 /** `running` is checked, not claimed: a status file outlives the process that wrote it. */
-async function readServeStatus(paths: ReturnType<typeof getStoragePaths>): Promise<unknown> {
+async function legacyReadServeStatus(paths: ReturnType<typeof getStoragePaths>): Promise<unknown> {
   let raw: string;
   try {
     raw = await readFile(serveStatusPath(paths), "utf8");
@@ -3396,8 +3640,8 @@ async function readServeStatus(paths: ReturnType<typeof getStoragePaths>): Promi
   return { running, ...status, ...(running ? {} : { reason: "the process that wrote this status is gone" }) };
 }
 
-async function stopServe(paths: ReturnType<typeof getStoragePaths>, dependencies: GuestDependencies): Promise<unknown> {
-  const status = (await readServeStatus(paths)) as { running?: boolean; pid?: number };
+async function legacyStopServe(paths: ReturnType<typeof getStoragePaths>, dependencies: GuestDependencies): Promise<unknown> {
+  const status = (await legacyReadServeStatus(paths)) as { running?: boolean; pid?: number };
   if (!status.running || !status.pid) return { stopped: false, reason: "no connector is running on this machine" };
   process.kill(status.pid, "SIGTERM");
   dependencies.stderr?.(`serve: asked pid ${status.pid} to stop\n`);

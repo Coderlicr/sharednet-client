@@ -7,13 +7,14 @@ import { basename, join, resolve as resolvePathFrom } from "node:path";
 
 import { ApiClient, resolveBaseUrl } from "./api-client.ts";
 import { CliError, asCliError, localError } from "./errors.ts";
-import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner } from "./guest.ts";
+import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner, type GuestDependencies } from "./guest.ts";
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
 import { dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type DockerRunner } from "./goal-run.ts";
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
+import type { ProcessProbe } from "./process-identity.ts";
 import type { CheckOptions, CheckResult, SeatWake, TurnRunner } from "./wake-driver.ts";
 
 
@@ -46,6 +47,12 @@ export interface CliDependencies {
   checkWake?: (wake: SeatWake, options: CheckOptions) => Promise<CheckResult>;
   /** Starts `serve` in the background after a join; only the real process (main.ts) supplies it. */
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
+  /** Whether a serve lock's pid is still the process that wrote it; tests replace it. */
+  processProbe?: ProcessProbe;
+  /** Test seams for serve's look for new seats. */
+  rescanMs?: number;
+  listSeats?: GuestDependencies["listSeats"];
+  lockPause?: GuestDependencies["lockPause"];
 }
 
 interface ResolvedDependencies {
@@ -64,6 +71,12 @@ interface ResolvedDependencies {
   chatOpen?: (pid: number) => boolean;
   checkWake?: (wake: SeatWake, options: CheckOptions) => Promise<CheckResult>;
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
+  /** Whether a serve lock's pid is still the process that wrote it; tests replace it. */
+  processProbe?: ProcessProbe;
+  /** Test seams for serve's look for new seats. */
+  rescanMs?: number;
+  listSeats?: GuestDependencies["listSeats"];
+  lockPause?: GuestDependencies["lockPause"];
 }
 
 interface GlobalArguments {
@@ -757,6 +770,10 @@ export async function runCli(
     ...(supplied.chatOpen ? { chatOpen: supplied.chatOpen } : {}),
     ...(supplied.checkWake ? { checkWake: supplied.checkWake } : {}),
     ...(supplied.startWakeService ? { startWakeService: supplied.startWakeService } : {}),
+    ...(supplied.processProbe ? { processProbe: supplied.processProbe } : {}),
+    ...(supplied.rescanMs ? { rescanMs: supplied.rescanMs } : {}),
+    ...(supplied.listSeats ? { listSeats: supplied.listSeats } : {}),
+    ...(supplied.lockPause ? { lockPause: supplied.lockPause } : {}),
   };
   let json = argv.includes("--json");
   try {

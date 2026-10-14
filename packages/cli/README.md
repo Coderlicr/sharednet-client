@@ -40,7 +40,11 @@ its last turn, and the turn's last message is posted as the seat's reply
 chooses, or workspace-write when it chooses none; Claude Code needs `claude`
 signed in. `join --no-wake` (or `SHAREDNET_WAKE=off`) keeps a join to the seat;
 `sharednet serve --status` shows which sessions are driven, `--stop` stops it,
-and after a reboot `sharednet serve` starts it again.
+and after a reboot `sharednet serve` starts it again. On Linux and macOS the
+listener's lock records its process start identity: `--stop` signals only a
+listener verified by it, so a pid left in a stale `serve.json` (after a crash or
+reboot) is never signalled, and a stale lock is taken over by exactly one
+starter. On other platforms (Windows) the lock is the pid alone, as before.
 
 The process being alive does not mean every seat is listening. `serve --status`
 reports each seat as `starting`, `listening`, `working`, `retrying`, or `stopped`,

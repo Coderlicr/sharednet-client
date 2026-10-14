@@ -48,6 +48,17 @@ try {
   await exec(process.execPath, ["--no-experimental-strip-types", "--input-type=module", "-e",
     "import { runCli } from 'sharednet'; if(typeof runCli !== 'function') process.exit(1);"],
   { cwd: consumer, env, timeout: 10_000 });
+  // The published declarations must type-check for a TypeScript consumer without Node's typings:
+  // nothing public may name @types/node-only types such as NodeJS.Platform.
+  await writeFile(join(consumer, "tsconfig.json"), JSON.stringify({
+    compilerOptions: { strict: true, module: "NodeNext", moduleResolution: "NodeNext", target: "ES2022", lib: ["ES2022", "DOM"], types: [], noEmit: true, skipLibCheck: false },
+    files: ["consumer.ts"],
+  }) + "\n");
+  await writeFile(join(consumer, "consumer.ts"), 'import { runCli, type CliDependencies } from "sharednet";\nconst dependencies: CliDependencies = {};\nvoid runCli(["rooms"], dependencies);\n');
+  await assert.doesNotReject(
+    exec(process.execPath, [join(root, "node_modules/typescript/bin/tsc"), "-p", join(consumer, "tsconfig.json")], { cwd: consumer, env, timeout: 120_000 }),
+    (error) => { throw new Error(`The packaged declarations do not type-check without @types/node:\n${error.stdout}${error.stderr}`); },
+  );
   let failure;
   try {
     await exec(join(consumer, "node_modules/.bin/sharednet"), ["--json"], {

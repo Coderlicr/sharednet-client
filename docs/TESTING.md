@@ -5,7 +5,7 @@
 | Export audit | `pnpm check:export` | Explicit file allowlist, private-path denylist, CLI ESM import boundaries and symlink refusal |
 | Types | `pnpm typecheck` | Compiled CLI source typechecks |
 | Tests | `pnpm test` | All client unit tests, executable Skill read examples, export checker negative cases, real-process wait test |
-| Package | `pnpm test:package` | Real tarball installs offline without install scripts; exports and executable work without TS stripping; artifact SHA-256 recorded |
+| Package | `pnpm test:package` | Real tarball installs offline without install scripts; exports and executable work without TS stripping; its declarations type-check in a consumer without `@types/node`; artifact SHA-256 recorded |
 | Secrets | `gitleaks git . --redact --no-banner` | Complete committed history, default detectors plus SharedNet capability detector |
 
 CI runs on Ubuntu with Node 22.18.0, 24.x and 26.x. The local development
