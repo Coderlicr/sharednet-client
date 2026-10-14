@@ -5,22 +5,42 @@ import { checkFromSteps, skipRest, type CheckOptions, type CheckResult, type Che
  *
  * Manus is a cloud agent, so there is no program to resume. A task is continued over its REST API (v2,
  * https://open.manus.ai/docs/v2/introduction): `POST /v2/task.sendMessage` hands it the lines, and the
- * reply is read by polling `GET /v2/task.listMessages` until the task's agent status leaves `running`
- * (https://open.manus.ai/docs/v2/task-lifecycle). Webhooks need a public address, which a laptop has
- * not, so this polls: with a growing delay, for no longer than the seat's wake limit (context.timeoutMs,
- * at most 2 hours), and it stops at the first terminal state. A seat without a task id starts a fresh task per wake (`POST /v2/task.create`).
+ * reply is read by polling `GET /v2/task.listMessages` and `GET /v2/task.detail`, as the lifecycle guide
+ * prescribes (https://open.manus.ai/docs/v2/task-lifecycle). Webhooks need a public address, which a laptop
+ * has not, so this polls. A seat without a task id starts a fresh task per wake (`POST /v2/task.create`).
+ *
+ * Lifecycle rules from that guide, and what this does with each:
+ * - `stopped` is not final. `task.detail.has_running_background_jobs` decides: `true` keeps polling, `false`
+ *   lets the result be consumed, and an omitted field is unknown (a later read may fill it), so it keeps
+ *   polling too. The same read is made before sending into a task that is already stopped.
+ * - `waiting` has three cases. `messageAskUser`/`cascadeAskUser` are answered with an ordinary message
+ *   (`task.sendMessage`), which is what the next wake does. An action confirmation is a `task.confirmAction`
+ *   decision that approves a side effect (a command, an email, a deploy); it is never made from a Room, and
+ *   a message sent into it would skip the action, so nothing is sent while one is pending. Any other type
+ *   is not dispatched either. The reply says which case it is.
+ * - A reply's Markdown links are rendered as https://open.manus.ai/docs/v2/attachments says: http(s) kept,
+ *   a path that matches an attachment named (never linked, a link in a Room is readable by all of it), any
+ *   other destination removed.
  *
  * The key (`x-manus-api-key`) is read at delivery time from the environment variable the wake names
- * (`api_key_env`, default MANUS_API_KEY) in the process that runs `serve`. It is never written to the
- * seat file. The wake's `command` holds the API address, https only (or loopback, for a stand-in).
+ * (`api_key_env`, default MANUS_API_KEY) in the process that runs `serve`; serve hands this plugin that one
+ * variable and withholds it from every program it starts (wake-driver.ts withholdSecretEnv). It is never
+ * written to the seat file. The key is only ever sent to https://api.manus.ai (a loopback stand-in needs
+ * SHAREDNET_MANUS_ALLOW_LOOPBACK=1), and a redirect is an error, not followed.
+ *
+ * Every request, sleep and page of reading is bounded by the one delivery deadline (the seat's wake limit,
+ * at most two hours) and by serve's stop signal.
  *
  * Race handled here: right after `sendMessage` a task may still read `stopped` from its previous run, so
- * the status is only trusted from events newer than the newest one seen before sending, and only once
- * this wake's own message (or a `running` status) has appeared.
+ * the status is only trusted from events newer than the newest one seen before sending, and only once this
+ * wake's own message (or a `running` status) has appeared. That marker's time is kept once seen, and
+ * reading pages back through the events until it, so a long run cannot push it out of view.
  */
 
 export const MANUS_API = "https://api.manus.ai";
 export const MANUS_KEY_ENV = "MANUS_API_KEY";
+/** A stand-in on this machine may take the key only when the person says so. */
+export const ALLOW_LOOPBACK_ENV = "SHAREDNET_MANUS_ALLOW_LOOPBACK";
 const RETRY_MS = 30_000;
 const RATE_LIMIT_RETRY_MS = 60_000;
 /** Polls start at 3 s and back off by half again each time, up to 30 s: about 100 reads in 40 minutes, far under 100 a minute. */
@@ -31,19 +51,42 @@ const POLL_MAX_MS = 30_000;
  * task still working after it is left running and linked, not watched.
  */
 const MAX_WAIT_MS = 2 * 60 * 60_000;
+/** One request; it is also cut to what is left of the delivery. */
 const REQUEST_MS = 30_000;
+const CHECK_BUDGET_MS = 20_000;
 /** Consecutive failed polls tolerated before the wake is given up (the task itself keeps running). */
 const POLL_FAILURES = 5;
-/** Manus takes about 5,000 estimated tokens of text per message; longer is a 400. This stays well under. */
-const PROMPT_CHARS = 12_000;
+/** Pages of events read back in one poll (100 each) while looking for this wake's marker. */
+const MAX_PAGES = 20;
+/** How often an omitted `has_running_background_jobs` is asked again before sending into a stopped task. */
+const UNKNOWN_JOBS_READS = 3;
+const UNKNOWN_JOBS_WAIT_MS = 2_000;
+/**
+ * Manus takes about 5,000 estimated tokens of text per message and answers longer with a 400. Tokens are
+ * estimated by script, not by character count: about 3 characters a token for ASCII (dense code) and 1.5
+ * tokens a character for anything else (Chinese, Japanese), a deliberate overestimate, then held to 70%.
+ */
+const MAX_PROMPT_TOKENS = 3_500;
+const HEAD_TOKENS = 800;
+
+interface ManusAttachment {
+  filename?: string;
+  path?: string;
+}
+
+interface StatusDetail {
+  waiting_for_event_id?: string;
+  waiting_for_event_type?: string;
+  waiting_description?: string;
+}
 
 interface ManusEvent {
   id?: string;
   type?: string;
   timestamp?: number;
-  assistant_message?: { content?: string; delivery_kind?: string; attachments?: Array<{ filename?: string }> };
+  assistant_message?: { content?: string; delivery_kind?: string; attachments?: ManusAttachment[] };
   error_message?: { content?: string };
-  status_update?: { agent_status?: string; status_detail?: { waiting_for_event_type?: string; waiting_description?: string } };
+  status_update?: { agent_status?: string; status_detail?: StatusDetail };
 }
 
 type Answer = { ok: true; body: Record<string, any> } | { ok: false; status: number; code: string; message: string };
@@ -52,17 +95,21 @@ export function keyEnvOf(wake: SeatWake): string {
   return wake.api_key_env ?? MANUS_KEY_ENV;
 }
 
-/** The API address of a wake, or why it may not carry a key: https, or a loopback stand-in. */
-export function apiBase(wake: SeatWake): { base: string } | { error: string } {
+/**
+ * The API address of a wake, or why it may not carry a key. The key goes only to the Manus API origin;
+ * a loopback stand-in is for tests and must be asked for in the environment.
+ */
+export function apiBase(wake: SeatWake, env: Environment = {}): { base: string } | { error: string } {
   let url: URL;
   try {
     url = new URL(wake.command);
   } catch {
     return { error: `${wake.command} is not an address; the Manus API is ${MANUS_API}` };
   }
-  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return { error: "the Manus API address must be https, so the key is not sent in the clear" };
-  return { base: url.origin };
+  if (url.origin === MANUS_API && url.username === "" && url.password === "") return { base: url.origin };
+  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) && (url.protocol === "http:" || url.protocol === "https:");
+  if (loopback && env[ALLOW_LOOPBACK_ENV]?.trim() === "1") return { base: url.origin };
+  return { error: `the Manus API key is only sent to ${MANUS_API}, not to ${url.origin} (a loopback stand-in needs ${ALLOW_LOOPBACK_ENV}=1)` };
 }
 
 /**
@@ -73,51 +120,141 @@ export function withoutBudget(prompt: string): string {
   return prompt.replace(/\n\nExecution budget:[^\n]*/, "");
 }
 
-/** The wake prompt cut to what one Manus message takes: its start (where it was addressed) and its end (what is asked). */
-export function fitPrompt(prompt: string): string {
-  if (prompt.length <= PROMPT_CHARS) return prompt;
-  const head = prompt.slice(0, 2_000);
-  const tail = prompt.slice(prompt.length - (PROMPT_CHARS - 2_000));
-  return `${head}\n[… middle of the room's lines cut to fit one Manus message; \`sharednet read\` has them …]\n${tail}`;
+/** A conservative token estimate by script (see MAX_PROMPT_TOKENS). */
+export function estimateTokens(text: string): number {
+  let ascii = 0;
+  let wide = 0;
+  for (const character of text) (character.codePointAt(0)! < 0x80 ? (ascii += 1) : (wide += 1));
+  return Math.ceil(ascii / 3 + wide * 1.5);
 }
 
-async function call(base: string, key: string, net: Required<PluginNet>, method: "GET" | "POST", path: string, params: Record<string, string> | Record<string, unknown>): Promise<Answer> {
+function weight(character: string): number {
+  return character.codePointAt(0)! < 0x80 ? 1 / 3 : 1.5;
+}
+
+function headWithin(text: string, tokens: number): string {
+  let used = 0;
+  let out = "";
+  for (const character of text) {
+    used += weight(character);
+    if (used > tokens) break;
+    out += character;
+  }
+  return out;
+}
+
+function tailWithin(text: string, tokens: number): string {
+  let used = 0;
+  const kept: string[] = [];
+  for (const character of [...text].reverse()) {
+    used += weight(character);
+    if (used > tokens) break;
+    kept.push(character);
+  }
+  return kept.reverse().join("");
+}
+
+/** The wake prompt cut to what one Manus message takes: its start (where it was addressed) and its end (what is asked). */
+export function fitPrompt(prompt: string): string {
+  if (estimateTokens(prompt) <= MAX_PROMPT_TOKENS) return prompt;
+  const mark = "\n[… middle of the room's lines cut to fit one Manus message; `sharednet read` has them …]\n";
+  return `${headWithin(prompt, HEAD_TOKENS)}${mark}${tailWithin(prompt, MAX_PROMPT_TOKENS - HEAD_TOKENS - estimateTokens(mark) - 1)}`;
+}
+
+/**
+ * Markdown links and images of an assistant message, as the attachments guide has a client render them:
+ * http(s) destinations stay; an absolute path that matches an attachment's `path` becomes the label with the
+ * file's name (no URL: the download link is signed and a Room's readers are many); anything else, including
+ * `manus-webdev://`, is removed as a node and the text around it stays.
+ */
+export function cleanLinks(text: string, attachments: ManusAttachment[] = []): string {
+  return text.replace(/(!?)\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g, (whole, _bang: string, label: string, destination: string) => {
+    if (/^https?:\/\//i.test(destination)) return whole;
+    let path = destination;
+    try {
+      path = decodeURIComponent(destination);
+    } catch {
+      // keep it as written
+    }
+    const file = path.startsWith("/") ? attachments.find((attachment) => attachment.path === path) : undefined;
+    return file ? `${label || file.filename || "file"} (attachment ${file.filename ?? "file"}, in the Manus task)` : "";
+  });
+}
+
+/** The delivery's limits, shared by every request and sleep of it. */
+interface Limits {
+  io: Required<PluginNet>;
+  deadline: number;
+  signal: AbortSignal | undefined;
+}
+
+const remaining = (limits: Limits) => limits.deadline - limits.io.now();
+const stopping = (limits: Limits) => limits.signal?.aborted === true;
+
+async function call(base: string, key: string, limits: Limits, method: "GET" | "POST", path: string, params: Record<string, string | number> | Record<string, unknown>): Promise<Answer> {
+  const left = remaining(limits);
+  if (stopping(limits)) return { ok: false, status: 0, code: "aborted", message: "serve is stopping" };
+  if (left <= 0) return { ok: false, status: 0, code: "deadline", message: "the delivery's time is spent" };
   const url = new URL(path, base);
-  const init: RequestInit = { method, headers: { "x-manus-api-key": key, accept: "application/json" }, signal: AbortSignal.timeout(REQUEST_MS) };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.min(REQUEST_MS, left));
+  const onStop = () => controller.abort();
+  limits.signal?.addEventListener("abort", onStop, { once: true });
+  // The key goes to this one origin, and a redirect is an error: it would carry the header elsewhere.
+  const init: RequestInit = { method, headers: { "x-manus-api-key": key, accept: "application/json" }, signal: controller.signal, redirect: "error" };
   if (method === "GET") for (const [name, value] of Object.entries(params)) url.searchParams.set(name, String(value));
   else {
     (init.headers as Record<string, string>)["content-type"] = "application/json";
     init.body = JSON.stringify(params);
   }
-  let response: Response;
   try {
-    response = await net.fetch(url, init);
-  } catch (error) {
-    return { ok: false, status: 0, code: "network", message: error instanceof Error ? error.message : String(error) };
+    let response: Response;
+    try {
+      response = await limits.io.fetch(url, init);
+    } catch (error) {
+      const why = stopping(limits) ? "serve is stopping" : controller.signal.aborted ? "no answer within the delivery's time" : error instanceof Error ? error.message : String(error);
+      return { ok: false, status: 0, code: stopping(limits) ? "aborted" : "network", message: why };
+    }
+    if (response.status >= 300 && response.status < 400) return { ok: false, status: response.status, code: "redirect", message: "Manus answered with a redirect, which is not followed" };
+    let body: Record<string, any> = {};
+    try {
+      body = (await response.json()) as Record<string, any>;
+    } catch {
+      // not JSON: keep the status
+    }
+    if (response.ok && body.ok !== false) return { ok: true, body };
+    const error = (body.error ?? {}) as { code?: string; message?: string };
+    return { ok: false, status: response.status, code: error.code ?? `http_${response.status}`, message: (error.message ?? `HTTP ${response.status}`).slice(0, 200) };
+  } finally {
+    clearTimeout(timer);
+    limits.signal?.removeEventListener("abort", onStop);
   }
-  let body: Record<string, any> = {};
-  try {
-    body = (await response.json()) as Record<string, any>;
-  } catch {
-    // not JSON: keep the status
-  }
-  if (response.ok && body.ok !== false) return { ok: true, body };
-  const error = (body.error ?? {}) as { code?: string; message?: string };
-  return { ok: false, status: response.status, code: error.code ?? `http_${response.status}`, message: (error.message ?? `HTTP ${response.status}`).slice(0, 200) };
 }
 
-function net(context: { api?: PluginNet } | undefined): Required<PluginNet> {
+function net(api: PluginNet | undefined): Required<PluginNet> {
   return {
-    fetch: context?.api?.fetch ?? globalThis.fetch,
-    sleep: context?.api?.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
-    now: context?.api?.now ?? Date.now,
+    fetch: api?.fetch ?? globalThis.fetch,
+    sleep:
+      api?.sleep ??
+      ((ms, signal) =>
+        new Promise<void>((resolve) => {
+          if (signal?.aborted) return resolve();
+          const done = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", done);
+            resolve();
+          };
+          const timer = setTimeout(done, ms);
+          signal?.addEventListener("abort", done, { once: true });
+        })),
+    now: api?.now ?? Date.now,
   };
 }
 
 /** A failed call as the delivery it should be: busy when nothing was lost and trying again may work, else failed. */
 function refused(answer: Extract<Answer, { ok: false }>, what: string, keyEnv: string, posted = false): Delivery {
   if (answer.status === 429) return { kind: "busy", why: `Manus rate limit on ${what}`, retryMs: RATE_LIMIT_RETRY_MS };
-  const unclear = answer.code === "network" || answer.status >= 500;
+  const unclear = answer.code === "network" || answer.code === "deadline" || answer.code === "aborted" || answer.status >= 500;
   // A read that failed lost nothing. A write that failed unclearly may have been taken: sending it again
   // could start a second task or ask twice (each costs credits), so it is reported instead of retried.
   if (unclear && !posted) return { kind: "busy", why: `Manus ${what} did not go through (${answer.message})`, retryMs: RETRY_MS };
@@ -128,32 +265,63 @@ function refused(answer: Extract<Answer, { ok: false }>, what: string, keyEnv: s
 
 const failed = (why: string): Delivery => ({ kind: "failed", why, detail: "", timedOut: false });
 
-/** The events of this wake's turn, oldest first: those after `baseline`, from our own message on. */
-function turnEvents(events: ManusEvent[], baseline: number): ManusEvent[] | null {
-  const fresh = events.filter((event) => typeof event.timestamp === "number" && event.timestamp > baseline).reverse();
-  const mine = fresh.find((event) => event.type === "user_message");
-  const running = fresh.find((event) => event.type === "status_update" && event.status_update?.agent_status === "running");
-  if (!mine && !running) return null;
-  const from = mine?.timestamp ?? running!.timestamp!;
-  return fresh.filter((event) => event.timestamp! >= from);
+/** What a pending `waiting` is, per https://open.manus.ai/docs/v2/task-lifecycle#handling-waiting-status. */
+type Waiting = { kind: "question" } | { kind: "confirmation"; type: string; description: string } | { kind: "unknown"; type: string };
+
+/** The action confirmations the guide lists; each is a `task.confirmAction` decision. */
+const CONFIRMATIONS = new Set([
+  "needConnectMyBrowser",
+  "gmailSendAction",
+  "outlookSendMailsAction",
+  "deployAction",
+  "terminalExecute",
+  "videoGenerate",
+  "apiHighCreditNotice",
+  "googleCalendarCreate",
+  "googleCalendarUpdate",
+  "googleCalendarDelete",
+  "outlookCalendarCreate",
+  "outlookCalendarUpdate",
+  "outlookCalendarDelete",
+  "shopifyAction",
+  "instagramCreateResult",
+  "metaMarketingAction",
+  "metaMarketingActionResult",
+  "selfConfigSaveAction",
+  "webdevRunAction",
+  "webdevRequestSecrets",
+  "connectorOauthExpired",
+  "mapreduceAction",
+]);
+
+export function classifyWaiting(detail: StatusDetail | undefined): Waiting {
+  const type = detail?.waiting_for_event_type;
+  if (type === "messageAskUser" || type === "cascadeAskUser") return { kind: "question" };
+  if (type && detail?.waiting_for_event_id && CONFIRMATIONS.has(type)) return { kind: "confirmation", type, description: (detail.waiting_description ?? "").slice(0, 160) };
+  return { kind: "unknown", type: type ?? "no type given" };
 }
 
-/** Reads a turn: still running (null), or how it ended. */
-function outcomeOf(turn: ManusEvent[]): { status: "stopped" | "waiting" | "error"; waiting?: string } | null {
-  const statuses = turn.filter((event) => event.type === "status_update");
-  const last = statuses[statuses.length - 1]?.status_update;
-  const status = last?.agent_status;
-  if (status === "stopped" || status === "error") return { status };
-  if (status === "waiting") return { status, waiting: last?.status_detail?.waiting_description ?? last?.status_detail?.waiting_for_event_type ?? "input" };
-  return null;
+function waitingNote(waiting: Waiting, link: string): string {
+  if (waiting.kind === "question") {
+    return `Manus asked this and is waiting. @-mention this seat with your answer: it is sent to the task as an ordinary message (task.sendMessage). ${link}`;
+  }
+  if (waiting.kind === "confirmation") {
+    return `Manus is waiting for your confirmation of an action (${waiting.type}${waiting.description ? `: ${waiting.description}` : ""}). That is a task.confirmAction decision, which this seat never makes from a Room: decide in Manus at ${link}. An @-mention here sends nothing while it is pending, because a message would skip the action.`;
+  }
+  return `Manus is waiting for something this seat does not recognise (${waiting.type}). Nothing was sent. Open the task in Manus: ${link}`;
+}
+
+/** The newest status event of a list, by time. */
+function latestStatus(events: ManusEvent[]): ManusEvent | undefined {
+  return events.filter((event) => event.type === "status_update" && typeof event.timestamp === "number").sort((a, b) => a.timestamp! - b.timestamp!).pop();
 }
 
 function replyOf(turn: ManusEvent[]): { text: string; files: string[] } | null {
   const said = turn.filter((event) => event.type === "assistant_message" && (event.assistant_message?.content ?? "").trim() !== "");
   const chosen = [...said].reverse().find((event) => event.assistant_message?.delivery_kind === "result") ?? said[said.length - 1];
   if (!chosen) return null;
-  const files = (chosen.assistant_message?.attachments ?? []).map((file) => file.filename ?? "file");
-  return { text: chosen.assistant_message!.content!.trim(), files };
+  const attachments = chosen.assistant_message?.attachments ?? [];
+  return { text: cleanLinks(chosen.assistant_message!.content!.trim(), attachments).trim(), files: attachments.map((file) => file.filename ?? "file") };
 }
 
 export const manusPlugin: WakePlugin = {
@@ -165,28 +333,47 @@ export const manusPlugin: WakePlugin = {
     const keyEnv = keyEnvOf(wake);
     const key = context.env[keyEnv]?.trim();
     if (!key) return failed(`${keyEnv} is not set in the environment of sharednet serve`);
-    const where = apiBase(wake);
+    const where = apiBase(wake, context.env);
     if ("error" in where) return failed(where.error);
-    const io = net(context);
-    const api = (method: "GET" | "POST", path: string, params: Record<string, string> | Record<string, unknown>) => call(where.base, key, io, method, path, params);
-    // The seat's wake limit (wake limit, 40 minutes by default) bounds the whole delivery, the lookups and the
-    // send included, and never more than MAX_WAIT_MS.
-    const deadline = io.now() + Math.min(context.timeoutMs, MAX_WAIT_MS);
+    const io = net(context.api);
+    // The seat's wake limit bounds the whole delivery, lookups and send included, and never more than MAX_WAIT_MS.
+    const budgetMs = Math.min(context.timeoutMs, MAX_WAIT_MS);
+    const limits: Limits = { io, deadline: io.now() + budgetMs, signal: context.signal };
+    const api = (method: "GET" | "POST", path: string, params: Record<string, string | number> | Record<string, unknown>) => call(where.base, key, limits, method, path, params);
     const message = { content: fitPrompt(withoutBudget(input.prompt)) };
+    const nap = (ms: number) => io.sleep(Math.min(ms, Math.max(0, remaining(limits))), limits.signal);
 
     let taskId = wake.session;
     let taskUrl: string | undefined;
     let baseline = 0;
     if (taskId) {
-      // A task that is working would take this message into its current run; leave the line for later instead.
       const detail = await api("GET", "/v2/task.detail", { task_id: taskId });
       if (!detail.ok) return refused(detail, "task lookup", keyEnv);
-      const task = (detail.body.task ?? {}) as { status?: string; task_url?: string };
+      let task = (detail.body.task ?? {}) as { status?: string; task_url?: string; has_running_background_jobs?: boolean };
       taskUrl = task.task_url;
+      // A task that is working would take this message into its current run; leave the line for later instead.
       if (task.status === "running") return { kind: "busy", why: "its Manus task is still running", retryMs: RETRY_MS };
-      const latest = await api("GET", "/v2/task.listMessages", { task_id: taskId, order: "desc", limit: 1 });
-      if (!latest.ok) return refused(latest, "message lookup", keyEnv);
-      baseline = Math.max(0, ...((latest.body.messages ?? []) as ManusEvent[]).map((event) => event.timestamp ?? 0));
+      if (task.status === "stopped") {
+        // A stopped task whose background work is still going may wake itself and change the results.
+        for (let read = 1; task.has_running_background_jobs === undefined && read <= UNKNOWN_JOBS_READS; read += 1) {
+          await nap(UNKNOWN_JOBS_WAIT_MS);
+          const again = await api("GET", "/v2/task.detail", { task_id: taskId });
+          if (!again.ok) return refused(again, "task lookup", keyEnv);
+          task = (again.body.task ?? task) as typeof task;
+        }
+        if (task.has_running_background_jobs === true) return { kind: "busy", why: "its Manus task has background work still running", retryMs: RETRY_MS };
+        // Still omitted after the reads: it is unknown, not false; the message is sent (an old task never reports it).
+      }
+      const recent = await api("GET", "/v2/task.listMessages", { task_id: taskId, order: "desc", limit: 100 });
+      if (!recent.ok) return refused(recent, "message lookup", keyEnv);
+      const events = (recent.body.messages ?? []) as ManusEvent[];
+      baseline = Math.max(0, ...events.map((event) => event.timestamp ?? 0));
+      // A message into a pending action confirmation would skip the action, and a question is the only waiting a message answers.
+      const status = latestStatus(events);
+      if (task.status === "waiting" || status?.status_update?.agent_status === "waiting") {
+        const waiting = classifyWaiting(status?.status_update?.status_detail);
+        if (waiting.kind !== "question") return failed(`${waitingNote(waiting, taskUrl ?? `https://manus.im/app/${taskId}`)} Nothing was sent.`);
+      }
       const sent = await api("POST", "/v2/task.sendMessage", { task_id: taskId, message });
       if (!sent.ok) return refused(sent, "send", keyEnv, true);
     } else {
@@ -197,58 +384,106 @@ export const manusPlugin: WakePlugin = {
       taskUrl = typeof created.body.task_url === "string" ? created.body.task_url : undefined;
     }
     const link = taskUrl ?? `https://manus.im/app/${taskId}`;
+    const minutes = Math.max(1, Math.round(budgetMs / 60_000));
+    let unsettled = "";
+    const spent = () => failed(`Manus is still working after ${minutes} minutes (this seat's wake limit${unsettled ? `; ${unsettled}` : ""}); the task keeps running at ${link}`);
+
+    // Reads this wake's events back through the pages, newest first, until the floor: the marker time once
+    // known, else the baseline. The marker is kept in `anchor`, so it cannot be lost to later events.
+    let anchor: number | null = null;
+    const readNew = async (): Promise<{ events: ManusEvent[] } | { error: Extract<Answer, { ok: false }> }> => {
+      const floor = anchor ?? baseline;
+      const events: ManusEvent[] = [];
+      let cursor: string | undefined;
+      for (let page = 0; page < MAX_PAGES; page += 1) {
+        const read = await api("GET", "/v2/task.listMessages", { task_id: taskId!, order: "desc", limit: 100, ...(cursor ? { cursor } : {}) });
+        if (!read.ok) return { error: read };
+        const got = (read.body.messages ?? []) as ManusEvent[];
+        events.push(...got);
+        const oldest = Math.min(Infinity, ...got.map((event) => event.timestamp ?? Infinity));
+        if (!read.body.has_more || typeof read.body.next_cursor !== "string" || got.length === 0 || oldest <= floor) break;
+        cursor = read.body.next_cursor;
+      }
+      return { events };
+    };
 
     let failures = 0;
     let interval = POLL_FIRST_MS;
     for (;;) {
-      const left = deadline - io.now();
-      if (left <= 0) return failed(`Manus is still working after ${Math.max(1, Math.round(Math.min(context.timeoutMs, MAX_WAIT_MS) / 60_000))} minutes (this seat's wake limit); the task keeps running at ${link}`);
-      await io.sleep(Math.min(interval, left));
+      if (stopping(limits)) return failed(`serve was stopping while Manus was working; the task keeps running at ${link}`);
+      const left = remaining(limits);
+      if (left <= 0) return spent();
+      await io.sleep(Math.min(interval, left), limits.signal);
       interval = Math.min(Math.round(interval * 1.5), POLL_MAX_MS);
-      const page = await api("GET", "/v2/task.listMessages", { task_id: taskId, order: "desc", limit: 100 });
-      if (!page.ok) {
+      if (stopping(limits)) return failed(`serve was stopping while Manus was working; the task keeps running at ${link}`);
+      const read = await readNew();
+      if ("error" in read) {
+        const page = read.error;
+        if (page.code === "deadline") return spent();
+        if (page.code === "aborted") continue;
         if (page.status === 401 || page.status === 404) return refused(page, "reading the reply", keyEnv);
         if (++failures >= POLL_FAILURES) return failed(`Manus could not be read after the message was sent (${page.message}); the task may still answer at ${link}`);
-      } else {
-        failures = 0;
-        const turn = turnEvents((page.body.messages ?? []) as ManusEvent[], baseline);
-        const ended = turn ? outcomeOf(turn) : null;
-        if (turn && ended) {
-          // Stopped, waiting or failed is the end: stop reading as soon as it shows. The one exception is a
-          // stop with nothing said yet while background work is still running, which may still say it.
-          if (ended.status === "stopped" && !replyOf(turn)) {
-            const detail = await api("GET", "/v2/task.detail", { task_id: taskId });
-            if (detail.ok && detail.body.task?.has_running_background_jobs === true) continue;
-          }
-          if (ended.status === "error") {
-            const problem = turn.filter((event) => event.type === "error_message").pop()?.error_message?.content;
-            return failed(`its Manus task failed${problem ? `: ${problem.slice(0, 160)}` : ""} (${link})`);
-          }
-          const reply = replyOf(turn);
-          if (!reply) return failed(`its Manus task ${ended.status === "waiting" ? "is waiting" : "finished"} without a message (${link})`);
-          const notes = [
-            ...(reply.files.length > 0 ? [`Manus attached ${reply.files.join(", ")}; they are in the task: ${link}`] : []),
-            ...(ended.status === "waiting" ? [`Manus is waiting for ${ended.waiting}; answer by @-mentioning this seat, or open ${link}`] : []),
-          ];
-          return { kind: "replied", reply: [reply.text, ...notes.map((note) => `(${note})`)].join("\n\n") };
-        }
+        continue;
       }
+      failures = 0;
+      const fresh = read.events
+        .filter((event) => typeof event.timestamp === "number" && event.timestamp > baseline)
+        .reverse();
+      if (anchor === null) {
+        const mine = fresh.find((event) => event.type === "user_message");
+        const running = fresh.find((event) => event.type === "status_update" && event.status_update?.agent_status === "running");
+        if (!mine && !running) continue;
+        anchor = (mine ?? running)!.timestamp!;
+      }
+      const turn = fresh.filter((event) => event.timestamp! >= anchor!);
+      const end = latestStatus(turn);
+      const state = end?.status_update?.agent_status;
+      if (state === "error") {
+        const problem = turn.filter((event) => event.type === "error_message").pop()?.error_message?.content;
+        return failed(`its Manus task failed${problem ? `: ${problem.slice(0, 160)}` : ""} (${link})`);
+      }
+      if (state === "stopped") {
+        // Stopped is not final: background work may still change the result. Only `false` settles it.
+        const detail = await api("GET", "/v2/task.detail", { task_id: taskId! });
+        if (!detail.ok) {
+          if (detail.code === "deadline") return spent();
+          if (detail.code === "aborted") continue;
+          if (++failures >= POLL_FAILURES) return failed(`Manus could not be read after the message was sent (${detail.message}); the task may still answer at ${link}`);
+          continue;
+        }
+        const jobs = detail.body.task?.has_running_background_jobs;
+        if (jobs !== false) {
+          unsettled = jobs === true ? "background work was still running" : "whether background work is running was not reported";
+          continue;
+        }
+        const reply = replyOf(turn);
+        if (!reply) return failed(`its Manus task finished without a message (${link})`);
+        const notes = reply.files.length > 0 ? [`Manus attached ${reply.files.join(", ")}; they are in the task: ${link}`] : [];
+        return { kind: "replied", reply: [reply.text, ...notes.map((note) => `(${note})`)].join("\n\n") };
+      }
+      if (state === "waiting") {
+        const waiting = classifyWaiting(end!.status_update?.status_detail);
+        const reply = replyOf(turn);
+        return { kind: "replied", reply: [...(reply ? [reply.text] : []), `(${waitingNote(waiting, link)})`].join("\n\n") };
+      }
+      // running: keep polling
     }
   },
   async check(wake: SeatWake, env: Environment, _run, options: CheckOptions = { call: false }): Promise<CheckResult> {
     // The steps of docs/wake-plugins.md "Checking a wake", for an API: `program` is the key and the address
     // (nothing to start), `signed_in` asks Manus who the key is, `session` asks for the seat's task. No step
-    // makes a Manus turn, since that costs credits; the first wake is that proof.
+    // makes a Manus turn, since that costs credits; the first wake is the proof.
     const steps: CheckStep[] = [];
     const keyEnv = keyEnvOf(wake);
     const key = env[keyEnv]?.trim();
-    const where = apiBase(wake);
+    const where = apiBase(wake, env);
     if (!key) steps.push({ step: "program", status: "failed", message: `${keyEnv} is not set in this environment` });
     else if ("error" in where) steps.push({ step: "program", status: "failed", message: where.error });
     else steps.push({ step: "program", status: "ok", message: `Manus API at ${where.base}, key in ${keyEnv}` });
     if (!key || "error" in where) return skipRest(steps, options, "the API address or key is not usable");
-    const io = net({ api: options.api });
-    const me = await call(where.base, key, io, "GET", "/v2/user.me", {});
+    const io = net(options.api);
+    const limits: Limits = { io, deadline: io.now() + CHECK_BUDGET_MS, signal: undefined };
+    const me = await call(where.base, key, limits, "GET", "/v2/user.me", {});
     steps.push(
       me.ok
         ? { step: "signed_in", status: "ok", message: `Manus accepted the API key in ${keyEnv}` }
@@ -257,7 +492,7 @@ export const manusPlugin: WakePlugin = {
           : { step: "signed_in", status: "warning", message: `Manus user.me: ${me.message}` },
     );
     if (wake.session) {
-      const detail = await call(where.base, key, io, "GET", "/v2/task.detail", { task_id: wake.session });
+      const detail = await call(where.base, key, limits, "GET", "/v2/task.detail", { task_id: wake.session });
       steps.push(
         detail.ok
           ? { step: "session", status: "ok", message: `task ${wake.session} exists (${String(detail.body.task?.status ?? "status unknown")})` }

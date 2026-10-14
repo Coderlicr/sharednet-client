@@ -73,6 +73,8 @@ export interface DeliveryContext {
   /** Whether a chat's process is still open. Tests replace it. */
   chatOpen: (pid: number) => boolean;
   timeoutMs: number;
+  /** Aborts when serve is stopping; an API plugin that waits must end its waiting and its requests. */
+  signal?: AbortSignal;
   /** For a plugin that talks to an HTTP API instead of running a program. Tests replace it. */
   api?: PluginNet;
 }
@@ -80,7 +82,8 @@ export interface DeliveryContext {
 /** What an API plugin needs from the outside world; each defaults to the real one. */
 export interface PluginNet {
   fetch?: typeof globalThis.fetch;
-  sleep?: (ms: number) => Promise<void>;
+  /** Sleeps, and ends early (resolves) when the signal aborts. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
 }
 
@@ -324,10 +327,30 @@ const HARNESS_SESSION_KEYS = new Set([
 // CLAUDE_CODE_* is mostly the host session's own wiring; these few are how a person signs in.
 const KEPT_CLAUDE_CODE_KEYS = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]);
 
-export function harnessFreeEnv(env: Environment): Record<string, string> {
+// Environment variables that hold a credential only a plugin's own API calls may read (the Manus API key,
+// whatever name a seat gives it). serve has to hold them, but no model process it starts may see them: a
+// resumed Codex or Claude turn, a `--run` adapter or a probe could otherwise read or print them. The default
+// name is always withheld; a seat file that names another registers it as soon as it is read.
+const SECRET_ENV = new Set<string>(["MANUS_API_KEY"]);
+
+/** From now on, in this process, no spawned program gets the variable with this name. */
+export function withholdSecretEnv(name: string): void {
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) SECRET_ENV.add(name);
+}
+
+/** The environment without the credentials reserved for API plugins; what any spawned program may be given. */
+export function withoutSecrets<T extends Environment>(env: T): Record<string, string> {
+  const kept: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) if (value !== undefined && !SECRET_ENV.has(key)) kept[key] = value;
+  return kept;
+}
+
+/** `keepSecrets` is for the one process that is the credential's owner: the `serve` a join starts. */
+export function harnessFreeEnv(env: Environment, keepSecrets = false): Record<string, string> {
   const kept: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined || HARNESS_SESSION_KEYS.has(key)) continue;
+    if (!keepSecrets && SECRET_ENV.has(key)) continue;
     if (key.startsWith("CLAUDE_CODE_") && !KEPT_CLAUDE_CODE_KEYS.has(key)) continue;
     kept[key] = value;
   }
@@ -484,7 +507,7 @@ export function startWakeService(input: { env: Environment; logFile: string; ent
     const child = spawn(input.execPath, [...input.execArgv, input.entry, "serve"], {
       detached: true,
       stdio: ["ignore", log, log],
-      env: harnessFreeEnv(input.env) as NodeJS.ProcessEnv,
+      env: harnessFreeEnv(input.env, true) as NodeJS.ProcessEnv,
       cwd: homedir(),
     });
     child.unref();

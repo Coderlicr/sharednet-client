@@ -140,29 +140,55 @@ Code's headless mode (<https://www.workbuddy.ai/docs/cli/headless>, <https://www
 
 A Manus task (manus.im) is the session. Manus is a cloud agent, so nothing is resumed on this machine: the plugin is a
 small HTTP client over the documented API v2 (<https://open.manus.ai/docs/v2/introduction>, global `fetch`, no dependency).
+Its lifecycle follows <https://open.manus.ai/docs/v2/task-lifecycle>.
 
 - **set by:** `sharednet wake set manus [--resume <task id>] [--key-env <NAME>] [--as <seat>]`. It is never captured by
   `join`: a cloud task leaves no marker in any process's environment. Without `--resume`, every wake starts a new task.
 - **key:** the API key (`x-manus-api-key`, made in Manus settings under Developers) is read at delivery time from the
   environment variable `--key-env` names (default `MANUS_API_KEY`), **in the process that runs `serve`**. The seat file holds
-  only the variable's name, never the key. The wake's `command` is the API address (`https://api.manus.ai`); the key is
-  only ever sent over https (or to a loopback stand-in).
+  only the variable's name, never the key.
+  - **It is sent only to `https://api.manus.ai`.** The wake's `command` is that address; any other origin (a look-alike, an
+    address with credentials in it, plain http, another port) is refused by `wake set`, `wake check` and every delivery. A
+    loopback stand-in for tests needs `SHAREDNET_MANUS_ALLOW_LOOPBACK=1`. A redirect is an error, not followed.
+  - **No program serve starts can read it.** serve hands this plugin that one variable and nothing else, and withholds every
+    key variable (`MANUS_API_KEY`, and any name a seat file gives) from the environment of a resumed Codex or Claude turn,
+    a `command` adapter, a `--run` or `watch --run` command, and the probes of `wake check`. The default name is always withheld;
+    a custom name is withheld as soon as a seat file that names it is read, which serve does for every seat before each delivery.
+    The one exception is the `serve` a `join` starts, which is the key's owner.
 - **deliver:**
-  1. `GET /v2/task.detail`. A task still `running` is `busy` (retried in 30 s; nothing is sent into its current run).
-  2. `GET /v2/task.listMessages` for the newest event's time (the baseline), then `POST /v2/task.sendMessage` with the wake
-     prompt. With no task: `POST /v2/task.create` (`interactive_mode: false`).
-  3. Poll `GET /v2/task.listMessages`, 3 s apart at first and backing off by half again each time up to 30 s (about 100 reads in
+  1. `GET /v2/task.detail`. A task still `running` is `busy` (retried in 30 s). A **stopped** task is only sent into when
+     `has_running_background_jobs` is `false`: `true` is `busy`, and an omitted field is read again (three times, 2 s apart)
+     and, if it is never reported (an old task), treated as unknown rather than false and sent into.
+  2. `GET /v2/task.listMessages` for the newest event's time (the baseline) and the newest status. A task that is **waiting**
+     is sent into only when it asks a question (`messageAskUser`, `cascadeAskUser`): a message answers it. A pending action
+     confirmation, or a waiting type this plugin does not know, is `failed` with a note and **nothing is sent**, because an
+     ordinary message would skip the pending action.
+  3. `POST /v2/task.sendMessage` with the wake prompt. With no task: `POST /v2/task.create` (`interactive_mode: false`).
+  4. Poll `GET /v2/task.listMessages`, 3 s apart at first and backing off by half again each time up to 30 s (about 100 reads in
      40 minutes, against a limit of 100 a minute), until a `status_update` newer than the baseline, and after this wake's own
      message, says `stopped`, `waiting` or `error`. A task that stopped before this wake does not count as this wake's ending.
-     Reading **stops at the first terminal state**: the outcome is `replied` with the last `assistant_message` (the one marked
-     `delivery_kind: result` if any). A question the agent is `waiting` on is the reply, with a note. Attached files are named,
-     never linked: a link in a Room is readable by all of it. Only a stop with nothing said yet, while the task reports
-     `has_running_background_jobs`, keeps polling.
-  4. **The seat's wake limit bounds the whole delivery** (`wake limit`, 40 minutes by default; serve passes it as the plugin's
-     `timeoutMs`): the lookups, the send and the polling together, and never more than 2 hours however long the limit. Past it
-     the outcome is `failed` with the task's link; the Manus task keeps running. serve's execution-budget paragraph (it asks for
-     `sharednet wake checkpoint`, which a cloud task cannot run) is left out of what Manus is sent. The hourly turn cap and the
-     one-turn-per-session queue are serve's and apply as for any plugin; a seat with a task id shares that task's turn order.
+     The events are read newest first through their cursor pages down to the baseline, and the time of this wake's own message
+     is remembered once seen, so a long run cannot push it out of view.
+  5. **On every `stopped`, `GET /v2/task.detail`.** `has_running_background_jobs: false` settles it and the last
+     `assistant_message` (the one marked `delivery_kind: result` if any) is the reply. `true` keeps polling, since background work
+     may wake the task and change the results. An omitted field is unknown: it keeps polling too, and at the end of the time
+     the wake fails with that reason rather than posting an unsettled reply.
+  6. **`waiting` at the end of a run** is a reply that says which case it is: a question (`messageAskUser`/`cascadeAskUser`) is
+     answered by @-mentioning the seat, whose message goes to `task.sendMessage`; an action confirmation is a
+     `task.confirmAction` decision, which is **never made from a Room** (it approves a command, an email or a deploy for whoever
+     @-mentions the seat) and is to be made in Manus; any other type is not dispatched, and Manus is to be opened.
+- **The delivery's time.** The seat's wake limit (`wake limit`, 40 minutes by default; serve passes it as `timeoutMs`) bounds the
+  whole delivery, and never more than 2 hours: each lookup, send, poll page and sleep is cut to what is left of it, so a 60-second
+  limit ends in about 60 seconds. serve's stop signal ends the sleeping and the request in flight. Past the time the outcome is
+  `failed` with the task's link; the Manus task keeps running. serve's execution-budget paragraph (it asks for
+  `sharednet wake checkpoint`, which a cloud task cannot run) is left out of what Manus is sent. The hourly turn cap and the
+  one-turn-per-session queue are serve's; a seat with a task id shares that task's turn order.
+- **The message.** Manus takes about 5,000 estimated tokens of text per message. A longer prompt is cut in its middle by an
+  estimate made by script (3 characters a token for ASCII, 1.5 tokens a character for anything else, held to 3,500), so Chinese
+  and dense code are cut far earlier than a character count would.
+- **The reply.** Markdown links and images are rendered as <https://open.manus.ai/docs/v2/attachments> requires: http(s) kept; an
+  absolute path that matches an attachment is named (file name, no link: the download URL is signed and a Room's readers are
+  many); `manus-webdev://` and every other destination removed, with the text around it kept.
 - **`busy`, `failed`:** a rate limit (10 messages a minute) is `busy` in 60 s. A read that fails is `busy`. A write that fails
   unclearly (timeout, 5xx) is `failed` and **not** retried: sending again could start a second task or ask twice, and each
   costs Manus credits. A rejected key is `failed`.
@@ -172,9 +198,7 @@ small HTTP client over the documented API v2 (<https://open.manus.ai/docs/v2/int
   `GET /v2/task.detail` for the seat's task (a task this key does not have fails; a seat with no task id has nothing to look up).
   `call` is skipped: the first wake is the proof. It needs the variable set in the environment `check` runs in, and serve's own
   environment is what matters for a delivery.
-- **Webhooks are not used.** Manus offers them (<https://open.manus.ai/docs/v2/webhooks-overview>), but they need a public URL.
-- **Not verified live:** the tests replace `fetch` with a script of the documented shapes; no Manus account or key was used.
-  A message is limited to about 5,000 tokens of text, so a long wake prompt is cut in its middle.
+- **Not verified live:** the tests are a stand-in that behaves as the documents describe; no Manus account or key was used.
 
 ### `command`
 

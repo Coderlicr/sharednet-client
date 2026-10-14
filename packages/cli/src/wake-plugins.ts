@@ -2,7 +2,7 @@ import { claudePlugin } from "./wake-claude.ts";
 import { codebuddyPlugin } from "./wake-codebuddy.ts";
 import { codexPlugin } from "./wake-codex.ts";
 import { commandPlugin } from "./wake-command.ts";
-import { validTurnLimit } from "./wake-driver.ts";
+import { validTurnLimit, withholdSecretEnv } from "./wake-driver.ts";
 import { manusPlugin } from "./wake-manus.ts";
 import type { Environment, SeatWake, WakeDriver, WakePlugin } from "./wake-driver.ts";
 
@@ -44,6 +44,8 @@ export function parseSeatWake(value: unknown): SeatWake | undefined {
   // task id starts a new task per wake.
   if (!driver || !cwd || !command || (driver !== "command" && driver !== "manus" && !session)) return undefined;
   const keyEnv = typeof record.api_key_env === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(record.api_key_env) ? record.api_key_env : null;
+  // Reading a seat that names a key variable is when this process learns that no program it starts may see it.
+  if (driver === "manus" && keyEnv) withholdSecretEnv(keyEnv);
   const home = text(record.codex_home);
   const configDir = text(record.config_dir);
   const live = record.live_pid;

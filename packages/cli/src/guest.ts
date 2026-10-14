@@ -14,8 +14,8 @@ import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn
 import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
 import { chatOpen } from "./wake-claude.ts";
 import { codebuddyProgram } from "./wake-codebuddy.ts";
-import { MANUS_API } from "./wake-manus.ts";
-import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
+import { apiBase, keyEnvOf, MANUS_API } from "./wake-manus.ts";
+import { withoutSecrets, DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
 import { describeWake, isWakeDriver, pluginFor, seatWakeFrom } from "./wake-plugins.ts";
 import {
   getOrCreateInstallationSecret,
@@ -1285,7 +1285,7 @@ function defaultExec(command: string, input: string, env: Record<string, string>
     let stderr = "";
     try {
       const child = spawn(shell[0]!, shell.slice(1), {
-        env: { ...process.env, ...env },
+        env: { ...withoutSecrets(process.env), ...env },
         stdio: ["pipe", "pipe", "pipe"],
       });
       child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
@@ -2976,7 +2976,12 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         const deadline = started + timeoutMs;
         const checkpointAt = deadline - Math.min(120_000, timeoutMs / 4);
         const prompt = wakeTurnPrompt(about) + `\n\nExecution budget: ${timeoutMs / 60_000} minutes; deadline ${new Date(deadline).toISOString()}. Save progress by ${new Date(checkpointAt).toISOString()} and after each significant milestone: sharednet wake checkpoint "completed; next step; blockers; evidence paths" --as ${seat.member_id}. Keep secrets out. Previous checkpoint (if any): ${checkpoint}. Read it to recover context, then verify current state before repeating actions. A checkpoint does not authorize automatic retries. You can set the NEXT turn's limit with sharednet wake limit 60m --as ${seat.member_id}; this does not extend this running turn. This budget applies to headless execution, not a handoff into an open chat.${compiled}`;
-        const delivery = await plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs });
+        // Before any program is started for any seat, learn every key variable any seat names (reading a seat
+        // file registers it), so no model process gets another seat's API key.
+        for (const other of tracked.values()) await readRoomCredential(paths, other.room_id, other.member_id).catch(() => null);
+        // An API plugin gets the one variable it names and nothing else: it starts no program.
+        const env = currentWake.driver === "manus" ? { [keyEnvOf(currentWake)]: dependencies.env[keyEnvOf(currentWake)] } : dependencies.env;
+        const delivery = await plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, { env, run: drive, chatOpen: open, timeoutMs, signal: stopping.signal });
         return { state: "delivered", delivery, pluginLabel: plugin.label, started, timeoutMs };
       };
       let ran: WakeRun;
@@ -3493,6 +3498,11 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
   const session = stringOption(parsed, "resume") ?? before?.session ?? here?.session;
   const command = stringOption(parsed, "command") ?? before?.command ?? here?.command;
   if (driver === "command" && command === undefined) throw localError("invalid_arguments", "A command wake needs --command <path>: the adapter that is handed each wake.");
+  // The Manus key is only ever sent to the Manus API: refuse another address now, not at the first wake.
+  if (driver === "manus" && command !== undefined) {
+    const where = apiBase({ driver, cwd: dependencies.cwd, command }, dependencies.env);
+    if ("error" in where) throw localError("invalid_arguments", where.error);
+  }
   // A Manus seat may have no task: every wake then starts one.
   if (driver !== "command" && driver !== "manus" && session === undefined) {
     throw localError("invalid_arguments", `A ${pluginFor(driver).label} wake resumes a session: give --resume <session id>, or run this from inside that session.`);

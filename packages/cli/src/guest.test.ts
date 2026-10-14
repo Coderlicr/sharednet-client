@@ -2015,6 +2015,23 @@ describe("sharednet say and wait", () => {
       expect(result.stderr).toContain("finished its turn: @host 2+2 is 4.");
     });
 
+    it("starts no program with a Manus API key in its environment, though serve itself holds it", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const { turns, runTurn } = turnsOf();
+      const service = { delivered_through: 1, acked_through: 1 };
+      const result = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex hi")]),
+        page([addressed(2, "@codex hi")]),
+        { status: 201, body: { message: own(3, "@host 2+2 is 4.") } },
+        revoked(),
+      ], { ...CODEX, MANUS_API_KEY: "synthetic-key-not-a-secret", PATH: "/usr/bin" }, { service, runTurn });
+      expect(result.exitCode).toBe(0);
+      expect(turns).toHaveLength(1);
+      expect(turns[0]!.env).toMatchObject({ PATH: "/usr/bin" });
+      expect(turns[0]!.env).not.toHaveProperty("MANUS_API_KEY");
+    });
+
     it("posts nothing for a turn that ends with nothing to say", async () => {
       const space = await workspace();
       expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
@@ -2640,6 +2657,10 @@ describe("sharednet say and wait", () => {
       expect(pasted.exitCode).not.toBe(0);
       expect(pasted.stdout + pasted.stderr).toContain("NAME of the environment variable");
       expect((await run(["wake", "set", "claude-code", "--resume", "6613bb00", "--key-env", "X", "--json"], space, [], { CLAUDE_SESSION_ID: "" })).exitCode).not.toBe(0);
+      // The key is only ever sent to the Manus API: another address is refused when the wake is set, not at the first wake.
+      const foreign = await run(["wake", "set", "manus", "--command", "https://attacker.example", "--json"], space, []);
+      expect(foreign.exitCode).not.toBe(0);
+      expect(foreign.stdout + foreign.stderr).toContain("only sent to https://api.manus.ai");
       expect(JSON.stringify(await credentialOf(space))).not.toContain("sk-synthetic");
     });
 
