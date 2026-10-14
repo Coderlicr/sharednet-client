@@ -1540,6 +1540,51 @@ describe("sharednet say and wait", () => {
     } finally { release(); await serving; }
   });
 
+  it("sits in a refused seat again once it is rejoined, without restarting serve, and leaves it alone until then", async () => {
+    const space = await joinedSpace();
+    await seatIn(space, "rom_SecondRoom", "i_AbCdEfGhIj");
+    const { writeFile } = await import("node:fs/promises");
+    const second = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", "rom_SecondRoom", "i_AbCdEfGhIj.json");
+    await writeFile(second, JSON.stringify({ ...JSON.parse(await readFile(second, "utf8")), room_type: "board" }));
+    await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+    await seatCursor(space, "rom_SecondRoom", "i_AbCdEfGhIj", 1);
+    const statusNow = async () => JSON.parse((await run(["serve", "--status", "--json"], space, [])).stdout) as { running: boolean; seats: Array<{ room_id: string; member_id: string; state: string }> };
+    let releaseHeld!: () => void;
+    const held = new Promise<void>((resolve) => { releaseHeld = resolve; });
+    let releaseAgain: () => void = () => undefined;
+    // One seat is refused for good; the other stays listening, which keeps this serve running.
+    const responses: Parameters<typeof run>[2] = [revoked(), { ...revoked(), wait: held }];
+    const serving = run(["serve", "--run", "handle", "--json"], space, responses);
+    const rejoined = `sni_${"N".repeat(43)}`;
+    try {
+      let refused!: { room_id: string; member_id: string };
+      await vi.waitFor(async () => {
+        const status = await statusNow();
+        refused = status.seats.find((seat) => seat.state === "stopped")!;
+        expect(refused).toBeDefined();
+        expect(status.seats.some((seat) => seat.state === "listening")).toBe(true);
+      });
+      // Unchanged, it is left alone through a whole look: a refusal is not asked again every 5 s.
+      await new Promise((resolve) => setTimeout(resolve, 5_600));
+      expect((await statusNow()).seats.find((seat) => seat.member_id === refused.member_id && seat.room_id === refused.room_id)?.state).toBe("stopped");
+      // Rejoined: its seat file now holds a new token. The next look sits in it again.
+      const file = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", refused.room_id, `${refused.member_id}.json`);
+      await writeFile(file, JSON.stringify({ ...JSON.parse(await readFile(file, "utf8")), member_token: rejoined }));
+      responses.push({ ...revoked(), wait: new Promise<void>((resolve) => { releaseAgain = resolve; }) });
+      await vi.waitFor(async () => {
+        const status = await statusNow();
+        expect(status.running).toBe(true);
+        expect(status.seats.map((seat) => seat.state)).toEqual(["listening", "listening"]);
+      }, { timeout: 9_000, interval: 100 });
+    } finally {
+      releaseHeld();
+      releaseAgain();
+    }
+    const result = await serving;
+    expect(result.stderr.match(/sitting in it again/g)).toHaveLength(1);
+    expect(result.requests.some((request) => header(request, "authorization") === `Bearer ${rejoined}`)).toBe(true);
+  }, 30_000);
+
   it("keeps serving and releases ownership when status persistence fails", async () => {
     const space = await joinedSpace();
     await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
@@ -2863,6 +2908,31 @@ describe("sharednet say and wait", () => {
       stop.abort();
       expect((await serving).exitCode).toBe(0);
     });
+
+    it("as the installed service, sits in its only seat again once the seat is repaired, without a restart", async () => {
+      const space = await joinedSpace();
+      const { writeFile } = await import("node:fs/promises");
+      const stop = new AbortController();
+      const responses: Parameters<typeof run>[2] = [revoked()];
+      const serving = run(["serve", "--service", "--json"], space, responses, {}, { service: { delivered_through: 1, acked_through: 1 }, signal: stop.signal });
+      const states = async () => (JSON.parse((await run(["serve", "--status", "--json"], space, [])).stdout).seats as Array<{ state: string }>).map((seat) => seat.state);
+      let release: () => void = () => undefined;
+      try {
+        await vi.waitFor(async () => expect(await states()).toEqual(["stopped"]));
+        // Repaired: the seat's wake now names another session (as `wake set` writes it).
+        const file = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, `${MEMBER_ID}.json`);
+        const stored = JSON.parse(await readFile(file, "utf8"));
+        await writeFile(file, JSON.stringify({ ...stored, member_token: `sni_${"R".repeat(43)}`, wake: { ...stored.wake, session: "repaired-session" } }));
+        responses.push({ ...revoked(), wait: new Promise<void>((resolve) => { release = resolve; }) });
+        await vi.waitFor(async () => expect(await states()).toEqual(["listening"]), { timeout: 9_000, interval: 100 });
+      } finally {
+        release();
+        stop.abort();
+      }
+      const result = await serving;
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toContain("changed (credential or wake); sitting in it again");
+    }, 30_000);
 
     it("says a stop restarts an installed service, and how to stop it for good", async () => {
       const space = await workspace();

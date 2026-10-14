@@ -466,6 +466,31 @@ export function launchdRunning(printed: string): { running: boolean; pid?: numbe
   return { running, ...(running && Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}) };
 }
 
+/**
+ * The storage root a service definition's serve uses: from the HOME and XDG_CONFIG_HOME its manager
+ * hands it (EnvironmentVariables, or Environment= lines), as the CLI's own getStoragePaths would.
+ * A definition that sets neither runs with the manager's defaults, which is the account's standard
+ * root, `~/.config/sharednet`.
+ */
+export function definitionRoot(kind: ServicePlatform, content: string, home: string): string {
+  const env: Record<string, string> = {};
+  if (kind === "launchd") {
+    const dict = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(content)?.[1] ?? "";
+    for (const match of dict.matchAll(/<key>([^<]+)<\/key>\s*<string>([^<]*)<\/string>/g)) {
+      env[match[1]!] = match[2]!.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+    }
+  } else {
+    for (const line of content.match(/^Environment=.*$/gm) ?? []) {
+      for (const match of line.slice("Environment=".length).matchAll(/"((?:[^"\\]|\\.)*)"|(\S+)/g)) {
+        const assignment = (match[1] ?? match[2]!).replace(/\\(.)/g, "$1").replace(/%%/g, "%");
+        const at = assignment.indexOf("=");
+        if (at > 0) env[assignment.slice(0, at)] = assignment.slice(at + 1);
+      }
+    }
+  }
+  return getStoragePaths({ HOME: env.HOME || home, ...(env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: env.XDG_CONFIG_HOME } : {}) }).configDir;
+}
+
 export class ServiceControl {
   private readonly env: Environment;
   private readonly host: ServiceHost;
@@ -490,15 +515,17 @@ export class ServiceControl {
   }
 
   /**
-   * Other definitions in the same manager that run or respawn a SharedNet serve: a hand-made
-   * supervisor would start serve again beside this service, and the two would race for the
-   * machine's one slot. Read-only: they are reported, with the command that stops them, never touched.
+   * Other definitions in the same manager that run or respawn a SharedNet serve for the same storage
+   * root: a hand-made supervisor would start serve again beside this service, and the two would race
+   * for that root's one slot (serve.json). A definition for another storage root has its own slot
+   * and is no conflict, which is why each root's service has its own name. Read-only: they are
+   * reported, with the command that stops them, never touched.
    */
   async conflicts(): Promise<Array<{ label: string; file: string; stop: string }>> {
     const where = await this.where();
     if (where === null) return [];
     const dir = dirname(where.file);
-    const own = (label: string) => label === where.label || /^ai\.sharednet\.serve(\.[0-9a-f]{8})?$/.test(label) || /^sharednet-serve(-[0-9a-f]{8})?\.service$/.test(label);
+    const root = getStoragePaths({ ...this.env, HOME: this.env.HOME || this.host.home }).configDir;
     const found: Array<{ label: string; file: string; stop: string }> = [];
     for (const name of (await this.host.listDir(dir)).sort()) {
       const kind = where.kind === "launchd" ? name.endsWith(".plist") : /\.(service|timer)$/.test(name);
@@ -507,7 +534,8 @@ export class ServiceControl {
       const content = await this.host.readFile(file);
       if (content === null || !/sharednet/i.test(content) || !/serve|supervis|listener|wake/i.test(content)) continue;
       const label = where.kind === "launchd" ? (/<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(content)?.[1] ?? name.replace(/\.plist$/, "")) : name;
-      if (own(label) || own(name.replace(/\.plist$/, ""))) continue;
+      if (label === where.label || label === where.label.replace(/\.service$/, "")) continue;
+      if (definitionRoot(where.kind, content, this.host.home) !== root) continue;
       found.push({
         label,
         file,

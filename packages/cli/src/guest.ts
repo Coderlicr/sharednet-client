@@ -3251,20 +3251,36 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   // Every seat gets its own loop, and no loop awaits another, so a slow or broken Room cannot make
   // another Room miss a message. A seat joined while this runs is picked up by the next look.
   const loops = new Map<string, Promise<void>>();
-  const sitting: StoredRoomCredential[] = [];
+  const sitting = new Map<string, StoredRoomCredential>();
+  const begun = new Set<string>();
+  // A seat whose loop ended (refused for good, wake off, its Room gone) keeps what it was begun with.
+  // The next look sits in it again once that changes (a rejoin's token, an account session's new
+  // token, a repaired wake) and leaves it alone while it does not, so a refusal is not asked again
+  // every few seconds. Without this a stopped seat stayed stopped until serve restarted.
+  const ended = new Map<string, string>();
+  const fingerprintOf = async (seat: StoredRoomCredential): Promise<string> => {
+    const session = seat.member_id.startsWith("i_") ? await readSessionById(paths, seat.member_id).catch(() => null) : null;
+    return createHash("sha256")
+      .update(JSON.stringify([seat.base_url, seat.member_token, seat.joined_at, seat.room_type ?? null, seat.wake ?? null, session?.instance_token ?? null]))
+      .digest("hex");
+  };
   let live = 0;
   let failure: unknown = null;
   let finish: () => void = () => undefined;
   const finished = new Promise<void>((resolve) => (finish = resolve));
-  const begin = (seat: StoredRoomCredential) => {
+  const begin = (seat: StoredRoomCredential, fingerprint: string) => {
     const key = `${seat.room_id}/${seat.member_id}`;
-    if (loops.has(key)) return false;
-    sitting.push(seat);
+    if (loops.has(key) || ended.get(key) === fingerprint) return false;
+    ended.delete(key);
+    begun.add(key);
+    sitting.set(key, seat);
     live += 1;
     loops.set(
       key,
       supervise(seat).then(
         () => {
+          loops.delete(key);
+          ended.set(key, fingerprint);
           live -= 1;
           // A service outlives its seats: a seat joined later is still picked up by the next look.
           if (live === 0 && (!asService || stopping.signal.aborted)) finish();
@@ -3277,7 +3293,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     );
     return true;
   };
-  for (const seat of seats) begin(seat);
+  for (const seat of seats) begin(seat, await fingerprintOf(seat));
   if (asService) stopping.signal.addEventListener("abort", () => live === 0 && finish(), { once: true });
   let looking = false;
   const rescan = setInterval(() => {
@@ -3285,10 +3301,17 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     looking = true;
     void heldSeats(paths)
       .then(async (all) => {
-        const fresh = all.filter(served).filter(begin);
-        if (fresh.length === 0) return;
-        dependencies.stderr?.(`serve: now also sitting in ${fresh.map((seat) => `${seat.room_id} as ${seat.name}`).join(", ")}\n`);
-        await statusWrite;
+        const fresh: StoredRoomCredential[] = [];
+        const again: StoredRoomCredential[] = [];
+        for (const seat of all.filter(served)) {
+          const key = `${seat.room_id}/${seat.member_id}`;
+          if (loops.has(key) || stopping.signal.aborted) continue;
+          const before = begun.has(key);
+          if (begin(seat, await fingerprintOf(seat))) (before ? again : fresh).push(seat);
+        }
+        if (fresh.length > 0) dependencies.stderr?.(`serve: now also sitting in ${fresh.map((seat) => `${seat.room_id} as ${seat.name}`).join(", ")}\n`);
+        if (again.length > 0) dependencies.stderr?.(`serve: ${again.map((seat) => `${seat.room_id} ${seat.name}`).join(", ")} changed (credential or wake); sitting in it again\n`);
+        if (fresh.length + again.length > 0) await statusWrite;
       })
       .catch(() => undefined)
       .finally(() => (looking = false));
@@ -3301,7 +3324,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     process.off("SIGTERM", stop);
     // The service stops ringing an address nobody answers; taking the doorbells down says so now.
     await Promise.all(
-      sitting.map((seat) =>
+      [...sitting.values()].map((seat) =>
         new ApiClient(seat.base_url, boundedFetch(dependencies, null, true))
           .request("PUT", `/rooms/${encodeURIComponent(seat.room_id)}/subscription`, seat.member_token, { push_url: null })
           .catch(() => undefined),
@@ -3311,7 +3334,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   }
   await releaseServe(paths);
   if (failure !== null) throw failure;
-  return { served: loops.size };
+  return { served: begun.size };
 }
 
 /** Where the connector remembers how far it has read in one Room. */

@@ -438,7 +438,11 @@ describe("installing, inspecting and removing it", () => {
     const { host, files, calls } = fakeHost("darwin", "/Users/synthetic");
     files.set(`${agents}/ai.sharednet.listener-supervisor.plist`, supervisor);
     files.set(`${agents}/com.example.backup.plist`, "<plist><dict><key>Label</key><string>com.example.backup</string></dict></plist>");
-    files.set(`${agents}/ai.sharednet.serve.0a1b2c3d.plist`, "<plist><dict><key>Label</key><string>ai.sharednet.serve.0a1b2c3d</string><string>sharednet serve --service</string></dict></plist>");
+    // This service for another storage root: its own slot, no conflict.
+    files.set(
+      `${agents}/ai.sharednet.serve.0a1b2c3d.plist`,
+      "<plist><dict><key>Label</key><string>ai.sharednet.serve.0a1b2c3d</string><key>ProgramArguments</key><array><string>sharednet serve --service</string></array><key>EnvironmentVariables</key><dict><key>XDG_CONFIG_HOME</key><string>/tmp/third</string></dict></dict></plist>",
+    );
     const control = new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, host, program);
     expect(await control.conflicts()).toEqual([
       { label: "ai.sharednet.listener-supervisor", file: `${agents}/ai.sharednet.listener-supervisor.plist`, stop: "launchctl bootout gui/501/ai.sharednet.listener-supervisor" },
@@ -448,10 +452,27 @@ describe("installing, inspecting and removing it", () => {
     expect(files.has(`${agents}/ai.sharednet.serve.plist`)).toBe(false);
     expect(files.get(`${agents}/ai.sharednet.listener-supervisor.plist`)).toBe(supervisor);
 
+    // Installing for another storage root, the same supervisor (which runs with the default root) is no
+    // conflict, and the default root's service is not either; a supervisor for that root is.
+    const elsewhere = { HOME: "/Users/synthetic", PATH: bin, XDG_CONFIG_HOME: "/tmp/elsewhere" };
+    files.set(`${agents}/ai.sharednet.serve.plist`, "<plist><dict><key>Label</key><string>ai.sharednet.serve</string><key>ProgramArguments</key><array><string>npx</string><string>sharednet@latest</string><string>serve</string></array></dict></plist>");
+    expect(await new ServiceControl(elsewhere, host, program).conflicts()).toEqual([]);
+    files.set(
+      `${agents}/com.example.sharednet-elsewhere.plist`,
+      "<plist><dict><key>Label</key><string>com.example.sharednet-elsewhere</string><key>ProgramArguments</key><array><string>/usr/local/bin/sharednet</string><string>serve</string></array><key>EnvironmentVariables</key><dict><key>XDG_CONFIG_HOME</key><string>/tmp/elsewhere</string></dict></dict></plist>",
+    );
+    expect((await new ServiceControl(elsewhere, host, program).conflicts()).map((other) => other.label)).toEqual(["com.example.sharednet-elsewhere"]);
+    // ...and the default root still sees only its own supervisor, not the one for /tmp/elsewhere.
+    expect((await control.conflicts()).map((other) => other.label)).toEqual(["ai.sharednet.listener-supervisor"]);
+
     const linux = fakeHost("linux", "/home/synthetic");
     linux.files.set("/home/synthetic/.config/systemd/user/sharednet-listener.service", "[Service]\nExecStart=/usr/bin/npx -y sharednet@latest serve\n");
+    linux.files.set("/home/synthetic/.config/systemd/user/sharednet-other.service", '[Service]\nEnvironment="XDG_CONFIG_HOME=/srv/other" "PATH=/usr/bin"\nExecStart=/usr/bin/npx -y sharednet@latest serve\n');
     expect((await new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, linux.host, program).conflicts()).map((other) => other.stop)).toEqual([
       "systemctl --user disable --now sharednet-listener.service",
+    ]);
+    expect((await new ServiceControl({ HOME: "/home/synthetic", PATH: bin, XDG_CONFIG_HOME: "/srv/other" }, linux.host, program).conflicts()).map((other) => other.label)).toEqual([
+      "sharednet-other.service",
     ]);
   });
 

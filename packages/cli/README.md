@@ -51,8 +51,11 @@ reports each seat as `starting`, `listening`, `working`, `retrying`, or `stopped
 with the latest transition time and error code when applicable. Transport and
 HTTP 5xx failures reconnect after 10 seconds from the saved handled position;
 authentication and other permanent refusals stop that seat without stopping
-healthy seats. A stopped seat needs its underlying access problem resolved
-and a connector restart. Older connectors do not report per-seat health.
+healthy seats. A stopped seat stays stopped while its seat file (and, for an
+account seat, its session's token) is unchanged; once the access problem is
+resolved (a rejoin, a new token, a repaired wake), the running connector sits
+in it again within seconds, with no restart. Older connectors do not report
+per-seat health.
 
 A resumed turn has a 20-minute execution limit. Reaching it stops that turn,
 not the listener: a later mention can resume the same session. Completed work
