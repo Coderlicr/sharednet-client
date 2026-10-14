@@ -5,12 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createHash } from "node:crypto";
+import { createServer } from "node:http";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runCli } from "./cli.ts";
 import type { CommandRunner } from "./guest.ts";
-import type { CheckOptions, CheckResult, CheckStep, SeatWake, TurnRunner, TurnSpec } from "./wake-driver.ts";
+import { withoutSecrets, type CheckOptions, type CheckResult, type CheckStep, type SeatWake, type TurnRunner, type TurnSpec } from "./wake-driver.ts";
 
 const cleanup: string[] = [];
 
@@ -2031,6 +2032,99 @@ describe("sharednet say and wait", () => {
       expect(turns[0]!.env).toMatchObject({ PATH: "/usr/bin" });
       expect(turns[0]!.env).not.toHaveProperty("MANUS_API_KEY");
     });
+
+    /** A second seat on this machine, as another `wake set` would have left it: a Manus seat naming its key variable. */
+    async function addManusSeat(space: Awaited<ReturnType<typeof workspace>>, keyEnv: string) {
+      const dir = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID);
+      const seat = JSON.parse(await readFile(join(dir, `${MEMBER_ID}.json`), "utf8"));
+      const other = { ...seat, member_id: "i_OtherSeat1", name: "manus-seat", wake: { driver: "manus", cwd: space.project, command: "https://api.manus.ai", api_key_env: keyEnv } };
+      await writeFile(join(dir, "i_OtherSeat1.json"), JSON.stringify(other), { mode: 0o600 });
+    }
+
+    it("withholds a custom Manus key variable from the probes of `wake check` on a different seat, in a process that has read only that seat", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      await addManusSeat(space, "PROBE_LEAK_KEY_ONE");
+      const bin = await mkdtemp(join(tmpdir(), "sharednet-fake-codex-"));
+      cleanup.push(bin);
+      await writeFile(join(bin, "codex"), "#!/bin/sh\n", { mode: 0o755 });
+      const { turns, runTurn } = turnsOf({ stdout: "codex 0.162.0" });
+      const result = await run(["wake", "check", "--as", MEMBER_ID, "--json"], space, [], { ...CODEX, PATH: bin, PROBE_LEAK_KEY_ONE: "synthetic-key-not-a-secret", SAFE_VARIABLE: "kept" }, { runTurn, checkWake: undefined });
+      // Whatever the verdict (the stand-in transcript is not there), the probes that did start are the point.
+      expect(result.stdout + result.stderr).not.toContain("not_in_a_room");
+      expect(turns.length).toBeGreaterThanOrEqual(1);
+      for (const turn of turns) {
+        expect(turn.env).toMatchObject({ SAFE_VARIABLE: "kept" });
+        expect(turn.env).not.toHaveProperty("PROBE_LEAK_KEY_ONE");
+      }
+    });
+
+    it("learns every seat's key variable before `watch --run` can start a program", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      await addManusSeat(space, "PROBE_LEAK_KEY_TWO");
+      const { exec } = recorder({ exitCode: 0, stdout: "" });
+      expect(withoutSecrets({ PROBE_LEAK_KEY_TWO: "synthetic", KEPT: "yes" })).toEqual({ PROBE_LEAK_KEY_TWO: "synthetic", KEPT: "yes" });
+      const result = await run(["watch", "--on", "message", "--run", "agent-turn", "--max-runs", "1", "--json"], space, [page([message(2, "hi")])], CODEX, { exec });
+      expect(result.exitCode).toBe(0);
+      // defaultExec builds the program's environment with withoutSecrets: after this run the name is known.
+      expect(withoutSecrets({ PROBE_LEAK_KEY_TWO: "synthetic", KEPT: "yes" })).toEqual({ KEPT: "yes" });
+    });
+
+    it("takes the loopback test flag through serve to a Manus stand-in, with the key in a header and a reply posted once", async () => {
+      const received: Array<{ method: string; path: string; key: string | undefined; body: string }> = [];
+      let sent = "";
+      const stand = createServer((request, response) => {
+        let body = "";
+        request.on("data", (chunk) => (body += chunk));
+        request.on("end", () => {
+          const url = new URL(request.url ?? "/", "http://127.0.0.1");
+          received.push({ method: request.method ?? "", path: url.pathname, key: request.headers["x-manus-api-key"] as string | undefined, body });
+          const reply = (value: unknown) => {
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(JSON.stringify(value));
+          };
+          if (url.pathname === "/v2/task.create") {
+            sent = JSON.parse(body).message.content;
+            return reply({ ok: true, task_id: "taskLoop0000000000001", task_url: "https://manus.im/app/taskLoop0000000000001" });
+          }
+          if (url.pathname === "/v2/task.listMessages") {
+            return reply({ ok: true, has_more: false, messages: [
+              { id: "s3", type: "status_update", timestamp: 13, status_update: { agent_status: "stopped" } },
+              { id: "a2", type: "assistant_message", timestamp: 12, assistant_message: { content: "LOOP-OK", delivery_kind: "result" } },
+              { id: "u1", type: "user_message", timestamp: 11, user_message: { content: sent } },
+            ] });
+          }
+          if (url.pathname === "/v2/task.detail") return reply({ ok: true, task: { id: "taskLoop0000000000001", status: "stopped", has_running_background_jobs: false } });
+          response.writeHead(404);
+          response.end();
+        });
+      });
+      await new Promise<void>((resolve) => stand.listen(0, "127.0.0.1", resolve));
+      try {
+        const address = `http://127.0.0.1:${(stand.address() as { port: number }).port}`;
+        const space = await workspace();
+        expect((await run(["join", PASTED_INVITE, "--no-wake"], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
+        const env = { SHAREDNET_MANUS_ALLOW_LOOPBACK: "1", STAND_IN_KEY: "synthetic-key-not-a-secret" };
+        const set = await run(["wake", "set", "manus", "--command", address, "--key-env", "STAND_IN_KEY", "--json"], space, [], env);
+        expect(set.exitCode).toBe(0);
+        const service = { delivered_through: 1, acked_through: 1 };
+        const result = await run(["serve", "--json"], space, [
+          page([addressed(2, "@manus say LOOP-OK")]),
+          page([addressed(2, "@manus say LOOP-OK")]),
+          { status: 201, body: { message: own(3, "LOOP-OK") } },
+          revoked(),
+        ], env, { service });
+        expect(result.exitCode).toBe(0);
+        expect(received.filter((call) => call.path === "/v2/task.create")).toHaveLength(1);
+        expect(received.every((call) => call.key === "synthetic-key-not-a-secret")).toBe(true);
+        const posted = result.requests.filter((request) => request.init.method === "POST");
+        expect(posted).toHaveLength(1);
+        expect(JSON.parse(String(posted[0]!.init.body)).content).toBe("LOOP-OK");
+      } finally {
+        await new Promise<void>((resolve) => stand.close(() => resolve()));
+      }
+    }, 30_000);
 
     it("posts nothing for a turn that ends with nothing to say", async () => {
       const space = await workspace();

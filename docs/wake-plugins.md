@@ -149,32 +149,42 @@ Its lifecycle follows <https://open.manus.ai/docs/v2/task-lifecycle>.
   only the variable's name, never the key.
   - **It is sent only to `https://api.manus.ai`.** The wake's `command` is that address; any other origin (a look-alike, an
     address with credentials in it, plain http, another port) is refused by `wake set`, `wake check` and every delivery. A
-    loopback stand-in for tests needs `SHAREDNET_MANUS_ALLOW_LOOPBACK=1`. A redirect is an error, not followed.
+    loopback stand-in for tests needs `SHAREDNET_MANUS_ALLOW_LOOPBACK=1` in serve's environment (serve passes that one non-secret
+    variable to the plugin along with the key). A redirect is an error, not followed.
   - **No program serve starts can read it.** serve hands this plugin that one variable and nothing else, and withholds every
     key variable (`MANUS_API_KEY`, and any name a seat file gives) from the environment of a resumed Codex or Claude turn,
     a `command` adapter, a `--run` or `watch --run` command, and the probes of `wake check`. The default name is always withheld;
-    a custom name is withheld as soon as a seat file that names it is read, which serve does for every seat before each delivery.
+    a custom name is withheld as soon as a seat file that names it is read. Every command that can start a program (serve, `watch`,
+    `wait --run`, `wake check`) first reads **all** the seats on the machine, so a fresh process that was asked about one seat
+    already knows another seat's variable name.
     The one exception is the `serve` a `join` starts, which is the key's owner.
 - **deliver:**
-  1. `GET /v2/task.detail`. A task still `running` is `busy` (retried in 30 s). A **stopped** task is only sent into when
-     `has_running_background_jobs` is `false`: `true` is `busy`, and an omitted field is read again (three times, 2 s apart)
-     and, if it is never reported (an old task), treated as unknown rather than false and sent into.
+  1. `GET /v2/task.detail`, judged again on every refresh. A task `running` is `busy` (retried in 30 s). A **stopped** task is only
+     sent into when `has_running_background_jobs` is `false`: `true` is `busy`; an omitted field is unknown, not false, so it is
+     read again (2 s, backing off) and **nothing is sent** until it is reported `false`. If it never is, the delivery ends at its
+     time as `failed` ("has_running_background_jobs is not reported ... nothing was sent"). A task that turns `running` between
+     two reads is not sent into.
   2. `GET /v2/task.listMessages` for the newest event's time (the baseline) and the newest status. A task that is **waiting**
      is sent into only when it asks a question (`messageAskUser`, `cascadeAskUser`): a message answers it. A pending action
      confirmation, or a waiting type this plugin does not know, is `failed` with a note and **nothing is sent**, because an
      ordinary message would skip the pending action.
-  3. `POST /v2/task.sendMessage` with the wake prompt. With no task: `POST /v2/task.create` (`interactive_mode: false`).
+  3. `POST /v2/task.sendMessage` with the wake prompt and a trailing `[sharednet-wake <nonce>]` line. With no task:
+     `POST /v2/task.create` (`interactive_mode: false`). The nonce is how this wake's own `user_message` event is told from any other
+     message or trigger that starts a run on the same task.
   4. Poll `GET /v2/task.listMessages`, 3 s apart at first and backing off by half again each time up to 30 s (about 100 reads in
-     40 minutes, against a limit of 100 a minute), until a `status_update` newer than the baseline, and after this wake's own
-     message, says `stopped`, `waiting` or `error`. A task that stopped before this wake does not count as this wake's ending.
+     40 minutes, against a limit of 100 a minute), until a `status_update` newer than the baseline, and after the user event that carries
+     this wake's nonce (not any `running` status, and not another message's run), says `stopped`, `waiting` or `error`. A task that
+     stopped before this wake does not count as this wake's ending. A `429` is answered with the service's `Retry-After` (else the next
+     wait doubled, up to a minute) and is not counted as a failure; failures of `listMessages` and of `task.detail` are counted apart.
      The events are read newest first through their cursor pages down to the baseline, and the time of this wake's own message
      is remembered once seen, so a long run cannot push it out of view.
-  5. **On every `stopped`, `GET /v2/task.detail`.** `has_running_background_jobs: false` settles it and the last
+  5. **On every `stopped`, `GET /v2/task.detail`.** Only a fresh read that says the task is `stopped` **and** `has_running_background_jobs: false` settles it (a task already `running` again does not), and the last
      `assistant_message` (the one marked `delivery_kind: result` if any) is the reply. `true` keeps polling, since background work
      may wake the task and change the results. An omitted field is unknown: it keeps polling too, and at the end of the time
      the wake fails with that reason rather than posting an unsettled reply.
   6. **`waiting` at the end of a run** is a reply that says which case it is: a question (`messageAskUser`/`cascadeAskUser`) is
-     answered by @-mentioning the seat, whose message goes to `task.sendMessage`; an action confirmation is a
+     answered by @-mentioning the seat, whose message goes to `task.sendMessage` (the reply shows the choices Manus offers,
+     `question_expectation.options` and whether several may be picked); an action confirmation is a
      `task.confirmAction` decision, which is **never made from a Room** (it approves a command, an email or a deploy for whoever
      @-mentions the seat) and is to be made in Manus; any other type is not dispatched, and Manus is to be opened.
 - **The delivery's time.** The seat's wake limit (`wake limit`, 40 minutes by default; serve passes it as `timeoutMs`) bounds the
@@ -188,7 +198,8 @@ Its lifecycle follows <https://open.manus.ai/docs/v2/task-lifecycle>.
   and dense code are cut far earlier than a character count would.
 - **The reply.** Markdown links and images are rendered as <https://open.manus.ai/docs/v2/attachments> requires: http(s) kept; an
   absolute path that matches an attachment is named (file name, no link: the download URL is signed and a Room's readers are
-  many); `manus-webdev://` and every other destination removed, with the text around it kept.
+  many); `manus-webdev://` and every other destination removed as a whole node, with the text around it kept. Destinations with
+  balanced parentheses, `<...>` destinations with spaces and titles are parsed as Markdown does.
 - **`busy`, `failed`:** a rate limit (10 messages a minute) is `busy` in 60 s. A read that fails is `busy`. A write that fails
   unclearly (timeout, 5xx) is `failed` and **not** retried: sending again could start a second task or ask twice, and each
   costs Manus credits. A rejected key is `failed`.

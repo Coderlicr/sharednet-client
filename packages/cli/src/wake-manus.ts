@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { checkFromSteps, skipRest, type CheckOptions, type CheckResult, type CheckStep, type Delivery, type DeliveryContext, type Environment, type PluginNet, type SeatWake, type WakeInput, type WakePlugin } from "./wake-driver.ts";
 
 /**
@@ -56,10 +58,11 @@ const REQUEST_MS = 30_000;
 const CHECK_BUDGET_MS = 20_000;
 /** Consecutive failed polls tolerated before the wake is given up (the task itself keeps running). */
 const POLL_FAILURES = 5;
+/** After a 429 on a poll the next one waits at least the double, up to this. */
+const RATE_LIMIT_POLL_MS = 60_000;
 /** Pages of events read back in one poll (100 each) while looking for this wake's marker. */
 const MAX_PAGES = 20;
-/** How often an omitted `has_running_background_jobs` is asked again before sending into a stopped task. */
-const UNKNOWN_JOBS_READS = 3;
+/** How soon an omitted `has_running_background_jobs` is asked again before sending into a stopped task (it backs off). */
 const UNKNOWN_JOBS_WAIT_MS = 2_000;
 /**
  * Manus takes about 5,000 estimated tokens of text per message and answers longer with a 400. Tokens are
@@ -74,6 +77,17 @@ interface ManusAttachment {
   path?: string;
 }
 
+interface TaskState {
+  status?: string;
+  task_url?: string;
+  has_running_background_jobs?: boolean;
+}
+
+interface QuestionExpectation {
+  options?: unknown;
+  selection_mode?: string;
+}
+
 interface StatusDetail {
   waiting_for_event_id?: string;
   waiting_for_event_type?: string;
@@ -84,12 +98,13 @@ interface ManusEvent {
   id?: string;
   type?: string;
   timestamp?: number;
-  assistant_message?: { content?: string; delivery_kind?: string; attachments?: ManusAttachment[] };
+  assistant_message?: { content?: string; delivery_kind?: string; attachments?: ManusAttachment[]; question_expectation?: QuestionExpectation };
+  user_message?: { content?: string };
   error_message?: { content?: string };
   status_update?: { agent_status?: string; status_detail?: StatusDetail };
 }
 
-type Answer = { ok: true; body: Record<string, any> } | { ok: false; status: number; code: string; message: string };
+type Answer = { ok: true; body: Record<string, any> } | { ok: false; status: number; code: string; message: string; retryAfterMs?: number };
 
 export function keyEnvOf(wake: SeatWake): string {
   return wake.api_key_env ?? MANUS_KEY_ENV;
@@ -162,23 +177,85 @@ export function fitPrompt(prompt: string): string {
 }
 
 /**
+ * One Markdown inline link or image starting at `open` (the `[`): its label, its destination and where it ends,
+ * or null when the text there is not one. The label may hold balanced brackets; the destination is `<...>`
+ * (spaces allowed) or a run without whitespace whose parentheses balance, then an optional title.
+ */
+function parseLink(text: string, open: number): { label: string; destination: string; end: number } | null {
+  let depth = 1;
+  let i = open + 1;
+  for (; i < text.length && depth > 0; i += 1) {
+    if (text[i] === "\\") i += 1;
+    else if (text[i] === "[") depth += 1;
+    else if (text[i] === "]") depth -= 1;
+  }
+  if (depth !== 0 || text[i] !== "(") return null;
+  const label = text.slice(open + 1, i - 1);
+  let j = i + 1;
+  while (/\s/.test(text[j] ?? "")) j += 1;
+  let destination: string;
+  if (text[j] === "<") {
+    const close = text.indexOf(">", j + 1);
+    if (close === -1 || text.slice(j + 1, close).includes("\n")) return null;
+    destination = text.slice(j + 1, close);
+    j = close + 1;
+  } else {
+    const from = j;
+    let parens = 0;
+    for (; j < text.length && !/\s/.test(text[j]!); j += 1) {
+      if (text[j] === "\\") j += 1;
+      else if (text[j] === "(") parens += 1;
+      else if (text[j] === ")") {
+        if (parens === 0) break;
+        parens -= 1;
+      }
+    }
+    destination = text.slice(from, j);
+  }
+  while (/\s/.test(text[j] ?? "")) j += 1;
+  const quote = text[j];
+  if (quote === '"' || quote === "'" || quote === "(") {
+    const closer = quote === "(" ? ")" : quote;
+    const close = text.indexOf(closer, j + 1);
+    if (close === -1) return null;
+    j = close + 1;
+    while (/\s/.test(text[j] ?? "")) j += 1;
+  }
+  if (text[j] !== ")") return null;
+  return { label, destination, end: j + 1 };
+}
+
+/**
  * Markdown links and images of an assistant message, as the attachments guide has a client render them:
  * http(s) destinations stay; an absolute path that matches an attachment's `path` becomes the label with the
  * file's name (no URL: the download link is signed and a Room's readers are many); anything else, including
- * `manus-webdev://`, is removed as a node and the text around it stays.
+ * `manus-webdev://`, is removed as a whole node and the text around it stays.
  */
 export function cleanLinks(text: string, attachments: ManusAttachment[] = []): string {
-  return text.replace(/(!?)\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g, (whole, _bang: string, label: string, destination: string) => {
-    if (/^https?:\/\//i.test(destination)) return whole;
-    let path = destination;
-    try {
-      path = decodeURIComponent(destination);
-    } catch {
-      // keep it as written
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const start = text[i] === "[" ? i : text[i] === "!" && text[i + 1] === "[" ? i + 1 : -1;
+    const node = start === -1 ? null : parseLink(text, start);
+    if (node === null) {
+      out += text[i];
+      i += 1;
+      continue;
     }
-    const file = path.startsWith("/") ? attachments.find((attachment) => attachment.path === path) : undefined;
-    return file ? `${label || file.filename || "file"} (attachment ${file.filename ?? "file"}, in the Manus task)` : "";
-  });
+    if (/^https?:\/\//i.test(node.destination)) out += text.slice(i, node.end);
+    else {
+      let path = node.destination;
+      try {
+        path = decodeURIComponent(node.destination);
+      } catch {
+        // keep it as written
+      }
+      const file = path.startsWith("/") ? attachments.find((attachment) => attachment.path === path) : undefined;
+      if (file) out += `${node.label || file.filename || "file"} (attachment ${file.filename ?? "file"}, in the Manus task)`;
+    }
+    i = node.end;
+  }
+  return out;
 }
 
 /** The delivery's limits, shared by every request and sleep of it. */
@@ -224,7 +301,8 @@ async function call(base: string, key: string, limits: Limits, method: "GET" | "
     }
     if (response.ok && body.ok !== false) return { ok: true, body };
     const error = (body.error ?? {}) as { code?: string; message?: string };
-    return { ok: false, status: response.status, code: error.code ?? `http_${response.status}`, message: (error.message ?? `HTTP ${response.status}`).slice(0, 200) };
+    const wait = Number(response.headers.get("retry-after"));
+    return { ok: false, status: response.status, code: error.code ?? `http_${response.status}`, message: (error.message ?? `HTTP ${response.status}`).slice(0, 200), ...(Number.isFinite(wait) && wait > 0 ? { retryAfterMs: Math.min(wait, 300) * 1000 } : {}) };
   } finally {
     clearTimeout(timer);
     limits.signal?.removeEventListener("abort", onStop);
@@ -301,9 +379,9 @@ export function classifyWaiting(detail: StatusDetail | undefined): Waiting {
   return { kind: "unknown", type: type ?? "no type given" };
 }
 
-function waitingNote(waiting: Waiting, link: string): string {
+function waitingNote(waiting: Waiting, link: string, choices?: string): string {
   if (waiting.kind === "question") {
-    return `Manus asked this and is waiting. @-mention this seat with your answer: it is sent to the task as an ordinary message (task.sendMessage). ${link}`;
+    return `Manus asked this and is waiting.${choices ? ` ${choices}` : ""} @-mention this seat with your answer: it is sent to the task as an ordinary message (task.sendMessage). ${link}`;
   }
   if (waiting.kind === "confirmation") {
     return `Manus is waiting for your confirmation of an action (${waiting.type}${waiting.description ? `: ${waiting.description}` : ""}). That is a task.confirmAction decision, which this seat never makes from a Room: decide in Manus at ${link}. An @-mention here sends nothing while it is pending, because a message would skip the action.`;
@@ -311,17 +389,27 @@ function waitingNote(waiting: Waiting, link: string): string {
   return `Manus is waiting for something this seat does not recognise (${waiting.type}). Nothing was sent. Open the task in Manus: ${link}`;
 }
 
+/** The choices an agent question offers (question_expectation), as a sentence; free text is always allowed. */
+function choicesOf(expectation: QuestionExpectation | undefined): string | undefined {
+  const options = Array.isArray(expectation?.options) ? expectation.options.filter((option): option is string => typeof option === "string" && option.trim() !== "") : [];
+  if (options.length === 0) return undefined;
+  const shown = options.slice(0, 20).map((option, index) => `${index + 1}) ${cleanLinks(option.trim()).slice(0, 120)}`).join(" ");
+  return `Choices: ${shown} (${expectation?.selection_mode === "multiple" ? "you may pick several" : "pick one"}, or answer in your own words).`;
+}
+
 /** The newest status event of a list, by time. */
 function latestStatus(events: ManusEvent[]): ManusEvent | undefined {
   return events.filter((event) => event.type === "status_update" && typeof event.timestamp === "number").sort((a, b) => a.timestamp! - b.timestamp!).pop();
 }
 
-function replyOf(turn: ManusEvent[]): { text: string; files: string[] } | null {
+function replyOf(turn: ManusEvent[], question = false): { text: string; files: string[]; choices?: string } | null {
   const said = turn.filter((event) => event.type === "assistant_message" && (event.assistant_message?.content ?? "").trim() !== "");
-  const chosen = [...said].reverse().find((event) => event.assistant_message?.delivery_kind === "result") ?? said[said.length - 1];
+  const asked = question ? [...said].reverse().find((event) => choicesOf(event.assistant_message?.question_expectation) !== undefined) : undefined;
+  const chosen = asked ?? [...said].reverse().find((event) => event.assistant_message?.delivery_kind === "result") ?? said[said.length - 1];
   if (!chosen) return null;
   const attachments = chosen.assistant_message?.attachments ?? [];
-  return { text: cleanLinks(chosen.assistant_message!.content!.trim(), attachments).trim(), files: attachments.map((file) => file.filename ?? "file") };
+  const choices = choicesOf(chosen.assistant_message?.question_expectation);
+  return { text: cleanLinks(chosen.assistant_message!.content!.trim(), attachments).trim(), files: attachments.map((file) => file.filename ?? "file"), ...(choices ? { choices } : {}) };
 }
 
 export const manusPlugin: WakePlugin = {
@@ -340,30 +428,41 @@ export const manusPlugin: WakePlugin = {
     const budgetMs = Math.min(context.timeoutMs, MAX_WAIT_MS);
     const limits: Limits = { io, deadline: io.now() + budgetMs, signal: context.signal };
     const api = (method: "GET" | "POST", path: string, params: Record<string, string | number> | Record<string, unknown>) => call(where.base, key, limits, method, path, params);
-    const message = { content: fitPrompt(withoutBudget(input.prompt)) };
+    // Manus echoes the message back as a user_message event; the nonce is how this wake's own is told from any other
+    // message or trigger that starts a run on the same task.
+    const nonce = randomUUID().replace(/-/g, "").slice(0, 16);
+    const message = { content: `${fitPrompt(withoutBudget(input.prompt))}\n\n[sharednet-wake ${nonce}]` };
     const nap = (ms: number) => io.sleep(Math.min(ms, Math.max(0, remaining(limits))), limits.signal);
 
     let taskId = wake.session;
     let taskUrl: string | undefined;
     let baseline = 0;
     if (taskId) {
-      const detail = await api("GET", "/v2/task.detail", { task_id: taskId });
-      if (!detail.ok) return refused(detail, "task lookup", keyEnv);
-      let task = (detail.body.task ?? {}) as { status?: string; task_url?: string; has_running_background_jobs?: boolean };
-      taskUrl = task.task_url;
-      // A task that is working would take this message into its current run; leave the line for later instead.
-      if (task.status === "running") return { kind: "busy", why: "its Manus task is still running", retryMs: RETRY_MS };
-      if (task.status === "stopped") {
+      const look = async (): Promise<{ task: TaskState } | { failure: Extract<Answer, { ok: false }> }> => {
+        const read = await api("GET", "/v2/task.detail", { task_id: taskId! });
+        return read.ok ? { task: (read.body.task ?? {}) as TaskState } : { failure: read };
+      };
+      let seen = await look();
+      // Nothing is sent until the task is known to be safe to send into, on the freshest read: every refresh is
+      // judged again (a stopped task can be running by the next one), and an omitted jobs field is unknown, not false.
+      let waitMs = UNKNOWN_JOBS_WAIT_MS;
+      for (;;) {
+        if ("failure" in seen) return refused(seen.failure, "task lookup", keyEnv);
+        const task = seen.task;
+        taskUrl = task.task_url ?? taskUrl;
+        // A task that is working would take this message into its current run; leave the line for later instead.
+        if (task.status === "running") return { kind: "busy", why: "its Manus task is still running", retryMs: RETRY_MS };
+        if (task.status !== "stopped") break;
         // A stopped task whose background work is still going may wake itself and change the results.
-        for (let read = 1; task.has_running_background_jobs === undefined && read <= UNKNOWN_JOBS_READS; read += 1) {
-          await nap(UNKNOWN_JOBS_WAIT_MS);
-          const again = await api("GET", "/v2/task.detail", { task_id: taskId });
-          if (!again.ok) return refused(again, "task lookup", keyEnv);
-          task = (again.body.task ?? task) as typeof task;
-        }
+        if (task.has_running_background_jobs === false) break;
         if (task.has_running_background_jobs === true) return { kind: "busy", why: "its Manus task has background work still running", retryMs: RETRY_MS };
-        // Still omitted after the reads: it is unknown, not false; the message is sent (an old task never reports it).
+        if (stopping(limits)) return { kind: "busy", why: "serve is stopping", retryMs: RETRY_MS };
+        await nap(waitMs);
+        waitMs = Math.min(Math.round(waitMs * 1.5), POLL_MAX_MS);
+        if (remaining(limits) <= 0) return failed(`Manus does not say whether background work is running on its task (has_running_background_jobs is not reported), so nothing was sent; the task is at ${taskUrl ?? `https://manus.im/app/${taskId}`}`);
+        seen = await look();
       }
+      const task = (seen as { task: TaskState }).task;
       const recent = await api("GET", "/v2/task.listMessages", { task_id: taskId, order: "desc", limit: 100 });
       if (!recent.ok) return refused(recent, "message lookup", keyEnv);
       const events = (recent.body.messages ?? []) as ManusEvent[];
@@ -407,8 +506,14 @@ export const manusPlugin: WakePlugin = {
       return { events };
     };
 
-    let failures = 0;
+    // Failures are counted per kind of request, so a success of one does not hide the repeated failure of the other.
+    let listFailures = 0;
+    let detailFailures = 0;
     let interval = POLL_FIRST_MS;
+    /** A 429 is the service saying slow down: wait as it says (or doubled, up to a minute), and do not count it as a failure. */
+    const slowDown = (answer: Extract<Answer, { ok: false }>) => {
+      interval = Math.max(answer.retryAfterMs ?? 0, Math.min(interval * 2, RATE_LIMIT_POLL_MS));
+    };
     for (;;) {
       if (stopping(limits)) return failed(`serve was stopping while Manus was working; the task keeps running at ${link}`);
       const left = remaining(limits);
@@ -421,19 +526,24 @@ export const manusPlugin: WakePlugin = {
         const page = read.error;
         if (page.code === "deadline") return spent();
         if (page.code === "aborted") continue;
+        if (page.status === 429) {
+          slowDown(page);
+          continue;
+        }
         if (page.status === 401 || page.status === 404) return refused(page, "reading the reply", keyEnv);
-        if (++failures >= POLL_FAILURES) return failed(`Manus could not be read after the message was sent (${page.message}); the task may still answer at ${link}`);
+        if (++listFailures >= POLL_FAILURES) return failed(`Manus could not be read after the message was sent (${page.message}); the task may still answer at ${link}`);
         continue;
       }
-      failures = 0;
+      listFailures = 0;
       const fresh = read.events
         .filter((event) => typeof event.timestamp === "number" && event.timestamp > baseline)
         .reverse();
       if (anchor === null) {
-        const mine = fresh.find((event) => event.type === "user_message");
-        const running = fresh.find((event) => event.type === "status_update" && event.status_update?.agent_status === "running");
-        if (!mine && !running) continue;
-        anchor = (mine ?? running)!.timestamp!;
+        // Only the user event that carries this wake's own nonce proves a run is this wake's: not any other
+        // message, and not a `running` status, which another message or a trigger can start as well.
+        const mine = fresh.find((event) => event.type === "user_message" && (event.user_message?.content ?? "").includes(nonce));
+        if (!mine) continue;
+        anchor = mine.timestamp!;
       }
       const turn = fresh.filter((event) => event.timestamp! >= anchor!);
       const end = latestStatus(turn);
@@ -443,15 +553,26 @@ export const manusPlugin: WakePlugin = {
         return failed(`its Manus task failed${problem ? `: ${problem.slice(0, 160)}` : ""} (${link})`);
       }
       if (state === "stopped") {
-        // Stopped is not final: background work may still change the result. Only `false` settles it.
+        // Stopped is not final: background work may still change the result. Only a fresh read that says the task
+        // is stopped and `has_running_background_jobs: false` settles it; a task already running again does not.
         const detail = await api("GET", "/v2/task.detail", { task_id: taskId! });
         if (!detail.ok) {
           if (detail.code === "deadline") return spent();
           if (detail.code === "aborted") continue;
-          if (++failures >= POLL_FAILURES) return failed(`Manus could not be read after the message was sent (${detail.message}); the task may still answer at ${link}`);
+          if (detail.status === 429) {
+            slowDown(detail);
+            continue;
+          }
+          if (++detailFailures >= POLL_FAILURES) return failed(`Manus could not be read after the message was sent (${detail.message}); the task may still answer at ${link}`);
           continue;
         }
-        const jobs = detail.body.task?.has_running_background_jobs;
+        detailFailures = 0;
+        const now = (detail.body.task ?? {}) as TaskState;
+        const jobs = now.has_running_background_jobs;
+        if (now.status !== "stopped") {
+          unsettled = `the task was ${now.status ?? "in an unknown state"} again`;
+          continue;
+        }
         if (jobs !== false) {
           unsettled = jobs === true ? "background work was still running" : "whether background work is running was not reported";
           continue;
@@ -463,8 +584,8 @@ export const manusPlugin: WakePlugin = {
       }
       if (state === "waiting") {
         const waiting = classifyWaiting(end!.status_update?.status_detail);
-        const reply = replyOf(turn);
-        return { kind: "replied", reply: [...(reply ? [reply.text] : []), `(${waitingNote(waiting, link)})`].join("\n\n") };
+        const reply = replyOf(turn, waiting.kind === "question");
+        return { kind: "replied", reply: [...(reply ? [reply.text] : []), `(${waitingNote(waiting, link, reply?.choices)})`].join("\n\n") };
       }
       // running: keep polling
     }

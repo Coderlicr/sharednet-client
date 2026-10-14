@@ -20,7 +20,8 @@ const input: WakeInput = { ...about, prompt: "TURN PROMPT", livePrompt: liveProm
 const wake: SeatWake = { driver: "manus", session: TASK, cwd: "/work", command: MANUS_API };
 
 type Event = Record<string, unknown>;
-const user = (timestamp: number, content = "TURN PROMPT"): Event => ({ id: `u${timestamp}`, type: "user_message", timestamp, user_message: { content } });
+// "__SENT__" stands for the text the plugin really sent, which the stand-in fills in (it carries a per-wake nonce).
+const user = (timestamp: number, content = "__SENT__"): Event => ({ id: `u${timestamp}`, type: "user_message", timestamp, user_message: { content } });
 const said = (timestamp: number, content: string, extra: Record<string, unknown> = {}): Event => ({ id: `a${timestamp}`, type: "assistant_message", timestamp, assistant_message: { content, ...extra } });
 const status = (timestamp: number, agent_status: string, status_detail?: Record<string, unknown>): Event => ({ id: `s${timestamp}`, type: "status_update", timestamp, status_update: { agent_status, ...(status_detail ? { status_detail } : {}) } });
 
@@ -46,14 +47,25 @@ class FakeManus {
   clock = 1_000_000;
   evolve: Array<(fake: FakeManus) => void> = [];
   onSend: (fake: FakeManus, body: Record<string, any>) => void = () => undefined;
-  replies: Record<string, { status: number; body: Record<string, unknown> }> = {};
+  replies: Record<string, { status: number; body: Record<string, unknown>; headers?: Record<string, string> }> = {};
+  /** Answers served once each, in order, before the usual ones (a service that fails a few times, then recovers). */
+  queue: Record<string, Array<{ status: number; body: Record<string, unknown>; headers?: Record<string, string> }>> = {};
 
   constructor(history: Event[] = []) {
     this.events = [...history];
   }
 
-  private respond(status: number, body: Record<string, unknown>) {
-    return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  private respond(status: number, body: Record<string, unknown>, headers: Record<string, string> = {}) {
+    return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+  }
+
+  private delivered(body: Record<string, any>) {
+    const before = this.events.length;
+    this.onSend(this, body);
+    for (const event of this.events.slice(before)) {
+      const sent = event.user_message as { content?: string } | undefined;
+      if (event.type === "user_message" && sent?.content === "__SENT__") sent.content = body.message.content;
+    }
   }
 
   api: PluginNet = {
@@ -74,8 +86,10 @@ class FakeManus {
         redirect: init?.redirect,
       };
       this.calls.push(call);
+      const queued = this.queue[`${call.method} ${call.path}`]?.shift();
+      if (queued) return this.respond(queued.status, queued.body, queued.headers);
       const scripted = this.replies[`${call.method} ${call.path}`];
-      if (scripted) return this.respond(scripted.status, scripted.body);
+      if (scripted) return this.respond(scripted.status, scripted.body, scripted.headers);
       if (call.path === "/v2/task.detail") return this.respond(200, { ok: true, task: this.task });
       if (call.path === "/v2/user.me") return this.respond(200, { ok: true, user_id: "u_1" });
       if (call.path === "/v2/task.listMessages") {
@@ -87,11 +101,11 @@ class FakeManus {
         return this.respond(200, { ok: true, task_id: TASK, messages: page, has_more: more, ...(more ? { next_cursor: String(start + limit) } : {}) });
       }
       if (call.path === "/v2/task.sendMessage") {
-        this.onSend(this, call.body!);
+        this.delivered(call.body!);
         return this.respond(200, { ok: true, task_id: TASK });
       }
       if (call.path === "/v2/task.create") {
-        this.onSend(this, call.body!);
+        this.delivered(call.body!);
         return this.respond(200, { ok: true, task_id: TASK, task_url: LINK });
       }
       throw new Error(`unscripted ${call.method} ${call.path}`);
@@ -173,7 +187,7 @@ describe("the manus plugin: continuing a task", () => {
       "GET /v2/task.detail",
     ]);
     const send = fake.posts()[0]!;
-    expect(send.body).toEqual({ task_id: TASK, message: { content: "TURN PROMPT" } });
+    expect(send.body).toEqual({ task_id: TASK, message: { content: expect.stringMatching(/^TURN PROMPT\n\n\[sharednet-wake [0-9a-f]{16}\]$/) } });
     expect(send.headers["x-manus-api-key"]).toBe(KEY);
     // The key travels in a header, never in a URL, and a redirect is an error rather than followed.
     expect(fake.calls.map((call) => call.path + JSON.stringify(call.query)).join(" ")).not.toContain(KEY);
@@ -232,29 +246,37 @@ describe("the manus plugin: continuing a task", () => {
     expect(await manusPlugin.deliver(wake, input, later.context())).toEqual({ kind: "replied", reply: "an answer" });
   });
 
-  it("does not send into a stopped task whose background work is still running, and asks again when the field is omitted", async () => {
+  it("does not send into a stopped task whose background work is still running; an omitted field is unknown, so it waits and never sends until it is reported false", async () => {
     const busy = new FakeManus(PRIOR);
     busy.task.has_running_background_jobs = true;
     expect(await manusPlugin.deliver(wake, input, busy.context())).toMatchObject({ kind: "busy", retryMs: 30_000 });
     expect(busy.paths()).toEqual(["GET /v2/task.detail"]);
 
-    const unknown = new FakeManus(PRIOR);
-    delete unknown.task.has_running_background_jobs;
-    unknown.onSend = started;
-    unknown.evolve = [(f) => void (f.task.has_running_background_jobs = true)];
-    expect(await manusPlugin.deliver(wake, input, unknown.context())).toMatchObject({ kind: "busy", why: expect.stringContaining("background work") });
-    expect(unknown.posts()).toHaveLength(0);
+    // Omitted at first, then reported true: busy, nothing sent.
+    const later = new FakeManus(PRIOR);
+    delete later.task.has_running_background_jobs;
+    later.evolve = [(f) => void (f.task.has_running_background_jobs = true)];
+    expect(await manusPlugin.deliver(wake, input, later.context())).toMatchObject({ kind: "busy", why: expect.stringContaining("background work") });
+    expect(later.posts()).toHaveLength(0);
 
-    // Never reported (an old task): unknown is not true, so after the reads the message is sent.
-    const old = new FakeManus(PRIOR);
-    delete old.task.has_running_background_jobs;
-    old.onSend = (f) => {
+    // Omitted at first, then reported false: now it is sent.
+    const reported = new FakeManus(PRIOR);
+    delete reported.task.has_running_background_jobs;
+    reported.onSend = (f) => {
       started(f);
       f.events.push(said(300, "ok", { delivery_kind: "result" }), status(301, "stopped"));
-      f.task.has_running_background_jobs = false;
     };
-    expect(await manusPlugin.deliver(wake, input, old.context())).toEqual({ kind: "replied", reply: "ok" });
-    expect(old.calls.filter((call) => call.path === "/v2/task.detail").length).toBeGreaterThanOrEqual(4);
+    reported.evolve = [() => undefined, (f) => void (f.task.has_running_background_jobs = false)];
+    expect(await manusPlugin.deliver(wake, input, reported.context())).toEqual({ kind: "replied", reply: "ok" });
+
+    // Never reported (an old task): unknown is not false. Nothing is sent, through the whole delivery time.
+    const never = new FakeManus(PRIOR);
+    delete never.task.has_running_background_jobs;
+    const delivery = await manusPlugin.deliver(wake, input, never.context(undefined, 2 * 60_000));
+    expect(delivery).toMatchObject({ kind: "failed", why: expect.stringContaining("has_running_background_jobs is not reported") });
+    expect(delivery.kind === "failed" && delivery.why).toContain("nothing was sent");
+    expect(never.posts()).toHaveLength(0);
+    expect(never.sleeps.reduce((sum, ms) => sum + ms, 0)).toBe(2 * 60_000);
   });
 
   it("falls back to the last message when none is marked a result, and names attached files without linking them", async () => {
@@ -289,7 +311,10 @@ describe("the manus plugin: waiting", () => {
     // ... and it does: the task is waiting on a question, so the next wake's message is sent into it.
     const pending = new FakeManus([...PRIOR, user(600), said(601, "Which branch?"), status(602, "waiting", { waiting_for_event_type: "messageAskUser" })]);
     pending.task.status = "waiting";
-    pending.onSend = (f) => f.events.push(user(700), said(703, "building main", { delivery_kind: "result" }), status(704, "stopped"));
+    pending.onSend = (f) => {
+      f.task.status = "stopped";
+      f.events.push(user(700), said(703, "building main", { delivery_kind: "result" }), status(704, "stopped"));
+    };
     expect(await manusPlugin.deliver(wake, input, pending.context())).toEqual({ kind: "replied", reply: "building main" });
     expect(pending.posts().map((call) => call.path)).toEqual(["/v2/task.sendMessage"]);
   });
@@ -336,7 +361,7 @@ describe("the manus plugin: starting a task", () => {
     fake.onSend = (f) => f.events.push(user(9), status(10, "running"), said(11, "On it: green.", { delivery_kind: "result" }), status(12, "stopped"));
     const delivery = await manusPlugin.deliver({ driver: "manus", cwd: "/work", command: MANUS_API, api_key_env: "TEAM_MANUS_KEY" }, input, fake.context({ TEAM_MANUS_KEY: KEY }));
     expect(delivery).toEqual({ kind: "replied", reply: "On it: green." });
-    expect(fake.calls[0]).toMatchObject({ method: "POST", path: "/v2/task.create", body: { message: { content: "TURN PROMPT" }, interactive_mode: false } });
+    expect(fake.calls[0]).toMatchObject({ method: "POST", path: "/v2/task.create", body: { message: { content: expect.stringContaining("TURN PROMPT") }, interactive_mode: false } });
     expect(String(fake.calls[0]!.body!.title)).toContain("manus-helper");
     expect(fake.calls[1]!.query).toMatchObject({ task_id: TASK });
   });
@@ -444,7 +469,7 @@ describe("the manus plugin: the message and the reply", () => {
     fake.onSend = (f) => f.events.push(user(9_000), said(9_001, "ok", { delivery_kind: "result" }), status(9_002, "stopped"));
     const prompt = "[SharedNet] You were addressed.\n#7 ann: hi\n\nDo what is asked.\n\nExecution budget: 40 minutes; sharednet wake checkpoint \"x\" --as i_Seat.\n\nMore after.";
     await manusPlugin.deliver(wake, { ...input, prompt }, fake.context());
-    expect(fake.posts()[0]!.body!.message.content).toBe("[SharedNet] You were addressed.\n#7 ann: hi\n\nDo what is asked.\n\nMore after.");
+    expect(String(fake.posts()[0]!.body!.message.content).replace(/\n\n\[sharednet-wake [0-9a-f]{16}\]$/, "")).toBe("[SharedNet] You were addressed.\n#7 ann: hi\n\nDo what is asked.\n\nMore after.");
     expect(withoutBudget("no budget here")).toBe("no budget here");
   });
 
@@ -623,5 +648,127 @@ describe("the manus plugin: when it cannot be delivered", () => {
     };
     expect(await manusPlugin.deliver(wake, input, fake.context())).toMatchObject({ kind: "failed", why: expect.stringContaining(`may still answer at ${LINK}`) });
     expect(polls).toBe(5);
+  });
+});
+
+describe("the manus plugin: second review of #31 (each case is a probe that failed on c81069f)", () => {
+  it("re-judges the task on every refresh before sending: stopped, then running, is not sent into", async () => {
+    const fake = new FakeManus(PRIOR);
+    delete fake.task.has_running_background_jobs;
+    fake.evolve = [(f) => void (f.task.status = "running")];
+    expect(await manusPlugin.deliver(wake, input, fake.context())).toMatchObject({ kind: "busy", why: "its Manus task is still running" });
+    expect(fake.posts()).toHaveLength(0);
+  });
+
+  it("does not consume a stale result when a fresh read says the task is running again, though jobs read false", async () => {
+    const fake = new FakeManus(PRIOR);
+    fake.onSend = (f) => f.events.push(user(200), said(203, "stale answer", { delivery_kind: "result" }), status(204, "stopped"));
+    // The first read after the stop already shows a run again; only the later one is the settled end.
+    fake.task.status = "running";
+    fake.evolve = [
+      () => undefined,
+      (f) => {
+        f.task.status = "stopped";
+        f.events.push(said(300, "the real answer", { delivery_kind: "result" }), status(301, "stopped"));
+      },
+    ];
+    // task.detail first says stopped (before the send); the run is running by the time the stop is read.
+    fake.task.status = "stopped";
+    let reads = 0;
+    const real = fake.api.fetch!;
+    fake.api.fetch = async (target, init) => {
+      if (String(target).includes("task.detail") && fake.posts().length > 0 && ++reads === 1) fake.task.status = "running";
+      return real(target, init);
+    };
+    expect(await manusPlugin.deliver(wake, input, fake.context())).toEqual({ kind: "replied", reply: "the real answer" });
+  });
+
+  it("does not take another run's answer for this wake's: only the user event carrying this wake's own nonce is the start", async () => {
+    // Another message from the UI (or a trigger) starts a run before this wake's event appears.
+    const fake = new FakeManus(PRIOR);
+    fake.onSend = () => undefined;
+    fake.evolve = [
+      (f) => f.events.push(user(150, "a message typed in the Manus app"), status(151, "running"), said(152, "the other run's answer", { delivery_kind: "result" }), status(153, "stopped")),
+      (f) => f.events.push(user(200), status(201, "running"), said(202, "this wake's answer", { delivery_kind: "result" }), status(203, "stopped")),
+    ];
+    // (the user(200) above has no content yet: give it the nonce the plugin sent)
+    const real = fake.api.fetch!;
+    let sent = "";
+    fake.api.fetch = async (target, init) => {
+      if (String(target).includes("sendMessage")) sent = JSON.parse(String(init!.body)).message.content;
+      for (const event of fake.events) if (event.type === "user_message" && (event.user_message as { content: string }).content === "__SENT__") (event.user_message as { content: string }).content = sent;
+      return real(target, init);
+    };
+    expect(await manusPlugin.deliver(wake, input, fake.context())).toEqual({ kind: "replied", reply: "this wake's answer" });
+  });
+
+  it("counts failures of task.detail on their own, so a succeeding listMessages does not hide them", async () => {
+    const fake = new FakeManus(PRIOR);
+    fake.onSend = (f) => f.events.push(user(200), said(203, "done", { delivery_kind: "result" }), status(204, "stopped"));
+    const real = fake.api.fetch!;
+    let detailFailures = 0;
+    fake.api.fetch = async (target, init) => {
+      if (String(target).includes("task.detail") && fake.posts().length > 0 && ++detailFailures > 0) throw new TypeError("fetch failed");
+      return real(target, init);
+    };
+    const delivery = await manusPlugin.deliver(wake, input, fake.context());
+    expect(delivery).toMatchObject({ kind: "failed", why: expect.stringContaining("could not be read after the message was sent") });
+    expect(detailFailures).toBe(5);
+  });
+
+  it("answers a 429 while polling with the service's own delay, and does not give up after five", async () => {
+    const fake = new FakeManus(PRIOR);
+    fake.onSend = started;
+    fake.queue["GET /v2/task.listMessages"] = [
+      { status: 200, body: { ok: true, messages: [], has_more: false } }, // the baseline read at the start
+      ...Array.from({ length: 8 }, () => ({ status: 429, body: { ok: false, error: { code: "rate_limited", message: "slow down" } }, headers: { "retry-after": "20" } })),
+    ];
+    fake.evolve = Array.from({ length: 8 }, () => () => undefined);
+    fake.evolve.push((f) => f.events.push(said(300, "done", { delivery_kind: "result" }), status(301, "stopped")));
+    expect(await manusPlugin.deliver(wake, input, fake.context())).toEqual({ kind: "replied", reply: "done" });
+    // Each wait after a 429 is at least what the service said (20 s), not the poll's own short interval.
+    const waits = fake.sleeps.slice(1, 9);
+    expect(waits.every((ms) => ms >= 20_000)).toBe(true);
+  });
+
+  it("without a Retry-After, a 429 doubles the next wait, up to a minute", async () => {
+    const fake = new FakeManus(PRIOR);
+    fake.onSend = started;
+    fake.queue["GET /v2/task.listMessages"] = [{ status: 200, body: { ok: true, messages: [], has_more: false } }, ...Array.from({ length: 4 }, () => ({ status: 429, body: { ok: false, error: { code: "rate_limited", message: "slow down" } } }))];
+    fake.evolve = [() => undefined, () => undefined, () => undefined, () => undefined, (f) => f.events.push(said(300, "ok", { delivery_kind: "result" }), status(301, "stopped"))];
+    expect(await manusPlugin.deliver(wake, input, fake.context())).toEqual({ kind: "replied", reply: "ok" });
+    // the next planned wait, doubled each time, up to a minute
+    expect(fake.sleeps.slice(1, 5)).toEqual([9000, 27000, 60000, 60000]);
+  });
+
+  it("removes a whole unresolved link node, however its destination is written", () => {
+    // balanced parentheses in the destination, an angle-bracket destination with spaces, a title, a nested label
+    expect(cleanLinks("See [r](/home/ubuntu/report_(1).pdf) here.")).toBe("See  here.");
+    expect(cleanLinks("See [r](</home/ubuntu/my report.pdf>) here.")).toBe("See  here.");
+    expect(cleanLinks('See [r](/home/ubuntu/a.pdf "the title") here.')).toBe("See  here.");
+    expect(cleanLinks("See ![chart [1]](/home/ubuntu/c(2).png) here.")).toBe("See  here.");
+    expect(cleanLinks("a [not a link] and (parens) stay; so does [x] (y)")).toBe("a [not a link] and (parens) stay; so does [x] (y)");
+    // ... and resolves a matching one written either way
+    const attachments = [{ filename: "my report.pdf", path: "/home/ubuntu/my report.pdf" }, { filename: "r (1).pdf", path: "/home/ubuntu/r_(1).pdf" }];
+    expect(cleanLinks("[a](</home/ubuntu/my report.pdf>) and [b](/home/ubuntu/r_(1).pdf).", attachments)).toBe("a (attachment my report.pdf, in the Manus task) and b (attachment r (1).pdf, in the Manus task).");
+    expect(cleanLinks("[a](https://example.com/x_(1))", attachments)).toBe("[a](https://example.com/x_(1))");
+  });
+
+  it("shows the Room a question's choices, which Manus supplies as options and a selection mode", async () => {
+    const fake = new FakeManus(PRIOR);
+    fake.onSend = (f) =>
+      f.events.push(
+        user(600),
+        said(601, "Which formats should I export?", { question_expectation: { options: ["PDF", "DOCX"], selection_mode: "multiple", response_method: "send_message" } }),
+        status(602, "waiting", { waiting_for_event_type: "messageAskUser", waiting_for_event_id: "evt_1" }),
+      );
+    const delivery = await manusPlugin.deliver(wake, input, fake.context());
+    const text = delivery.kind === "replied" ? delivery.reply! : "";
+    expect(text).toContain("Which formats should I export?");
+    expect(text).toContain("Choices: 1) PDF 2) DOCX (you may pick several, or answer in your own words).");
+    const single = new FakeManus(PRIOR);
+    single.onSend = (f) => f.events.push(user(600), said(601, "Which branch?", { question_expectation: { options: ["main", "dev"], selection_mode: "single" } }), status(602, "waiting", { waiting_for_event_type: "cascadeAskUser", waiting_for_event_id: "evt_1" }));
+    const one = await manusPlugin.deliver(wake, input, single.context());
+    expect(one.kind === "replied" && one.reply).toContain("Choices: 1) main 2) dev (pick one, or answer in your own words).");
   });
 });
