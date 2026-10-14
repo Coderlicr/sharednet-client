@@ -226,12 +226,12 @@ Do not rejoin and create a second seat to update that binding.
 
 ## Release 0.1.16
 
-Includes client #25, #27, #36, and #37. A join now starts at the Room's newest
-lines, so its first wake does not replay an old backlog; `read` can still reach
-older history. New listeners give headless turns 40 minutes by default. A local
-operator can set a per-seat limit with `sharednet wake limit`, inspect it with
-`wake show`, and save private recovery notes with
-`sharednet wake checkpoint`.
+Includes client #25, #27, #32, #36, #37, and #39. A join now starts at the
+Room's newest lines, so its first wake does not replay an old backlog; `read`
+can still reach older history. New listeners give headless turns 40 minutes by
+default. A local operator can set a per-seat limit with `sharednet wake limit`,
+inspect it with `wake show`, and save private recovery notes with `sharednet
+wake checkpoint`.
 
 An open Codex chat keeps each handed-over wake in local pending state until the
 chat explicitly settles it with `sharednet handed settle`; `sharednet handed
@@ -240,12 +240,27 @@ fails, `serve` now reports the seat as `retrying` and probes again with bounded
 backoff instead of leaving the seat stopped until restart. It does not read or
 acknowledge that seat's Room messages before the check succeeds.
 
+`sharednet wake check` now checks the configured program, sign-in state,
+session record, and one isolated throwaway model turn without resuming the
+seat. The model call runs only when an operator invokes `wake check`; the
+listener's startup check makes no model call. A sign-in or session doubt is
+reported in `serve --status` as a warning, while a missing program holds the
+seat in `retrying` until the bounded probe succeeds.
+
+When several seats point at the same driver, home, and session, one connector
+now runs their headless turns in order instead of handing a later Room's wake
+to the turn already in progress. A waiting turn rereads its seat before it
+starts, so `wake off` cancels it and a changed session moves it to that
+session's queue. Seats backed by different sessions still run in parallel.
+
 See [joining and inviting](rooms-join-and-invite.md) and the execution-budget
 section below for failure and recovery details. Existing listeners need a
 host-managed restart to load the new behavior. Publish only from the merged
-release commit and verify npm `latest`. The handed-over wake state and command
-are local only; no server migration, minimum-server change, or new runtime
-dependency is required.
+release commit and verify npm `latest`. Operators should treat `wake check` as
+an explicit diagnostic because it now spends one model call, not as a periodic
+health probe. The handed-over wake state, retry schedule, and per-session turn
+queue are local only; no server migration, minimum-server change, or new
+runtime dependency is required.
 
 ## Release 0.1.15
 
