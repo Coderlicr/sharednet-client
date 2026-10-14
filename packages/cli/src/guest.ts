@@ -13,7 +13,7 @@ import { detectRuntime, type DetectedRuntime } from "./runtime-detection.ts";
 import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn, triggerTakesParameter, wakeIdentity, type Trigger } from "./triggers.ts";
 import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
 import { chatOpen } from "./wake-claude.ts";
-import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
+import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
 import { describeWake, isWakeDriver, pluginFor, seatWakeFrom } from "./wake-plugins.ts";
 import {
   getOrCreateInstallationSecret,
@@ -61,8 +61,8 @@ export interface GuestDependencies {
   runTurn?: TurnRunner;
   /** Whether the Claude Code chat that took a seat is still open; tests replace it. */
   chatOpen?: (pid: number) => boolean;
-  /** Whether a seat's wake program starts at all (the plugin's check); tests replace it. */
-  checkWake?: (wake: SeatWake) => Promise<CheckResult>;
+  /** Whether a seat's wake can be delivered (the plugin's check); tests replace it. */
+  checkWake?: (wake: SeatWake, options: CheckOptions) => Promise<CheckResult>;
   /**
    * Starts `sharednet serve` in the background after a join, so the session that joined is woken
    * when it is addressed. Only the real process supplies it; without it, a join starts nothing.
@@ -2675,6 +2675,8 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const seatKey = (seat: StoredRoomCredential) => `${seat.room_id}/${seat.member_id}`;
   const tracked = new Map(seats.map((seat) => [seatKey(seat), seat]));
   const turnTimes = new Map<string, number[]>();
+  /** What serve's start check doubted about a seat it drives anyway (`wake_warnings` in `serve --status`). */
+  const wakeWarnings = new Map<string, string[]>();
   const inTurnOrder = sessionTurnOrder();
   const statusOf = (all: StoredRoomCredential[]): ServeStatus => ({
     pid: process.pid,
@@ -2688,6 +2690,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       name: seat.name,
       resumes: !command && seat.wake ? describeWake(seat.wake) : null,
       ...(health.get(seatKey(seat)) ?? { state: "starting" as const, updated_at: started }),
+      ...(wakeWarnings.get(seatKey(seat))?.length ? { wake_warnings: wakeWarnings.get(seatKey(seat)) } : {}),
     })),
   });
   const holder = await claimServe(paths, statusOf(seats));
@@ -2713,7 +2716,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const exec = dependencies.exec ?? defaultExec;
   const drive = dependencies.runTurn ?? runTurn;
   const open = dependencies.chatOpen ?? chatOpen;
-  const checkWake = dependencies.checkWake ?? ((wake: SeatWake) => pluginFor(wake.driver).check(wake, dependencies.env, drive));
+  const checkWake = dependencies.checkWake ?? ((wake: SeatWake, options: CheckOptions) => pluginFor(wake.driver).check(wake, dependencies.env, drive, options));
 
   // With --push the seats sit behind a doorbell (wait PR 7): no long-poll, and not one request while
   // nothing is said. Ctrl-C takes the doorbells down before it goes.
@@ -2783,10 +2786,15 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
           attempt = -1;
           continue;
         }
-        const checked = await checkWake(wake);
+        // Only the steps that cost no model call; `sharednet wake check` also makes one. Only a
+        // program that does not start holds the seat back: a sign-in or session in doubt is shown
+        // in `serve --status`, and a delivery that does fail says so in the Room.
+        const checked = startVerdict(await checkWake(wake, { call: false }));
         if (checked.ok) {
           // The repair may have replaced the command or session while serve was retrying.
           seat.wake = wake;
+          wakeWarnings.set(seatKey(seat), checked.warnings);
+          for (const warning of checked.warnings) dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} (${me}) wake warning: ${warning}. Check with \`sharednet wake check --as ${me}\`.\n`);
           break;
         }
         const delay = Math.min(CHECK_RETRY_MS * 2 ** attempt, CHECK_RETRY_MAX_MS);
@@ -3221,7 +3229,7 @@ type ServeStatus = {
   drives?: boolean;
   /** Capability of the running daemon, not the invoking CLI. */
   wake_protocol?: "wake-plugins-v1";
-  seats?: Array<{ room_id: string; member_id: string; name: string; resumes: string | null; state?: string; last_error?: string; updated_at?: string }>;
+  seats?: Array<{ room_id: string; member_id: string; name: string; resumes: string | null; state?: string; last_error?: string; updated_at?: string; wake_warnings?: string[] }>;
 };
 
 function serveStatusPath(paths: ReturnType<typeof getStoragePaths>): string {
@@ -3367,9 +3375,13 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
   if (action === "check") {
     if (!credential.wake) throw localError("not_driven", `${credential.member_id} has no wake. Set one with: sharednet wake set <driver> --as ${credential.member_id}`);
     const wake = credential.wake;
-    const checked = await (dependencies.checkWake ?? ((candidate: SeatWake) => pluginFor(candidate.driver).check(candidate, dependencies.env, dependencies.runTurn ?? runTurn)))(wake);
+    // Explicitly asked, the check proves the whole path, including one throwaway model call.
+    const check = dependencies.checkWake ?? ((candidate: SeatWake, options: CheckOptions) => pluginFor(candidate.driver).check(candidate, dependencies.env, dependencies.runTurn ?? runTurn, options));
+    const checked = await check(wake, { call: true });
+    // Every step, so a person sees what passed as well as what failed; the error carries the failures.
+    for (const step of checked.steps ?? []) dependencies.stderr?.(`wake check: ${STEP_LABELS[step.step]} ${step.status}: ${step.message}\n`);
     if (!checked.ok) throw localError("wake_command_unavailable", `${describeWake(wake)}: ${checked.message}`);
-    return { ...shown(wake), check: checked.message };
+    return { ...shown(wake), check: checked.message, ...(checked.steps ? { steps: checked.steps } : {}) };
   }
 
   if (!isWakeDriver(driver)) throw localError("invalid_arguments", `The wake drivers are codex, claude-code and command. ${WAKE_USAGE}`);

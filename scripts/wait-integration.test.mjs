@@ -269,6 +269,11 @@ process.stdin.on("data", (chunk) => (prompt += chunk)).on("end", () => {
 `,
     { mode: 0o755 },
   );
+  // A real Codex keeps the thread's rollout under CODEX_HOME (here HOME/.codex); serve's start check
+  // looks for it before it drives the seat.
+  const rollouts = join(f.env.HOME, ".codex", "sessions", "2026", "10", "13");
+  await mkdir(rollouts, { recursive: true });
+  await writeFile(join(rollouts, "rollout-2026-10-13T00-00-00-thread-0001.jsonl"), "{}\n");
   const project = join(f.projects.reader, "..", "driven");
   await mkdir(project);
   const env = { ...f.env, PATH: `${harness}:${f.env.PATH}`, CODEX_SESSION_ID: "thread-0001" };

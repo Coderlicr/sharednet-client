@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runCli } from "./cli.ts";
 import type { CommandRunner } from "./guest.ts";
-import type { CheckResult, SeatWake, TurnRunner, TurnSpec } from "./wake-driver.ts";
+import type { CheckOptions, CheckResult, CheckStep, SeatWake, TurnRunner, TurnSpec } from "./wake-driver.ts";
 
 const cleanup: string[] = [];
 
@@ -99,7 +99,7 @@ async function run(
     ackFailure?: { status: number; body: unknown };
     runTurn?: TurnRunner;
     chatOpen?: (pid: number) => boolean;
-    checkWake?: (wake: SeatWake) => Promise<CheckResult>;
+    checkWake?: (wake: SeatWake, options: CheckOptions) => Promise<CheckResult>;
     signal?: AbortSignal;
     startWakeService?: (input: { env: Record<string, string | undefined>; logFile: string }) => number | null;
   } = {},
@@ -2368,13 +2368,19 @@ describe("sharednet say and wait", () => {
         { ok: true },
       ];
       const slept: number[] = [];
+      const asked: CheckOptions[] = [];
       const result = await run(["serve", "--json"], space, [revoked()], CODEX, {
         runTurn,
-        checkWake: async () => looks.shift() as CheckResult,
+        checkWake: async (_wake, options) => {
+          asked.push(options);
+          return looks.shift() as CheckResult;
+        },
         sleep: async (ms) => {
           slept.push(ms);
         },
       });
+      // serve's start takes only the steps that cost no model call.
+      expect(asked).toEqual([{ call: false }, { call: false }, { call: false }]);
 
       // Two failed looks, 30 s then 60 s apart; nothing was read or acknowledged meanwhile.
       expect(slept.slice(0, 2)).toEqual([30_000, 60_000]);
@@ -2385,6 +2391,54 @@ describe("sharednet say and wait", () => {
       expect(result.requests.length).toBeGreaterThan(0);
       expect(turns).toHaveLength(0);
       expect(result.acks).toEqual([]);
+    });
+
+    it("drives a seat whose sign-in or session is only in doubt, and shows the doubt in serve --status", async () => {
+      // Only a program that does not start holds a seat back: `codex login status` fails for a
+      // provider signed in by an environment variable, and a slow `auth status` is a busy machine.
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      let release!: () => void;
+      const wait = new Promise<void>((resolve) => { release = resolve; });
+      const doubtful: CheckResult = {
+        ok: false,
+        message: "session failed: no rollout for thread 019a-codex-thread; signed in warning: codex login status exited 1: Not logged in",
+        steps: [
+          { step: "program", status: "ok", message: "codex codex-cli 0.162.0" },
+          { step: "signed_in", status: "warning", message: "codex login status exited 1: Not logged in" },
+          { step: "session", status: "failed", message: "no rollout for thread 019a-codex-thread" },
+        ],
+      };
+      const serving = run(["serve", "--json"], space, [{ ...revoked(), wait }], CODEX, { checkWake: async () => doubtful });
+      try {
+        await vi.waitFor(async () => {
+          const status = JSON.parse((await run(["serve", "--status", "--json"], space, [])).stdout);
+          expect(status.seats).toEqual([
+            expect.objectContaining({
+              state: "listening",
+              wake_warnings: ["signed in warning: codex login status exited 1: Not logged in", "session failed: no rollout for thread 019a-codex-thread"],
+            }),
+          ]);
+        });
+      } finally {
+        release();
+      }
+      const result = await serving;
+      expect(result.stderr).toContain(`wake warning: signed in warning: codex login status exited 1: Not logged in. Check with \`sharednet wake check --as ${MEMBER_ID}\``);
+      expect(result.stderr).toContain("wakes codex 019a-codex-thread when addressed");
+      expect(result.stderr).not.toContain("Looking again");
+    });
+
+    it("still holds back a seat whose program step failed, even with other steps passing", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const looks: CheckResult[] = [
+        { ok: false, message: "program failed: codex --version did not answer within 5s", steps: [{ step: "program", status: "failed", message: "codex --version did not answer within 5s" }, { step: "signed_in", status: "skipped", message: "the program did not start" }, { step: "session", status: "skipped", message: "the program did not start" }] },
+        { ok: true, message: "program: codex codex-cli 0.162.0", steps: [{ step: "program", status: "ok", message: "codex codex-cli 0.162.0" }] },
+      ];
+      const result = await run(["serve", "--json"], space, [revoked()], CODEX, { checkWake: async () => looks.shift()!, sleep: async () => undefined });
+      expect(result.stderr).toContain("not driven: program failed: codex --version did not answer within 5s. Looking again in 30s");
+      expect(result.stderr).toContain("wakes codex 019a-codex-thread when addressed");
     });
 
     it("parks a wake turned off during startup retry, then checks its replacement without restarting serve", async () => {
@@ -2511,11 +2565,34 @@ describe("sharednet say and wait", () => {
       const claude = await run(["wake", "set", "claude-code", "--resume", "6613bb00", "--json"], space, [], { CLAUDE_SESSION_ID: "" });
       expect(JSON.parse(claude.stdout).wake).toEqual({ driver: "claude-code", session: "6613bb00", cwd: space.project, command: "claude" });
 
-      const checked = await run(["wake", "check", "--json"], space, [], {}, { checkWake: async () => ({ ok: true, message: "claude 2.1.285" }) });
-      expect(JSON.parse(checked.stdout)).toMatchObject({ wakes: "claude-code 6613bb00", check: "claude 2.1.285" });
-      const broken = await run(["wake", "check", "--json"], space, [], {}, { checkWake: async () => ({ ok: false, message: "claude is not on PATH" }) });
+      const asked: CheckOptions[] = [];
+      const steps: CheckStep[] = [
+        { step: "program", status: "ok", message: "claude 2.1.285" },
+        { step: "signed_in", status: "ok", message: "claude auth status: signed in (claude.ai)" },
+      ];
+      const checked = await run(["wake", "check", "--json"], space, [], {}, {
+        checkWake: async (_wake, options) => {
+          asked.push(options);
+          return { ok: true, message: "program: claude 2.1.285", steps };
+        },
+      });
+      // Asked by hand, the check also makes its one throwaway model call.
+      expect(asked).toEqual([{ call: true }]);
+      expect(JSON.parse(checked.stdout)).toMatchObject({ wakes: "claude-code 6613bb00", check: "program: claude 2.1.285", steps });
+      expect(checked.stderr).toContain("wake check: signed in ok: claude auth status: signed in (claude.ai)");
+      const broken = await run(["wake", "check", "--json"], space, [], {}, {
+        checkWake: async () => ({
+          ok: false,
+          message: "signed in failed: claude auth status: not signed in",
+          steps: [steps[0]!, { step: "signed_in", status: "failed", message: "claude auth status: not signed in" }, { step: "call", status: "skipped", message: "not signed in" }],
+        }),
+      });
       expect(broken.exitCode).not.toBe(0);
       expect(broken.stdout + broken.stderr).toContain("wake_command_unavailable");
+      // Which step failed, in the error itself, and every step, including what passed and what was skipped.
+      expect(broken.stderr).toContain("claude-code 6613bb00: signed in failed: claude auth status: not signed in");
+      expect(broken.stderr).toContain("wake check: program ok: claude 2.1.285");
+      expect(broken.stderr).toContain("wake check: model call skipped: not signed in");
 
       expect(JSON.parse((await run(["wake", "off", "--json"], space, [])).stdout).wake).toBeNull();
       expect((await credentialOf(space)).wake).toBeUndefined();

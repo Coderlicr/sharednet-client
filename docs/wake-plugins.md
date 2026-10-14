@@ -48,8 +48,8 @@ interface WakePlugin {
   listen?(wake, memberId): string | null;
   /** In serve: deliver one wake. */
   deliver(wake, wakeInput, context): Promise<Delivery>;
-  /** `wake check` and serve start: can the program start at all (#20's launch probe). */
-  check(wake, env): Promise<CheckResult>;
+  /** `wake check` and serve start: can a wake be delivered (see "Checking a wake"). Never resumes the session. */
+  check(wake, env, run, { call }): Promise<CheckResult>;
 }
 ```
 
@@ -115,10 +115,31 @@ The `command` field of a `codex` or `claude-code` wake stays, as before, the pro
 | `sharednet wake [--as <seat>] [--json]` | Shows the seat's wake: plugin, session, command, live chat |
 | `sharednet wake set <driver> [--command <path>] [--resume <session id>] [--as <seat>]` | Sets or changes it. `--resume` defaults to the current process's session when the driver is this harness. (`--session` is already the CLI's global option for choosing an Instance, so it is not reused) |
 | `sharednet wake off [--as <seat>]` | Removes it. The seat stays, and serve stops driving it |
-| `sharednet wake check [--as <seat>]` | Runs the plugin's launch probe (`--version` under the wake's environment, five-second deadline) |
-| `sharednet serve --status` | Each seat's driver, as `resumes`, is shown as before |
+| `sharednet wake check [--as <seat>]` | Proves the wake path in this shell's environment: all four steps of "Checking a wake", including one throwaway model call. Prints each step; exits non-zero naming the step that failed. A warning alone does not fail it |
+| `sharednet serve --status` | Each seat's driver, as `resumes`, is shown as before; a seat driven despite a doubt carries it in `wake_warnings` |
 
-At start, `serve` probes each driven seat once, as #20 did. A seat whose program does not start is reported as `stopped` with the probe's message, and its lines are not consumed.
+At start, `serve` checks each driven seat with the steps that cost no model call. Only the `program` step can hold a seat back: the seat is `retrying` (#36), its lines are not read, and it is looked at again with capped backoff. A `signed_in` or `session` problem does not hold it back. It is logged, kept in the seat's `wake_warnings` in `serve --status`, and the seat is driven; a delivery that then fails posts its notice in the Room as before.
+
+## Checking a wake
+
+`--version` alone once passed while every wake would have failed (2026-10-13): `claude --version` answered, but headless `claude -p` said `Not logged in · Please run /login`, because the desktop chat signs in on its own. After signing in, `claude -p` still answered `API Error: 403 Request not allowed` without the machine's HTTPS proxy. So a check now takes these steps, each reported as `ok`, `failed`, `warning` or `skipped` with the program's own words:
+
+| Step | `claude-code` | `codex` | serve start | `wake check` |
+| --- | --- | --- | --- | --- |
+| `program` | the seat's directory exists; `claude --version` (5 s) | the same with `codex --version` | yes | yes |
+| `signed_in` | `claude auth status --json` reports `loggedIn: true` (15 s). Never fails: a no or a timeout is a warning | `codex login status` exits 0, under the wake's `CODEX_HOME` (15 s). The same: only a warning | yes, as a warning | yes, as a warning |
+| `session` | `<session>.jsonl` under any `projects/*/`, where `auth status` says projects are (else `$CLAUDE_CONFIG_DIR` or `~/.claude`) | `sessions/**/rollout-*-<thread>.jsonl` under the wake's `CODEX_HOME` | yes, as a warning | yes |
+| `call` | `claude -p --no-session-persistence --output-format json --settings '{"disableAllHooks":true,"autoMemoryEnabled":false}' --strict-mcp-config --tools ""`, "Reply with exactly: ok" (120 s) | `codex exec --ephemeral --json --skip-git-repo-check -s read-only -`, the same prompt (120 s) | no | yes |
+
+- **The call resumes nothing.** Resuming the seat's own session would add a turn to its transcript, so the call is a new turn that saves no session, run in an empty temporary directory that is removed afterwards. It proves sign-in, network and model access for this program, not the seat's session itself; the `session` step covers that the session is there.
+- **The call runs none of the person's hooks, MCP servers or tools.** `--no-session-persistence` only skips the transcript; a global SessionStart hook still ran (and wrote outside the temporary directory). `--settings '{"disableAllHooks":true}'`, `--strict-mcp-config` without `--mcp-config`, and `--tools ""` stop that (all exist on Claude Code 2.1.296). `"autoMemoryEnabled":false` keeps it from leaving an empty `projects/<temp dir>/memory` behind on every check. Settings sources are otherwise kept, so their environment (a proxy) and sign-in still apply. An opt-in test proves it against the real `claude`: a temporary `CLAUDE_CONFIG_DIR` with a SessionStart hook and an MCP server that each leave a marker. Without the flags both markers appear and a project directory is filed; with them, neither marker appears and nothing is filed.
+- **It costs a model call**, so only `wake check` makes it. serve's start runs only the first three steps, which run no model.
+- **Sign-in status warns; the call decides.** A status command speaks only for the program's own sign-in. A Codex custom provider authenticated by an environment variable fails `codex login status` and still works (Codex 0.162.0), and a busy machine can make `auth status` miss its 15 s. So `signed_in` is a warning, never a failure, and `wake check` makes its call either way.
+- **What it does not see.** The call runs outside the seat's directory, so a project's own settings (hooks, a project `apiKeyHelper`) are not exercised. And `wake check` runs in the shell you type it in; serve runs in its own environment. A proxy set in your shell and not in serve's passes `wake check` and still fails at serve. serve's start check catches a missing sign-in in its own environment, but not a missing proxy, since that needs the call.
+- **Environment.** Every step runs in the same environment a delivery does (`harnessFreeEnv`), which keeps `USER`, `LOGNAME`, `HOME` and any proxy variables. Claude Code finds a macOS keychain sign-in by `USER`: without it, `auth status` reads as signed out, and the step says so.
+- **Where the transcript is.** Claude Code files a transcript under the slug of the directory the session started in, which need not be the seat's directory. A resume works from any directory, so every project directory is searched.
+- **A launcher is what is checked.** Every step asks the wake's own command, as a delivery runs it; a `claude` or `codex` elsewhere on PATH could be a different program with a different sign-in or provider. A launcher is not asked for `--version` or its sign-in status (it may accept only the call it was written for), so those are `skipped`. The throwaway turn goes through it. If it does not answer, that is a warning rather than a failure, since the launcher may accept only its resume.
+- **Messages say what to do.** Not signed in: sign in as the user serve runs as, or set `USER`. A 403 or a connection error: the message says whether the check ran with `HTTPS_PROXY` set (never its value). No transcript: set the session again with `wake set`. For Codex the failed turn's own error is shown. For example, a Codex 0.146.0 whose configured model needs a newer Codex passes `--version` and `login status`, then fails the call with `The '<model>' model requires a newer version of Codex`.
 
 ## Files
 
@@ -170,13 +191,14 @@ A seat is one session in one Room. Today the same session may sit in several Roo
   - capture: attended or not, Codex home, PATH;
   - parse: damaged records;
   - deliver: resume finished, active writer → queue → handed, queue failure → busy, closed chat → resume, open chat → left, command exit codes;
-  - check: missing binary, a wrapper with no payload, timeout.
+  - check: missing binary, a wrapper with no payload, timeout, a missing seat directory; signed out (by what `auth status` reports, not its exit code) only warns, and the call decides; a slow `auth status`; USER unset; a Codex provider signed in by environment variable; no transcript or rollout, including one filed under another directory's slug; a refused call (403, `Not logged in`, a Codex too old for its model), with and without a proxy; a launcher checked itself, never the harness beside it; no model call at serve start; the call's directory removed; no API key repeated; the call's flags against hooks, MCP servers and tools;
+  - against the real `claude`, opt-in (`SHAREDNET_TEST_REAL_CLAUDE=1`): a hook and an MCP server from a temporary config run without the flags and do not with them. The API points at a dead local port, so no model is reached.
 - **serve, one test per outcome:**
   - what is posted;
   - what is acknowledged;
   - when it retries;
   - how the turn cap is counted.
-- **CLI:** `wake`, `wake set`, `wake off`, `wake check`; `join` output.
+- **CLI:** `wake`, `wake set`, `wake off`, `wake check` (asks for the call, prints every step); serve start does not ask for the call, retries only a failed `program` step, and drives a seat with `signed_in`/`session` doubts while showing them in `serve --status`; `join` output.
 - **Live, on a real Room:**
   - Codex idle → replied; Codex open → handed and answered by the open chat;
   - Claude closed → replied; Claude open → left and answered by the chat;

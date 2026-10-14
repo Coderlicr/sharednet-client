@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { accessSync, closeSync, constants, mkdirSync, openSync } from "node:fs";
-import { homedir } from "node:os";
+import { accessSync, closeSync, constants, mkdirSync, mkdtempSync, openSync, rmSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 
 /**
@@ -78,9 +78,32 @@ export type Delivery =
   | { kind: "busy"; why: string; retryMs: number }
   | { kind: "failed"; why: string; detail: string; timedOut: boolean };
 
+/**
+ * One step of a wake check (docs/wake-plugins.md, "Checking a wake"). A step that cannot be taken
+ * because an earlier one failed, or that cannot be run through a launcher, is skipped and says why.
+ * A warning is a doubt that does not decide anything by itself: a sign-in status that says no while
+ * the program may still authenticate another way, or a launcher that may accept only its own call.
+ */
+export interface CheckStep {
+  step: "program" | "signed_in" | "session" | "call";
+  status: "ok" | "failed" | "warning" | "skipped";
+  /** What was found, or the program's own words when it failed. */
+  message: string;
+}
+
 export interface CheckResult {
   ok: boolean;
   message: string;
+  /** Each step taken, in order; a plugin with a single look (`command`) may leave it out. */
+  steps?: CheckStep[];
+}
+
+export interface CheckOptions {
+  /**
+   * Also run one throwaway model turn that resumes nothing and saves nothing. It costs a model call,
+   * so only `sharednet wake check` asks for it; serve's start takes the steps that cost none.
+   */
+  call: boolean;
 }
 
 export interface WakePlugin {
@@ -92,8 +115,11 @@ export interface WakePlugin {
   /** At join: how an open session hears its Room itself, when it has to. */
   listen?(wake: SeatWake, memberId: string): string | null;
   deliver(wake: SeatWake, input: WakeInput, context: DeliveryContext): Promise<Delivery>;
-  /** Whether the program can start at all; never runs a turn. */
-  check(wake: SeatWake, env: Environment, run: TurnRunner): Promise<CheckResult>;
+  /**
+   * Whether a wake can be delivered: the program starts, it is signed in, the session is there to
+   * resume, and (with `options.call`) a throwaway turn gets an answer. Never resumes the seat's session.
+   */
+  check(wake: SeatWake, env: Environment, run: TurnRunner, options?: CheckOptions): Promise<CheckResult>;
 }
 
 export function onPath(name: string, env: Environment): string | null {
@@ -118,6 +144,8 @@ export function onPath(name: string, env: Environment): string | null {
 export async function checkProgram(wake: SeatWake, harness: string, env: Environment, run: TurnRunner): Promise<CheckResult> {
   const program = isAbsolute(wake.command) ? wake.command : onPath(wake.command, env);
   if (program === null) return { ok: false, message: `${wake.command} is not on PATH` };
+  // Every delivery runs there; a directory that is gone reads as the program missing (spawn ENOENT).
+  if (!isDirectory(wake.cwd)) return { ok: false, message: `the seat's directory ${wake.cwd} is not there; a delivery runs in it` };
   try {
     accessSync(program, constants.X_OK);
   } catch {
@@ -128,6 +156,109 @@ export async function checkProgram(wake: SeatWake, harness: string, env: Environ
   if (outcome.exitCode === 0 && !outcome.timedOut) return { ok: true, message: `${program} ${outcome.stdout.trim().split("\n")[0] ?? ""}`.trim() };
   const why = outcome.timedOut ? "did not answer within 5s" : `exited ${outcome.exitCode}`;
   return { ok: false, message: `${program} --version ${why}${outcome.stderr.trim() ? `: ${outcome.stderr.trim().split("\n").slice(-1)[0]!.slice(0, 200)}` : ""}` };
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The program a delivery runs: the wake's command, resolved as a delivery resolves it. The check asks
+ * this program and no other; a `claude` or `codex` elsewhere on PATH would answer for a different one.
+ */
+export function wakeProgram(wake: SeatWake, env: Environment): string | null {
+  return isAbsolute(wake.command) ? wake.command : onPath(wake.command, env);
+}
+
+/** A launcher stands in for the harness; it may be written for the one call a delivery makes. */
+export function isLauncher(program: string, harness: string): boolean {
+  return basename(program) !== harness;
+}
+
+/** The prompt of the throwaway turn. Any answer at all proves the path; its words are only shown. */
+export const CHECK_PROMPT = "Reply with exactly: ok";
+/** A throwaway turn is one short answer; this is long enough for a slow start, not for a task. */
+export const CHECK_CALL_MS = 120_000;
+/**
+ * Asking whether the program is signed in reads local state; it never waits on a model. Running out
+ * of time is only a warning: a busy machine is not a broken one.
+ */
+export const CHECK_SIGNED_IN_MS = 15_000;
+
+/** The last thing a program said, in one line, for a step's message. */
+export function lastWords(outcome: TurnOutcome): string {
+  const said = (outcome.stderr.trim() || outcome.stdout.trim()).split("\n").filter((line) => line.trim() !== "");
+  return (said.slice(-1)[0] ?? "").trim().slice(0, 300);
+}
+
+/**
+ * Runs the throwaway turn in an empty directory made for it and removed after, so it reads no
+ * project's files and leaves nothing behind (the harness is also told to save no session).
+ */
+export async function inThrowawayDirectory<T>(work: (cwd: string) => Promise<T>): Promise<T> {
+  const cwd = mkdtempSync(join(tmpdir(), "sharednet-wake-check-"));
+  try {
+    return await work(cwd);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+function stepLine(step: CheckStep): string {
+  return `${STEP_LABELS[step.step]}${step.status === "failed" || step.status === "warning" ? ` ${step.status}` : ""}: ${step.message}`;
+}
+
+/**
+ * A check made of steps, as `sharednet wake check` judges it: it passes when none failed, and its
+ * message leads with what failed, then what warned.
+ */
+export function checkFromSteps(steps: CheckStep[]): CheckResult {
+  const failed = steps.filter((step) => step.status === "failed");
+  const warned = steps.filter((step) => step.status === "warning");
+  const shown = failed.length + warned.length > 0 ? [...failed, ...warned] : steps.filter((step) => step.status === "ok");
+  return { ok: failed.length === 0, message: shown.map(stepLine).join("; "), steps };
+}
+
+/**
+ * The same check as serve's start judges it. Only a program that does not start holds a seat back
+ * (and is looked at again); a sign-in or session in doubt is a warning shown in `serve --status`,
+ * since the status command can be wrong (a provider signed in by environment) or merely slow, and
+ * a delivery that does fail says so in the Room. A check without steps is judged as it says.
+ */
+export function startVerdict(checked: CheckResult): { ok: boolean; message: string; warnings: string[] } {
+  if (!checked.steps) return { ok: checked.ok, message: checked.message, warnings: [] };
+  const program = checked.steps.find((step) => step.step === "program");
+  const warnings = checked.steps.filter((step) => step.step !== "program" && (step.status === "failed" || step.status === "warning")).map(stepLine);
+  if (program?.status === "failed") return { ok: false, message: stepLine(program), warnings };
+  return { ok: true, message: checked.message, warnings };
+}
+
+/** The steps after `program`, skipped for one reason: a check that cannot go on still says what it did not do. */
+export function skipRest(steps: CheckStep[], options: CheckOptions, why: string): CheckResult {
+  const rest: CheckStep["step"][] = options.call ? ["signed_in", "session", "call"] : ["signed_in", "session"];
+  for (const step of rest) steps.push({ step, status: "skipped", message: why });
+  return checkFromSteps(steps);
+}
+
+export const STEP_LABELS: Record<CheckStep["step"], string> = {
+  program: "program",
+  signed_in: "signed in",
+  session: "session",
+  call: "model call",
+};
+
+/**
+ * What a model call's refusal most likely means, when its own words point to the network: whether
+ * this environment had a proxy set is said, never its value.
+ */
+export function networkHint(said: string, env: Environment): string {
+  if (!/\b(403|407|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN)\b|fetch failed|connection error|network|Request not allowed/i.test(said)) return "";
+  const proxied = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"].some((key) => Boolean(env[key]?.trim()));
+  return ` (this looks like the network: the check ran ${proxied ? "with" : "without"} HTTPS_PROXY set; if this machine reaches the API through a proxy, serve's environment needs it too)`;
 }
 
 /** A turn that did not finish, as the Room should hear it: the harness's own words, or how it ended. */

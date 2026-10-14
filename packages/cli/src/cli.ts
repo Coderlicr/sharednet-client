@@ -14,7 +14,7 @@ import { dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type Doc
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
-import type { CheckResult, SeatWake, TurnRunner } from "./wake-driver.ts";
+import type { CheckOptions, CheckResult, SeatWake, TurnRunner } from "./wake-driver.ts";
 
 
 type Environment = Record<string, string | undefined>;
@@ -43,7 +43,7 @@ export interface CliDependencies {
   runTurn?: TurnRunner;
   /** Whether the Claude Code chat that took a seat is still open, in `serve`; tests replace it. */
   chatOpen?: (pid: number) => boolean;
-  checkWake?: (wake: SeatWake) => Promise<CheckResult>;
+  checkWake?: (wake: SeatWake, options: CheckOptions) => Promise<CheckResult>;
   /** Starts `serve` in the background after a join; only the real process (main.ts) supplies it. */
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
 }
@@ -62,7 +62,7 @@ interface ResolvedDependencies {
   signal?: AbortSignal;
   runTurn?: TurnRunner;
   chatOpen?: (pid: number) => boolean;
-  checkWake?: (wake: SeatWake) => Promise<CheckResult>;
+  checkWake?: (wake: SeatWake, options: CheckOptions) => Promise<CheckResult>;
   startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
 }
 

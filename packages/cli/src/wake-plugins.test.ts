@@ -1,15 +1,16 @@
 // @vitest-environment node
 
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { claudePlugin } from "./wake-claude.ts";
-import { codexPlugin } from "./wake-codex.ts";
+import { CLAUDE_CHECK_ARGS, claudePlugin, claudeTranscript } from "./wake-claude.ts";
+import { CODEX_CHECK_ARGS, codexError, codexPlugin, codexRollout } from "./wake-codex.ts";
 import { commandPlugin, EXIT_BUSY, EXIT_HANDED } from "./wake-command.ts";
-import { checkProgram, livePrompt, type DeliveryContext, type SeatWake, type TurnOutcome, type TurnSpec, type WakeInput } from "./wake-driver.ts";
+import { checkFromSteps, checkProgram, harnessFreeEnv, livePrompt, onPath, runTurn, startVerdict, type CheckResult, type CheckStep, type DeliveryContext, type SeatWake, type TurnOutcome, type TurnSpec, type WakeInput } from "./wake-driver.ts";
 import { describeWake, parseSeatWake, pluginFor, seatWakeFrom, wakePlugins } from "./wake-plugins.ts";
 
 const cleanup: string[] = [];
@@ -172,26 +173,393 @@ describe("the launch check", () => {
   it("asks the harness itself for its version, and only looks at a launcher", async () => {
     const path = await bin("codex", "codex-room-bypass.sh");
     const ok = scripted({ stdout: "codex-cli 0.162.0\n" });
-    expect(await checkProgram({ driver: "codex", session: "s", cwd: "/w", command: "codex" }, "codex", { PATH: path }, ok.context.run)).toEqual({
+    expect(await checkProgram({ driver: "codex", session: "s", cwd: path, command: "codex" }, "codex", { PATH: path }, ok.context.run)).toEqual({
       ok: true,
       message: `${join(path, "codex")} codex-cli 0.162.0`,
     });
     expect([ok.ran[0]!.command, ...ok.ran[0]!.args]).toEqual([join(path, "codex"), "--version"]);
 
     const launcher = scripted();
-    const viaLauncher = await checkProgram({ driver: "codex", session: "s", cwd: "/w", command: join(path, "codex-room-bypass.sh") }, "codex", {}, launcher.context.run);
+    const viaLauncher = await checkProgram({ driver: "codex", session: "s", cwd: path, command: join(path, "codex-room-bypass.sh") }, "codex", {}, launcher.context.run);
     expect(viaLauncher.ok).toBe(true);
     expect(launcher.ran).toHaveLength(0);
   });
 
-  it("names what is wrong: not on PATH, a wrapper whose payload is gone, no answer", async () => {
+  it("names what is wrong: not on PATH, a wrapper whose payload is gone, no answer, no directory", async () => {
     const path = await bin("codex");
-    const wake: SeatWake = { driver: "codex", session: "s", cwd: "/w", command: "codex" };
+    const wake: SeatWake = { driver: "codex", session: "s", cwd: path, command: "codex" };
     expect(await checkProgram(wake, "codex", { PATH: "" }, scripted().context.run)).toEqual({ ok: false, message: "codex is not on PATH" });
     const broken = scripted({ exitCode: 1, stderr: "Error: spawn /opt/homebrew/lib/codex/vendor/codex ENOENT\n" });
     expect((await checkProgram(wake, "codex", { PATH: path }, broken.context.run)).message).toContain("--version exited 1: Error: spawn");
     const silent = scripted({ timedOut: true, exitCode: 143 });
     expect((await checkProgram(wake, "codex", { PATH: path }, silent.context.run)).message).toContain("did not answer within 5s");
+    // A directory that is gone would read as the program missing (spawn ENOENT); it is named instead.
+    const gone = scripted();
+    expect(await checkProgram({ ...wake, cwd: join(path, "gone") }, "codex", { PATH: path }, gone.context.run)).toEqual({
+      ok: false,
+      message: `the seat's directory ${join(path, "gone")} is not there; a delivery runs in it`,
+    });
+    expect(gone.ran).toHaveLength(0);
+  });
+});
+
+/**
+ * A stand-in for the harness, answering each kind of call the check makes by its arguments, and
+ * keeping what it was asked. Nothing here reaches a model.
+ */
+function harness(answers: Record<string, Partial<TurnOutcome>>) {
+  const ran: TurnSpec[] = [];
+  const run = async (spec: TurnSpec): Promise<TurnOutcome> => {
+    ran.push(spec);
+    const kind = spec.args[0] === "--version" ? "version" : spec.args[0] === "auth" || spec.args[0] === "login" ? "signed_in" : "call";
+    // The throwaway turn's directory exists while it runs.
+    if (kind === "call") expect(existsSync(spec.cwd)).toBe(true);
+    const answer = answers[kind] ?? {};
+    return { exitCode: answer.exitCode ?? 0, stdout: answer.stdout ?? "", stderr: answer.stderr ?? "", timedOut: answer.timedOut ?? false };
+  };
+  return { ran, run };
+}
+
+const SIGNED_IN = JSON.stringify({ loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty" });
+const SIGNED_OUT = JSON.stringify({ loggedIn: false, authMethod: "none", apiProvider: "firstParty" });
+const claudeAnswered = (result: string, isError = false) => JSON.stringify({ type: "result", subtype: "success", is_error: isError, result });
+const statuses = (checked: CheckResult) => checked.steps?.map((step) => [step.step, step.status]);
+
+async function launcherIn(path: string, name: string) {
+  await writeFile(join(path, name), "#!/bin/sh\n");
+  await chmod(join(path, name), 0o755);
+  return join(path, name);
+}
+
+describe("the claude-code wake check", () => {
+  const SESSION = "96713c45-d688-4971-a55e-d2f0edbc0d72";
+
+  /** A machine: claude on PATH, a seat directory, and a transcript filed under another directory's slug. */
+  async function machine(options: { transcript?: boolean } = {}) {
+    const path = await bin("claude");
+    const config = await mkdtemp(join(tmpdir(), "sharednet-claude-config-"));
+    cleanup.push(config);
+    const seat = join(path, "seat");
+    await mkdir(seat);
+    await mkdir(join(config, "projects", "-Users-someone-Desktop"), { recursive: true });
+    if (options.transcript !== false) await writeFile(join(config, "projects", "-Users-someone-Desktop", `${SESSION}.jsonl`), "{}\n");
+    const wake: SeatWake = { driver: "claude-code", session: SESSION, cwd: seat, command: join(path, "claude") };
+    const env = { PATH: path, HOME: "/nowhere", USER: "someone", CLAUDE_CONFIG_DIR: config, CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "host-session" };
+    return { path, config, seat, wake, env };
+  }
+
+  it("proves the path: the program, its sign-in, the transcript, and a throwaway turn", async () => {
+    const { config, seat, wake, env } = await machine();
+    const { ran, run } = harness({ version: { stdout: "2.1.296 (Claude Code)\n" }, signed_in: { stdout: SIGNED_IN }, call: { stdout: claudeAnswered("ok") } });
+    const checked = await claudePlugin.check(wake, env, run, { call: true });
+
+    expect(checked.ok).toBe(true);
+    expect(statuses(checked)).toEqual([["program", "ok"], ["signed_in", "ok"], ["session", "ok"], ["call", "ok"]]);
+    expect(checked.steps?.[1]?.message).toBe("claude auth status: signed in (claude.ai)");
+    // Found under the slug it was filed under, not the seat's.
+    expect(checked.steps?.[2]?.message).toContain(join(config, "projects", "-Users-someone-Desktop", `${SESSION}.jsonl`));
+    expect(checked.steps?.[3]?.message).toContain('answered "ok"');
+
+    expect(ran.map((spec) => spec.args)).toEqual([["--version"], ["auth", "status", "--json"], [...CLAUDE_CHECK_ARGS]]);
+    // Every step asks the wake's own command.
+    expect(new Set(ran.map((spec) => spec.command))).toEqual(new Set([wake.command]));
+    const call = ran[2]!;
+    // The throwaway turn resumes nothing, saves nothing, and runs outside the seat's directory, which is then gone.
+    expect(call.args).not.toContain("--resume");
+    expect(call.input).toBe("Reply with exactly: ok");
+    expect(call.cwd).not.toBe(seat);
+    expect(existsSync(call.cwd)).toBe(false);
+    // The host session's markers are left behind; the sign-in's USER is kept (the keychain is found by it).
+    for (const spec of ran) {
+      expect(spec.env.CLAUDECODE).toBeUndefined();
+      expect(spec.env.CLAUDE_CODE_SESSION_ID).toBeUndefined();
+      expect(spec.env.USER).toBe("someone");
+    }
+  });
+
+  it("runs the throwaway turn without the person's hooks, MCP servers, tools or auto-memory", () => {
+    // `--no-session-persistence` only skips the transcript; a global SessionStart hook still ran.
+    const settings = CLAUDE_CHECK_ARGS[CLAUDE_CHECK_ARGS.indexOf("--settings") + 1]!;
+    expect(JSON.parse(settings)).toEqual({ disableAllHooks: true, autoMemoryEnabled: false });
+    expect(CLAUDE_CHECK_ARGS).toContain("--strict-mcp-config");
+    expect(CLAUDE_CHECK_ARGS[CLAUDE_CHECK_ARGS.indexOf("--tools") + 1]).toBe("");
+    expect(CLAUDE_CHECK_ARGS).toContain("--no-session-persistence");
+    // Settings sources are left alone: their environment (a proxy) and sign-in still apply.
+    expect(CLAUDE_CHECK_ARGS).not.toContain("--setting-sources");
+    expect(CLAUDE_CHECK_ARGS).not.toContain("--bare");
+  });
+
+  it("costs no model call when serve starts", async () => {
+    const { wake, env } = await machine();
+    const { ran, run } = harness({ signed_in: { stdout: SIGNED_IN } });
+    const checked = await claudePlugin.check(wake, env, run, { call: false });
+    expect(checked.ok).toBe(true);
+    expect(checked.steps?.map((step) => step.step)).toEqual(["program", "signed_in", "session"]);
+    expect(ran.map((spec) => spec.args[0])).toEqual(["--version", "auth"]);
+    // Called the old way, it is the same.
+    expect((await claudePlugin.check(wake, env, harness({ signed_in: { stdout: SIGNED_IN } }).run)).steps).toHaveLength(3);
+  });
+
+  it("only warns when auth status says no, and lets the turn decide (2026-10-13)", async () => {
+    const { wake, env } = await machine();
+    // The 10-13 machine: --version answered, auth status said no, and so did the turn.
+    const out = harness({ version: { stdout: "2.1.228 (Claude Code)\n" }, signed_in: { exitCode: 1, stdout: SIGNED_OUT }, call: { exitCode: 1, stdout: claudeAnswered("Not logged in · Please run /login", true) } });
+    const signedOut = await claudePlugin.check(wake, env, out.run, { call: true });
+    expect(signedOut.ok).toBe(false);
+    expect(statuses(signedOut)).toEqual([["program", "ok"], ["signed_in", "warning"], ["session", "ok"], ["call", "failed"]]);
+    expect(signedOut.message).toBe(
+      "model call failed: a throwaway `claude -p` turn failed: Not logged in · Please run /login; signed in warning: claude auth status: not signed in. Run `claude auth login` as the user serve runs as, unless this program signs in another way",
+    );
+    expect(out.ran).toHaveLength(3);
+
+    // A program signed in some way auth status does not see: the turn answers, and the check passes.
+    const other = await claudePlugin.check(wake, env, harness({ signed_in: { exitCode: 1, stdout: SIGNED_OUT }, call: { stdout: claudeAnswered("ok") } }).run, { call: true });
+    expect(other.ok).toBe(true);
+    expect(statuses(other)).toEqual([["program", "ok"], ["signed_in", "warning"], ["session", "ok"], ["call", "ok"]]);
+
+    // The answer is what it reports, not how it exits.
+    expect((await claudePlugin.check(wake, env, harness({ signed_in: { exitCode: 0, stdout: SIGNED_OUT } }).run)).steps?.[1]?.status).toBe("warning");
+    expect((await claudePlugin.check(wake, env, harness({ signed_in: { exitCode: 0, stdout: "signed in, probably" } }).run)).steps?.[1]?.status).toBe("warning");
+
+    // A busy machine is not a broken one: a slow auth status warns.
+    const slow = await claudePlugin.check(wake, env, harness({ signed_in: { timedOut: true, exitCode: 143 } }).run);
+    expect(slow.steps?.[1]).toMatchObject({ status: "warning", message: expect.stringContaining("did not answer within 15s") });
+
+    // Without USER, a signed-in Mac reads as signed out; the check says so.
+    const { USER: _user, ...noUser } = env;
+    const unnamed = await claudePlugin.check(wake, noUser, harness({ signed_in: { exitCode: 1, stdout: SIGNED_OUT } }).run, { call: true });
+    expect(unnamed.message).toContain("but USER is not set in this environment, and Claude Code finds its keychain sign-in by USER. Set USER where serve runs");
+  });
+
+  it("reports the turn's own words when the call is refused, and whether a proxy was set", async () => {
+    const { wake, env } = await machine();
+    const refused = await claudePlugin.check(wake, env, harness({ signed_in: { stdout: SIGNED_IN }, call: { exitCode: 1, stdout: claudeAnswered("Failed to authenticate. API Error: 403 Request not allowed", true) } }).run, { call: true });
+    expect(refused.ok).toBe(false);
+    expect(refused.message).toContain("model call failed: a throwaway `claude -p` turn failed: Failed to authenticate. API Error: 403 Request not allowed");
+    expect(refused.message).toContain("the check ran without HTTPS_PROXY set");
+    const proxied = await claudePlugin.check(wake, { ...env, HTTPS_PROXY: "http://127.0.0.1:10080" }, harness({ signed_in: { stdout: SIGNED_IN }, call: { exitCode: 1, stdout: claudeAnswered("API Error: 403", true) } }).run, { call: true });
+    expect(proxied.message).toContain("the check ran with HTTPS_PROXY set");
+    expect(proxied.message).not.toContain("127.0.0.1");
+
+    const silent = await claudePlugin.check(wake, env, harness({ signed_in: { stdout: SIGNED_IN }, call: { timedOut: true, exitCode: 143 } }).run, { call: true });
+    expect(silent.message).toContain("no answer within 120s");
+    const empty = await claudePlugin.check(wake, env, harness({ signed_in: { stdout: SIGNED_IN }, call: { stderr: "warning: hook said something\n" } }).run, { call: true });
+    expect(empty.ok).toBe(false);
+  });
+
+  it("fails a session with no transcript to resume, and says how to set it again", async () => {
+    const { wake, env } = await machine({ transcript: false });
+    const checked = await claudePlugin.check(wake, env, harness({ signed_in: { stdout: SIGNED_IN }, call: { stdout: claudeAnswered("ok") } }).run, { call: true });
+    expect(checked.ok).toBe(false);
+    expect(checked.steps?.map((step) => step.status)).toEqual(["ok", "ok", "failed", "ok"]);
+    expect(checked.message).toContain(`session failed: no transcript for session ${SESSION}`);
+    expect(checked.message).toContain("sharednet wake set claude-code");
+  });
+
+  it("looks where `claude auth status` says the projects are, and never outside them", async () => {
+    const { wake, env } = await machine({ transcript: false });
+    const elsewhere = await mkdtemp(join(tmpdir(), "sharednet-claude-projects-"));
+    cleanup.push(elsewhere);
+    await mkdir(join(elsewhere, "-work"));
+    await writeFile(join(elsewhere, "-work", `${SESSION}.jsonl`), "{}\n");
+    const reported = JSON.stringify({ loggedIn: true, authMethod: "claude.ai", projectsDirectory: elsewhere });
+    expect((await claudePlugin.check(wake, env, harness({ signed_in: { stdout: reported } }).run)).ok).toBe(true);
+
+    expect(claudeTranscript(SESSION, {}, elsewhere)).toBe(join(elsewhere, "-work", `${SESSION}.jsonl`));
+    expect(claudeTranscript("../-work/" + SESSION, {}, elsewhere)).toBeNull();
+    expect(claudeTranscript(SESSION, {}, join(elsewhere, "missing"))).toBeNull();
+  });
+
+  it("skips what a program that does not start cannot answer", async () => {
+    const { wake, env } = await machine();
+    const { ran, run } = harness({ version: { exitCode: 1, stderr: "Error: spawn ENOENT\n" } });
+    const broken = await claudePlugin.check(wake, env, run, { call: true });
+    expect(statuses(broken)).toEqual([["program", "failed"], ["signed_in", "skipped"], ["session", "skipped"], ["call", "skipped"]]);
+    expect(ran).toHaveLength(1);
+  });
+
+  it("checks a launcher itself, never the claude beside it, and never fails it for a step it cannot take", async () => {
+    const { path, wake, env } = await machine();
+    const launcher = await launcherIn(path, "claude-room.sh");
+    const through = { ...wake, command: launcher };
+
+    // The turn goes through the launcher, as a delivery does; `auth status` is not asked of it.
+    const answered = harness({ call: { stdout: claudeAnswered("ok") } });
+    const checked = await claudePlugin.check(through, env, answered.run, { call: true });
+    expect(checked.ok).toBe(true);
+    expect(statuses(checked)).toEqual([["program", "ok"], ["signed_in", "skipped"], ["session", "ok"], ["call", "ok"]]);
+    expect(answered.ran.map((spec) => [spec.command, spec.args[0]])).toEqual([[launcher, "-p"]]);
+    expect(checked.steps?.[3]?.message).toContain(`through the launcher ${launcher}`);
+
+    // A launcher that refuses the throwaway turn may accept only its resume: a warning, not a failure.
+    const refused = await claudePlugin.check(through, env, harness({ call: { exitCode: 2, stderr: "usage: claude-room.sh --resume <id>\n" } }).run, { call: true });
+    expect(refused.ok).toBe(true);
+    expect(refused.steps?.[3]).toMatchObject({ status: "warning", message: expect.stringContaining("usage: claude-room.sh --resume <id>") });
+
+    // With no claude on PATH at all, the launcher is still what is checked.
+    const alone = harness({ call: { stdout: claudeAnswered("ok") } });
+    expect((await claudePlugin.check(through, { ...env, PATH: "" }, alone.run, { call: true })).ok).toBe(true);
+    expect(alone.ran.map((spec) => spec.command)).toEqual([launcher]);
+  });
+
+  // Proof against the real `claude` that the throwaway turn's flags keep the person's hooks and MCP
+  // servers from running. A temporary CLAUDE_CONFIG_DIR stands in for the person's global settings,
+  // with a SessionStart hook and an MCP server that each leave a marker. The API is pointed at a dead
+  // local port, so no model is reached whatever the sign-in. Opt in: SHAREDNET_TEST_REAL_CLAUDE=1.
+  it.skipIf(process.env.SHAREDNET_TEST_REAL_CLAUDE !== "1")("keeps a real claude's global hook and MCP server from running (opt-in)", async () => {
+    const claude = onPath("claude", process.env);
+    expect(claude).not.toBeNull();
+    const scratch = await mkdtemp(join(tmpdir(), "sharednet-hook-proof-"));
+    cleanup.push(scratch);
+    const config = join(scratch, "config");
+    await mkdir(config);
+    const hookMarker = join(scratch, "hook-ran");
+    const mcpMarker = join(scratch, "mcp-started");
+    await writeFile(join(config, "settings.json"), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: `touch '${hookMarker}'` }] }] } }));
+    await writeFile(join(config, ".claude.json"), JSON.stringify({ mcpServers: { probe: { type: "stdio", command: "/bin/sh", args: ["-c", `touch '${mcpMarker}'; sleep 2`] } } }));
+    const { ANTHROPIC_API_KEY: _key, CLAUDE_CODE_OAUTH_TOKEN: _token, ...inherited } = process.env;
+    const env = { ...harnessFreeEnv(inherited), CLAUDE_CONFIG_DIR: config, ANTHROPIC_BASE_URL: "http://127.0.0.1:9" };
+    const turn = (args: string[]) =>
+      runTurn({ command: claude!, args, cwd: scratch, env, input: "Reply with exactly: ok", timeoutMs: 60_000 });
+
+    // The control: without the flags, the hook runs, the MCP server starts, and auto-memory files a
+    // project directory for the working directory even though no session is saved.
+    await turn(["-p", "--no-session-persistence", "--output-format", "json"]);
+    expect(existsSync(hookMarker)).toBe(true);
+    expect(existsSync(mcpMarker)).toBe(true);
+    const filed = await readdir(join(config, "projects"));
+    expect(filed).toHaveLength(1);
+    await rm(hookMarker);
+    await rm(mcpMarker);
+
+    // With the check's flags, through the check itself, neither does.
+    const wake: SeatWake = { driver: "claude-code", session: "00000000-0000-0000-0000-000000000000", cwd: scratch, command: claude! };
+    const checked = await claudePlugin.check(wake, env, runTurn, { call: true });
+    expect(checked.steps?.find((step) => step.step === "call")?.status).toBe("failed");
+    expect(existsSync(hookMarker)).toBe(false);
+    expect(existsSync(mcpMarker)).toBe(false);
+    // And it filed nothing for its own temporary directory.
+    expect(await readdir(join(config, "projects"))).toEqual(filed);
+  }, 120_000);
+});
+
+describe("serve's start verdict", () => {
+  const step = (name: CheckStep["step"], status: CheckStep["status"], message = `${name} ${status}`): CheckStep => ({ step: name, status, message });
+
+  it("holds a seat back only for a program that does not start; the rest are warnings", () => {
+    expect(startVerdict(checkFromSteps([step("program", "ok"), step("signed_in", "warning"), step("session", "failed")]))).toEqual({
+      ok: true,
+      message: "session failed: session failed; signed in warning: signed_in warning",
+      warnings: ["signed in warning: signed_in warning", "session failed: session failed"],
+    });
+    expect(startVerdict(checkFromSteps([step("program", "failed", "codex --version did not answer within 5s"), step("signed_in", "skipped"), step("session", "skipped")]))).toEqual({
+      ok: false,
+      message: "program failed: codex --version did not answer within 5s",
+      warnings: [],
+    });
+    expect(startVerdict(checkFromSteps([step("program", "ok"), step("signed_in", "ok"), step("session", "ok")]))).toMatchObject({ ok: true, warnings: [] });
+    // A check without steps (an adapter's, a stand-in's) is judged as it says.
+    expect(startVerdict({ ok: false, message: "bot is not on PATH" })).toEqual({ ok: false, message: "bot is not on PATH", warnings: [] });
+  });
+
+  it("is stricter by hand: `wake check` fails on a failed session or call, never on a warning", () => {
+    expect(checkFromSteps([step("program", "ok"), step("signed_in", "warning"), step("session", "ok"), step("call", "ok")]).ok).toBe(true);
+    expect(checkFromSteps([step("program", "ok"), step("signed_in", "ok"), step("session", "failed")]).ok).toBe(false);
+  });
+});
+
+describe("the codex wake check", () => {
+  const THREAD = "019efdd0-ba96-77c3-820c-641b3e5e756c";
+  const ANSWERED = ['{"type":"thread.started","thread_id":"01a1"}', '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}', '{"type":"turn.completed","usage":{}}'].join("\n");
+  // Recorded 2026-10-13: Codex 0.146.0 with a model configured that needs a newer Codex.
+  const TOO_OLD = [
+    '{"type":"thread.started","thread_id":"01a1"}',
+    '{"type":"turn.started"}',
+    JSON.stringify({ type: "error", message: JSON.stringify({ type: "error", status: 400, error: { type: "invalid_request_error", message: "The 'gpt-6-astra' model requires a newer version of Codex." } }) }),
+    JSON.stringify({ type: "turn.failed", error: { message: JSON.stringify({ type: "error", status: 400, error: { type: "invalid_request_error", message: "The 'gpt-6-astra' model requires a newer version of Codex." } }) } }),
+  ].join("\n");
+
+  async function machine(options: { rollout?: boolean } = {}) {
+    const path = await bin("codex");
+    const home = await mkdtemp(join(tmpdir(), "sharednet-codex-home-"));
+    cleanup.push(home);
+    await mkdir(join(home, "sessions", "2026", "06", "25"), { recursive: true });
+    if (options.rollout !== false) await writeFile(join(home, "sessions", "2026", "06", "25", `rollout-2026-06-25T16-06-15-${THREAD}.jsonl`), "{}\n");
+    const wake: SeatWake = { driver: "codex", session: THREAD, cwd: path, command: join(path, "codex"), codex_home: home };
+    return { path, home, wake, env: { PATH: path, HOME: "/nowhere", USER: "someone", CODEX_SESSION_ID: "host-thread" } };
+  }
+
+  it("proves the path: the program, its login, the rollout, and an ephemeral turn", async () => {
+    const { home, wake, env } = await machine();
+    const { ran, run } = harness({ version: { stdout: "codex-cli 0.146.0\n" }, signed_in: { stderr: "Logged in using ChatGPT\n" }, call: { stdout: ANSWERED } });
+    const checked = await codexPlugin.check(wake, env, run, { call: true });
+    expect(checked.ok).toBe(true);
+    expect(checked.steps?.map((step) => step.message)).toEqual([
+      `${wake.command} codex-cli 0.146.0`,
+      "codex login status: signed in with ChatGPT",
+      `${THREAD} has its rollout at ${join(home, "sessions", "2026", "06", "25", `rollout-2026-06-25T16-06-15-${THREAD}.jsonl`)}`,
+      'a throwaway `codex exec --ephemeral` turn answered "ok"',
+    ]);
+    expect(ran.map((spec) => spec.args)).toEqual([["--version"], ["login", "status"], [...CODEX_CHECK_ARGS]]);
+    expect(CODEX_CHECK_ARGS).toEqual(["exec", "--ephemeral", "--json", "--skip-git-repo-check", "-s", "read-only", "-"]);
+    for (const spec of ran.slice(1)) {
+      expect(spec.command).toBe(wake.command);
+      expect(spec.env.CODEX_HOME).toBe(home);
+      expect(spec.env.CODEX_SESSION_ID).toBeUndefined();
+    }
+    expect(ran[2]!.args).not.toContain("resume");
+    expect(existsSync(ran[2]!.cwd)).toBe(false);
+  });
+
+  it("names a Codex too old for its configured model, which --version and login status both pass", async () => {
+    const { wake, env } = await machine();
+    const checked = await codexPlugin.check(wake, env, harness({ call: { exitCode: 1, stdout: TOO_OLD, stderr: "ERROR rmcp::transport::worker: worker quit\n" } }).run, { call: true });
+    expect(checked.ok).toBe(false);
+    expect(checked.message).toBe("model call failed: a throwaway `codex exec` turn failed: The 'gpt-6-astra' model requires a newer version of Codex.");
+    expect(codexError(TOO_OLD)).toBe("The 'gpt-6-astra' model requires a newer version of Codex.");
+    expect(codexError(ANSWERED)).toBeNull();
+  });
+
+  it("passes a custom provider signed in by an environment variable, which login status does not see (Codex 0.162.0)", async () => {
+    const { wake, env } = await machine();
+    const provider = harness({ signed_in: { exitCode: 1, stderr: "Not logged in\n" }, call: { stdout: ANSWERED } });
+    const checked = await codexPlugin.check(wake, { ...env, MY_PROVIDER_API_KEY: "synthetic-test-value" }, provider.run, { call: true });
+    expect(checked.ok).toBe(true);
+    expect(statuses(checked)).toEqual([["program", "ok"], ["signed_in", "warning"], ["session", "ok"], ["call", "ok"]]);
+    expect(checked.steps?.[1]?.message).toContain("a provider authenticated by an environment variable is not seen here");
+    // The variable reaches the turn, as it reaches a delivery.
+    expect(provider.ran[2]!.env.MY_PROVIDER_API_KEY).toBe("synthetic-test-value");
+  });
+
+  it("warns for a login it cannot see, fails a missing rollout, and never repeats an API key", async () => {
+    const { home, wake, env } = await machine({ rollout: false });
+    const checked = await codexPlugin.check(wake, env, harness({ signed_in: { exitCode: 1, stderr: "Not logged in\n" }, call: { exitCode: 1, stdout: '{"type":"turn.failed","error":{"message":"401 Unauthorized"}}' } }).run, { call: true });
+    expect(statuses(checked)).toEqual([["program", "ok"], ["signed_in", "warning"], ["session", "failed"], ["call", "failed"]]);
+    expect(checked.message).toContain(`signed in warning: codex login status exited 1: Not logged in. If this Codex signs in with \`codex login\`, run it with CODEX_HOME=${home}`);
+    expect(checked.message).toContain(`session failed: no rollout for thread ${THREAD}`);
+    expect(checked.message).toContain("model call failed: a throwaway `codex exec` turn failed: 401 Unauthorized");
+
+    const keyed = await codexPlugin.check(wake, env, harness({ signed_in: { stderr: "Logged in using an API key - sk-proj-***ABCDE\n" } }).run);
+    expect(keyed.steps?.[1]?.message).toBe("codex login status: signed in with an API key");
+    expect(JSON.stringify(keyed)).not.toContain("sk-proj");
+    const keyedOut = await codexPlugin.check(wake, env, harness({ signed_in: { exitCode: 1, stderr: "Invalid API key - sk-proj-***ABCDE\n" } }).run);
+    expect(JSON.stringify(keyedOut)).not.toContain("sk-proj");
+
+    expect(codexRollout(home, "../../etc")).toBeNull();
+  });
+
+  it("checks a launcher itself: the rollout and the turn through it, login status skipped", async () => {
+    const { path, wake, env } = await machine();
+    const launcher = await launcherIn(path, "codex-room-bypass.sh");
+    const through = harness({ call: { stdout: ANSWERED } });
+    const checked = await codexPlugin.check({ ...wake, command: launcher }, env, through.run, { call: true });
+    expect(checked.ok).toBe(true);
+    expect(statuses(checked)).toEqual([["program", "ok"], ["signed_in", "skipped"], ["session", "ok"], ["call", "ok"]]);
+    // The launcher is never asked for --version; the turn goes through it, never the codex beside it.
+    expect(through.ran.map((spec) => [spec.command, spec.args[0]])).toEqual([[launcher, "exec"]]);
+    const refused = await codexPlugin.check({ ...wake, command: launcher }, env, harness({ call: { exitCode: 64 } }).run, { call: true });
+    expect(refused.ok).toBe(true);
+    expect(refused.steps?.[3]?.status).toBe("warning");
   });
 });
 
