@@ -2781,7 +2781,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     if (!install) return control.uninstall();
     // Before anything is written: a supervisor that respawns serve would race the service for ever.
     const others = await control.conflicts();
-    if (others.length > 0) throw supervisorConflict(others);
+    if (others.some((other) => other.blocking)) throw supervisorConflict(others);
     // A serve this service did not start holds the slot. Installing beside it is a choice, not a race:
     // refused, unless --handoff says the service should wait for it and take over once it stops.
     const running = (await readServeStatus(paths).catch(() => ({}))) as { running?: boolean; pid?: number };

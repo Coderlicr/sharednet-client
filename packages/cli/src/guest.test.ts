@@ -2764,7 +2764,7 @@ describe("sharednet say and wait", () => {
     function installedService(
       state: Partial<ServiceState> | null,
       started: { ok: boolean; message: string } = { ok: true, message: "the installed service ai.sharednet.serve was started" },
-      others: Array<{ label: string; file: string; stop: string }> = [],
+      others: Array<{ label: string; file: string; stop: string; blocking: boolean; why: string }> = [],
     ) {
       const calls: string[] = [];
       const control: WakeServiceControl = {
@@ -2852,7 +2852,13 @@ describe("sharednet say and wait", () => {
 
       // A supervisor that respawns serve is refused outright, with the command that stops it; nothing is installed.
       const supervised = installedService(null, undefined, [
-        { label: "ai.sharednet.listener-supervisor", file: "/Users/synthetic/Library/LaunchAgents/ai.sharednet.listener-supervisor.plist", stop: "launchctl bootout gui/501/ai.sharednet.listener-supervisor" },
+        {
+          label: "ai.sharednet.listener-supervisor",
+          file: "/Users/synthetic/Library/LaunchAgents/ai.sharednet.listener-supervisor.plist",
+          stop: "launchctl bootout gui/501/ai.sharednet.listener-supervisor",
+          blocking: true,
+          why: "launchd has it loaded and running (pid 80225)",
+        },
       ]);
       const blocked = await run(["serve", "--install", "--handoff", "--json"], space, [], {}, { wakeService: supervised.wakeService });
       expect(JSON.parse(blocked.stderr).error).toMatchObject({ code: "service_conflict", message: expect.stringContaining("launchctl bootout gui/501/ai.sharednet.listener-supervisor") });
