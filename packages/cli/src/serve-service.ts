@@ -1,11 +1,10 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { localError } from "./errors.ts";
-import { launchdConflicts, rootFrom, systemdConflicts, type ServeDefinition } from "./serve-conflicts.ts";
 import { getStoragePaths } from "./storage.ts";
 import { harnessFreeEnv, onPath, type Environment } from "./wake-driver.ts";
 
@@ -181,6 +180,19 @@ export function serviceProgram(input: { entry: string; execPath: string; execArg
 }
 
 export type ServicePlatform = "launchd" | "systemd";
+
+/**
+ * The storage root a process uses, given the HOME and XDG_CONFIG_HOME it is started with, as the
+ * CLI's own getStoragePaths resolves it. A relative HOME or XDG_CONFIG_HOME would resolve against a
+ * working directory nobody can know for certain, so it is unresolved.
+ */
+export function rootFrom(env: Record<string, string | undefined>, accountHome: string): { root: string } | { unresolved: string } {
+  const home = env.HOME === undefined || env.HOME === "" ? accountHome : env.HOME;
+  if (!isAbsolute(home)) return { unresolved: `HOME=${home} is relative` };
+  const configHome = env.XDG_CONFIG_HOME;
+  if (configHome !== undefined && configHome !== "" && !isAbsolute(configHome)) return { unresolved: `XDG_CONFIG_HOME=${configHome} is relative` };
+  return { root: resolve(getStoragePaths({ HOME: home, ...(configHome ? { XDG_CONFIG_HOME: configHome } : {}) }).configDir) };
+}
 
 export interface ServiceLocation {
   kind: ServicePlatform;
@@ -377,9 +389,6 @@ export interface ServiceHost {
   writeFile(path: string, content: string): Promise<void>;
   remove(path: string): Promise<boolean>;
   ensureDir(path: string): Promise<void>;
-  /** The names in a directory, or none when it cannot be read. */
-  listDir(path: string): Promise<string[]>;
-  sleep(ms: number): Promise<void>;
   run(command: string, args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }>;
 }
 
@@ -413,8 +422,7 @@ export const realServiceHost = (): ServiceHost => ({
   ensureDir: async (path) => {
     await mkdir(path, { recursive: true, mode: 0o700 });
   },
-  listDir: (path) => readdir(path).catch(() => []),
-  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+
   run: (command, args) =>
     new Promise((resolve) => {
       execFile(command, args, { timeout: 15_000, encoding: "utf8" }, (error, stdout, stderr) => {
@@ -495,38 +503,11 @@ export class ServiceControl {
     return (await this.where()) ?? unsupported(this.host.platform);
   }
 
-  /**
-   * Other definitions that run or respawn serve for this install's storage root, as their service
-   * manager runs them (serve-conflicts.ts). Read-only.
-   */
-  async conflicts(): Promise<ServeDefinition[]> {
-    const where = await this.where();
-    if (where === null) return [];
-    const root = this.root();
-    if (where.kind === "launchd") {
-      return launchdConflicts({
-        host: this.host,
-        ownLabel: where.label,
-        root,
-        // Per-user agents, and the machine's agents, which launchd also loads into this login session.
-        agentDirs: [join(this.host.home, "Library", "LaunchAgents"), "/Library/LaunchAgents"],
-      });
-    }
-    return systemdConflicts({ host: this.host, ownLabel: where.label, root, unitDirs: await this.userUnitDirs() });
-  }
-
   /** This install's storage root, resolved; a relative HOME or XDG_CONFIG_HOME is refused. */
   private root(): string {
     const resolved = rootFrom({ HOME: this.env.HOME, XDG_CONFIG_HOME: this.env.XDG_CONFIG_HOME }, this.host.home);
-    if ("unresolved" in resolved) throw localError("service_not_installed", `This shell's storage root cannot be resolved: ${resolved.unresolved.replace(/^its /, "")}. Install from a shell with an absolute HOME and XDG_CONFIG_HOME.`);
+    if ("unresolved" in resolved) throw localError("service_not_installed", `This shell's storage root cannot be resolved: ${resolved.unresolved}. Install from a shell with an absolute HOME and XDG_CONFIG_HOME.`);
     return resolved.root;
-  }
-
-  /** The persistent unit directories under the account's home in the user manager's search path, for the fallback. */
-  private async userUnitDirs(): Promise<string[]> {
-    const shown = await this.host.run("systemctl", ["--user", "show", "--property=UnitPath", "--value"]);
-    const listed = shown.exitCode === 0 ? shown.stdout.split(/\s+/).filter((entry) => entry.startsWith(`${this.host.home}/`) && entry.endsWith("/systemd/user")) : [];
-    return listed.length > 0 ? listed : [join(this.host.home, ".config", "systemd", "user"), join(this.host.home, ".local", "share", "systemd", "user")];
   }
 
   /** The service as its manager sees it, or null where there is no service manager to ask. */
@@ -562,8 +543,16 @@ export class ServiceControl {
   async install(): Promise<Record<string, unknown>> {
     const where = await this.location();
     if (this.program === null) throw localError("service_not_installed", "Only the sharednet executable can install its service.");
-    const others = await this.conflicts();
-    if (others.some((other) => other.blocking)) throw supervisorConflict(others);
+    const root = this.root();
+    // SharedNet's own definition for this storage root, by its exact label and file. Its being there,
+    // or launchd/systemd holding that label, is refused: a reinstall is an explicit uninstall first.
+    const existing = await this.state();
+    if (existing !== null && (existing.installed || existing.loaded)) {
+      throw localError(
+        "service_installed",
+        `SharedNet's service for storage root ${root} is already ${existing.installed ? "installed" : "loaded"}: ${existing.label} at ${existing.file}${existing.running ? ` (running${existing.pid ? `, pid ${existing.pid}` : ""})` : ""}. To install it again: sharednet serve --uninstall, then sharednet serve --install.`,
+      );
+    }
     const captured = captureServiceEnv(this.env, { home: this.host.home, username: this.host.username });
     for (const required of ["HOME", "PATH"] as const) {
       if (!captured.env[required]) throw localError("service_not_installed", `${required} is not set here, and the service cannot run without it.`);
@@ -579,14 +568,7 @@ export class ServiceControl {
     await this.host.ensureDir(paths.stateDir);
     if (where.kind === "launchd") {
       const target = `gui/${this.host.uid}`;
-      // Bootstrapping a label that is already loaded fails; installing again means replacing it.
-      const replaced = (await this.host.run("launchctl", ["bootout", `${target}/${where.label}`])).exitCode === 0;
-      // launchd finishes a bootout after it returns; until then a bootstrap of the label fails (5: I/O error).
-      let loaded = await this.host.run("launchctl", ["bootstrap", target, where.file]);
-      for (let attempt = 0; replaced && loaded.exitCode !== 0 && attempt < 5; attempt += 1) {
-        await this.host.sleep(1_000);
-        loaded = await this.host.run("launchctl", ["bootstrap", target, where.file]);
-      }
+      const loaded = await this.host.run("launchctl", ["bootstrap", target, where.file]);
       if (loaded.exitCode !== 0) {
         throw localError("service_not_loaded", `Wrote ${where.file}, but launchctl bootstrap ${target} refused it (exit ${loaded.exitCode}): ${lastLine(loaded.stderr || loaded.stdout)}`);
       }
@@ -598,7 +580,9 @@ export class ServiceControl {
         }
       }
     }
-    const warnings: string[] = others.filter((other) => !other.blocking).map(inactiveDefinitionWarning);
+    const warnings: string[] = [
+      `Only SharedNet's own service (${where.label}, ${where.file}) and this storage root's serve lock were checked. A supervisor you manage yourself (another LaunchAgent or user unit, a timer, cron, a login script) is not inspected: if one runs serve for ${root}, retire it, or it will keep starting serve; the service then waits for the lock rather than run beside it.`,
+    ];
     if (!hasProxy(captured.env)) {
       warnings.push("No proxy variable (HTTPS_PROXY, HTTP_PROXY, ALL_PROXY) was set here, so the service has none. If a harness reaches its API only through a proxy, install again from a shell that has it.");
     }
@@ -619,6 +603,7 @@ export class ServiceControl {
     }
     return {
       installed: true,
+      root,
       manager: where.kind,
       label: where.label,
       file: where.file,
@@ -671,23 +656,5 @@ export class ServiceControl {
 }
 
 /** The refusal for another definition that runs or respawns serve, with the command that stops each. */
-/** The refusal for the blocking ones, each with why it blocks and the command that stops it. */
-export function supervisorConflict(others: ServeDefinition[]) {
-  return localError(
-    "service_conflict",
-    [
-      `Another service definition here runs or respawns a SharedNet serve for this storage root, and would race this service for its one slot. Stop it, move its file out of the way so it does not come back, then install again:`,
-      ...others.filter((other) => other.blocking).map((other) => `  ${other.stop}    # ${other.file}: ${other.why}`),
-    ].join("\n"),
-  );
-}
-
-/** What install says about a definition that serves this root but will not run (disabled, inactive). */
-export function inactiveDefinitionWarning(other: ServeDefinition): string {
-  return `${other.label} (${other.file}) also runs serve for this storage root, but ${other.why}, so it does not block this install; enabling it again would race the service.`;
-}
-
-export type { ServeDefinition };
-
 /** What `serve` and `join` use of the service; tests stand in for it. */
-export type WakeServiceControl = Pick<ServiceControl, "state" | "install" | "uninstall" | "start" | "conflicts">;
+export type WakeServiceControl = Pick<ServiceControl, "state" | "install" | "uninstall" | "start">;

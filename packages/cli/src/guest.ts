@@ -12,7 +12,8 @@ import { computeLocalInstanceKey } from "./instance-computation.ts";
 import { detectRuntime, type DetectedRuntime } from "./runtime-detection.ts";
 import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn, triggerTakesParameter, wakeIdentity, type Trigger } from "./triggers.ts";
 import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
-import { RESTART_SECONDS, supervisorConflict, type WakeServiceControl } from "./serve-service.ts";
+import { looksLikeServe, systemProcessProbe, type ProcessProbe } from "./process-identity.ts";
+import { RESTART_SECONDS, type WakeServiceControl } from "./serve-service.ts";
 import { chatOpen } from "./wake-claude.ts";
 import { codebuddyProgram } from "./wake-codebuddy.ts";
 import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
@@ -78,6 +79,8 @@ export interface GuestDependencies {
    * `--uninstall`, its state in `--status`, and starting it after a join. Only the real process supplies it.
    */
   wakeService?: (env: Environment) => WakeServiceControl;
+  /** Whether a serve lock's pid is still the process that wrote it (process-identity.ts); tests replace it. */
+  processProbe?: ProcessProbe;
 }
 
 export type CommandRunner = (
@@ -130,7 +133,7 @@ const WAIT_MAX_SECONDS = 25;
 const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume", "config-dir"]);
 /** Options that may be given more than once; every value is kept, in order. */
 const REPEATABLE_OPTIONS = new Set(["on", "artifact"]);
-const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake", "switch-account", "install", "uninstall", "service", "handoff"]);
+const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake", "switch-account", "install", "uninstall", "service"]);
 
 function parseGuestArguments(args: string[]): ParsedGuestArguments {
   const options = new Map<string, string | true>();
@@ -771,7 +774,7 @@ async function wakeAfterJoin(
   const plugin = pluginFor(wake.driver);
   const harness = plugin.label;
   let listen = plugin.listen?.(wake, seat.member_id) ?? null;
-  const status = (await readServeStatus(paths).catch(() => ({}))) as { running?: boolean; pid?: number; drives?: boolean; wake_protocol?: string };
+  const status = (await readServeStatus(paths, dependencies.processProbe).catch(() => ({}))) as { running?: boolean; pid?: number; drives?: boolean; wake_protocol?: string };
   let service: "running" | "started" | "not_started" | "outdated";
   let how: string;
   let pid: number | null = null;
@@ -2749,11 +2752,11 @@ const MAX_MESSAGE_BYTES = 32_768;
 
 async function serve(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["run", "reply", "rooms", "from-instance", "from-agent", "grep", "status", "stop", "push", "listen", "install", "uninstall", "service", "handoff"]);
+  assertOnlyOptions(parsed, ["run", "reply", "rooms", "from-instance", "from-agent", "grep", "status", "stop", "push", "listen", "install", "uninstall", "service"]);
   if (parsed.positionals.length !== 0) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet serve [--run '<command>'] [--reply] [--rooms all|rom_…,rom_…] [--grep TEXT] [--push <public address>|ngrok [--listen <port>]], or sharednet serve --status | --stop | --install [--handoff] | --uninstall",
+      "Usage: sharednet serve [--run '<command>'] [--reply] [--rooms all|rom_…,rom_…] [--grep TEXT] [--push <public address>|ngrok [--listen <port>]], or sharednet serve --status | --stop | --install | --uninstall",
     );
   }
   const pushOption = stringOption(parsed, "push");
@@ -2766,42 +2769,28 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const control = dependencies.wakeService?.(dependencies.env);
   const install = parsed.options.get("install") === true;
   if (install || parsed.options.get("uninstall") === true) {
-    const handoff = parsed.options.get("handoff") === true;
-    if (
-      [...parsed.options.keys()].some((name) => name !== "install" && name !== "uninstall" && name !== "handoff") ||
-      (install && parsed.options.get("uninstall") === true) ||
-      (handoff && !install)
-    ) {
-      throw localError("invalid_arguments", "--install [--handoff] and --uninstall go alone: the service serves every seat here joined from a Codex or Claude Code session.");
+    if ([...parsed.options.keys()].some((name) => name !== "install" && name !== "uninstall") || (install && parsed.options.get("uninstall") === true)) {
+      throw localError("invalid_arguments", "--install and --uninstall go alone: the service serves every seat here joined from a Codex or Claude Code session.");
     }
     if (!control) throw localError("service_unsupported", "Only the sharednet executable can install or remove its service.");
     if (install && sandboxed(dependencies.env)) {
       throw localError("service_not_installed", "This session runs in a sandbox; install the service from a terminal outside it.");
     }
     if (!install) return control.uninstall();
-    // Before anything is written: a supervisor that respawns serve would race the service for ever.
-    const others = await control.conflicts();
-    if (others.some((other) => other.blocking)) throw supervisorConflict(others);
-    // A serve this service did not start holds the slot. Installing beside it is a choice, not a race:
-    // refused, unless --handoff says the service should wait for it and take over once it stops.
-    const running = (await readServeStatus(paths).catch(() => ({}))) as { running?: boolean; pid?: number };
-    const service = await control.state().catch(() => null);
-    const elsewhere = running.running && running.pid && running.pid !== service?.pid ? running.pid : null;
-    if (elsewhere !== null && !handoff) {
+    // The install-time contract (Room #134–#144): SharedNet's own definition for this root (checked
+    // in control.install(), exact label and file), and this root's serve lock, whoever holds it.
+    // Supervisors SharedNet did not write are not interpreted; the report tells the operator so.
+    const running = (await readServeStatus(paths, dependencies.processProbe)) as { running?: boolean; pid?: number; holder_check?: string };
+    if (running.running && running.pid) {
       throw localError(
         "serve_running",
-        `A serve the service did not start is running here (pid ${elsewhere}). Stop it first (sharednet serve --stop) and install again, or install with --handoff: the service then waits for pid ${elsewhere} to stop and takes over.`,
+        `A connector already holds the serve lock for storage root ${paths.configDir} (pid ${running.pid}, checked by ${running.holder_check === "argv" ? "its command line" : "its start identity"}), whoever started it. Stop it first with \`sharednet serve --stop\` (or retire the supervisor that runs it), then install again.`,
       );
     }
-    const report = await control.install();
-    if (elsewhere !== null) {
-      const note = `handing over: pid ${elsewhere} keeps the machine's slot until it stops; the service then takes over. Stop it with: sharednet serve --stop`;
-      report.warnings = [...((report.warnings as string[] | undefined) ?? []), note];
-    }
-    return reportInstall(report, dependencies);
+    return reportInstall(await control.install(), dependencies);
   }
   if (parsed.options.get("status") === true) {
-    const status = (await readServeStatus(paths)) as Record<string, unknown>;
+    const status = (await readServeStatus(paths, dependencies.processProbe)) as Record<string, unknown>;
     const installed = await control?.state().catch(() => null);
     return installed ? { ...status, service: installed } : status;
   }
@@ -2848,8 +2837,12 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   /** What serve's start check doubted about a seat it drives anyway (`wake_warnings` in `serve --status`). */
   const wakeWarnings = new Map<string, string[]>();
   const inTurnOrder = sessionTurnOrder();
+  // This process's start identity, from the source a later check of the lock reads (process-identity.ts).
+  const probe = dependencies.processProbe ?? systemProcessProbe;
+  const identity = probe.identity(process.pid);
   const statusOf = (all: StoredRoomCredential[]): ServeStatus => ({
     pid: process.pid,
+    ...(identity !== null ? { start_identity: identity } : {}),
     started_at: started,
     rooms: [...new Set(all.map((seat) => seat.room_id))],
     drives: !command,
@@ -2864,19 +2857,19 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     })),
   });
   const sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  let holder = await claimServe(paths, statusOf(seats));
+  let holder = await claimServe(paths, statusOf(seats), probe);
   if (holder !== null && asService) {
-    dependencies.stderr?.(`serve: ${holder === 0 ? "another connector is starting" : `a connector is already running (pid ${holder})`}; this service waits for it to stop, then takes over\n`);
+    dependencies.stderr?.(`serve: ${holder === 0 ? "another connector is starting" : `a connector is already running (pid ${holder})`} for storage root ${paths.configDir}; this service waits for it to stop, then takes over\n`);
     while (holder !== null && !dependencies.signal?.aborted) {
       await sleep(SLOT_WAIT_MS);
-      holder = await claimServe(paths, statusOf(seats));
+      holder = await claimServe(paths, statusOf(seats), probe);
     }
     if (holder !== null) return { served: 0 };
   }
   if (holder !== null) {
     throw localError(
       "serve_running",
-      `${holder === 0 ? "Another connector is starting on this machine" : `A connector is already running on this machine (pid ${holder})`}; it serves every seat here, including ones joined after it started. Stop it first with: sharednet serve --stop`,
+      `${holder === 0 ? "Another connector is starting" : `A connector is already running (pid ${holder})`} for storage root ${paths.configDir}; it serves every seat there, including ones joined after it started. Stop it first with: sharednet serve --stop`,
     );
   }
 
@@ -3430,6 +3423,8 @@ async function roomEnd(client: ApiClient, seat: StoredRoomCredential): Promise<n
 
 type ServeStatus = {
   pid: number;
+  /** The holder's start identity (process-identity.ts); absent in a status file written before it existed. */
+  start_identity?: string;
   started_at: string;
   rooms: string[];
   /** True for a connector that resumes sessions; one running a --run command, or an older one, does not. */
@@ -3451,10 +3446,11 @@ async function writeServeStatus(paths: ReturnType<typeof getStoragePaths>, statu
 }
 
 /**
- * Takes the machine's one connector slot: null when it is now this process's, or the pid of the
- * live connector that holds it. A slot whose process is gone is taken over.
+ * Takes the storage root's one connector slot: null when it is now this process's, or the pid of the
+ * live connector that holds it (0 while one is being written). A slot whose holder is gone, or whose
+ * pid now belongs to another process, is taken over.
  */
-async function claimServe(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus): Promise<number | null> {
+async function claimServe(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus, probe: ProcessProbe = systemProcessProbe): Promise<number | null> {
   await mkdir(paths.configDir, { recursive: true, mode: 0o700 });
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
@@ -3465,7 +3461,7 @@ async function claimServe(paths: ReturnType<typeof getStoragePaths>, status: Ser
     }
     let holder: { running?: boolean; pid?: number };
     try {
-      holder = (await readServeStatus(paths)) as { running?: boolean; pid?: number };
+      holder = (await readServeStatus(paths, probe)) as { running?: boolean; pid?: number };
     } catch {
       // Being written this moment by a connector that is starting.
       return 0;
@@ -3479,32 +3475,50 @@ async function claimServe(paths: ReturnType<typeof getStoragePaths>, status: Ser
 
 /** Gives the slot back, if it is still this process's. */
 async function releaseServe(paths: ReturnType<typeof getStoragePaths>): Promise<void> {
-  const status = (await readServeStatus(paths).catch(() => null)) as { pid?: number } | null;
+  const raw = await readFile(serveStatusPath(paths), "utf8").catch(() => null);
+  const status = raw === null ? null : (JSON.parse(raw) as { pid?: number });
   if (status?.pid === process.pid) await unlink(serveStatusPath(paths)).catch(() => undefined);
 }
 
+/**
+ * Whether the pid in a status file is still the listener that wrote it: alive (EPERM counts: it is
+ * someone else's process), and its start identity is the one recorded, compared as exact strings.
+ * A status file written before identities were recorded counts only if the pid's full argv names
+ * sharednet and serve. `holder` says which check decided.
+ */
+function holderOf(status: ServeStatus, probe: ProcessProbe): { live: boolean; holder: "start_identity" | "argv"; why?: string } {
+  if (!probe.alive(status.pid)) return { live: false, holder: status.start_identity ? "start_identity" : "argv", why: "the process that wrote this status is gone" };
+  if (status.start_identity !== undefined) {
+    const now = probe.identity(status.pid);
+    return now === status.start_identity
+      ? { live: true, holder: "start_identity" }
+      : { live: false, holder: "start_identity", why: `pid ${status.pid} is now another process (its start identity ${now === null ? "could not be read" : "differs"}); the listener that wrote this status is gone` };
+  }
+  return looksLikeServe(probe.argv(status.pid))
+    ? { live: true, holder: "argv" }
+    : { live: false, holder: "argv", why: `pid ${status.pid} is not a sharednet serve (this status predates start identities, and its command does not name sharednet serve)` };
+}
+
 /** `running` is checked, not claimed: a status file outlives the process that wrote it. */
-async function readServeStatus(paths: ReturnType<typeof getStoragePaths>): Promise<unknown> {
+async function readServeStatus(paths: ReturnType<typeof getStoragePaths>, probe: ProcessProbe = systemProcessProbe): Promise<unknown> {
   let raw: string;
   try {
     raw = await readFile(serveStatusPath(paths), "utf8");
   } catch {
-    return { running: false, reason: "no connector has been started on this machine" };
+    return { running: false, root: paths.configDir, reason: `no connector has been started for storage root ${paths.configDir}` };
   }
   const status = JSON.parse(raw) as ServeStatus;
-  let running = false;
-  try {
-    process.kill(status.pid, 0);
-    running = true;
-  } catch {
-    running = false;
-  }
-  return { running, ...status, ...(running ? {} : { reason: "the process that wrote this status is gone" }) };
+  const checked = holderOf(status, probe);
+  return { running: checked.live, root: paths.configDir, ...status, holder_check: checked.holder, ...(checked.why ? { reason: checked.why } : {}) };
 }
 
+/** Stops the listener holding this root's slot, and only after checking it is that listener. */
 async function stopServe(paths: ReturnType<typeof getStoragePaths>, dependencies: GuestDependencies, control?: WakeServiceControl): Promise<unknown> {
-  const status = (await readServeStatus(paths)) as { running?: boolean; pid?: number };
-  if (!status.running || !status.pid) return { stopped: false, reason: "no connector is running on this machine" };
+  const status = (await readServeStatus(paths, dependencies.processProbe)) as { running?: boolean; pid?: number; reason?: string };
+  if (!status.running || !status.pid) {
+    // Never a signal to a pid that is not verifiably the listener: after a reboot it can be anyone's.
+    return { stopped: false, root: paths.configDir, ...(status.pid ? { pid: status.pid } : {}), reason: status.reason ?? `no connector is running for storage root ${paths.configDir}` };
+  }
   process.kill(status.pid, "SIGTERM");
   dependencies.stderr?.(`serve: asked pid ${status.pid} to stop\n`);
   // An installed service is started again by its manager: stopping is how it restarts on the newest CLI.
@@ -3512,16 +3526,16 @@ async function stopServe(paths: ReturnType<typeof getStoragePaths>, dependencies
   if (installed?.installed && installed.loaded) {
     const note = `the installed service ${installed.label} starts serve again within ${RESTART_SECONDS}s; to stop it for good: sharednet serve --uninstall`;
     dependencies.stderr?.(`serve: ${note}\n`);
-    return { stopped: true, pid: status.pid, restarts: true, note };
+    return { stopped: true, pid: status.pid, root: paths.configDir, restarts: true, note };
   }
-  return { stopped: true, pid: status.pid };
+  return { stopped: true, pid: status.pid, root: paths.configDir };
 }
 
 /** `serve --install` says, on stderr, what it wrote: the program, every variable and its value, and what to look at. */
 function reportInstall(report: Record<string, unknown>, dependencies: GuestDependencies): Record<string, unknown> {
   const env = (report.env ?? {}) as Record<string, string>;
   const lines = [
-    `serve: installed ${String(report.label)} (${String(report.manager)}) at ${String(report.file)}`,
+    `serve: installed ${String(report.label)} (${String(report.manager)}) at ${String(report.file)}, for storage root ${String(report.root)}`,
     `serve: it runs ${(report.program as string[]).join(" ")}`,
     `serve: ${String(report.program_note)}`,
     `serve: environment written (${Object.keys(env).length} variables, from an allowlist; no tokens or keys):`,

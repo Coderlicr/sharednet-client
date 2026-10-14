@@ -16,14 +16,13 @@ Without this, `serve` is a detached child that `join` leaves behind (`startWakeS
 
 | Command | Does |
 | --- | --- |
-| `sharednet serve --install` | Writes the service definition and has the manager load and start it. Running it again replaces the definition and restarts the service. On stderr it prints the program and every variable it wrote, with values. With `--json`, stdout carries the same report. It refuses, before writing anything, when another service definition runs or respawns serve (`service_conflict`), or when a serve the service did not start is running (`serve_running`). |
-| `sharednet serve --install --handoff` | Installs beside a running serve the service did not start. The service waits for that serve to stop and then takes over; stop it with `serve --stop`. |
+| `sharednet serve --install` | Writes SharedNet's own service definition for this storage root and has the manager load and start it. On stderr it prints the storage root, the label and file it wrote, the program, and every variable it wrote with its value. With `--json`, stdout carries the same report. Before writing anything, it refuses in two cases: SharedNet's own service for this root is already installed or loaded (`service_installed`; uninstall first to reinstall), or this root's serve lock is held by a live listener, whoever started it (`serve_running`). |
 | `sharednet serve --uninstall` | Stops the service and removes its definition. It does not touch a `serve` you started by hand. |
 | `sharednet serve --status` | Shows the connector, as before. When a service exists, it adds `service: { installed, loaded, running, pid, label, file, program }`. |
-| `sharednet serve --stop` | Stops the running connector, as before. When it was the installed service, the manager starts it again within 30 s. That is how it restarts onto the newest CLI. To stop it for good, use `--uninstall`. |
+| `sharednet serve --stop` | Stops the listener that holds this root's serve lock, only after checking that the pid is still that listener (see "The serve lock"). When it was the installed service, the manager starts it again within 30 s. That is how the service restarts onto the newest CLI. To stop it for good, use `--uninstall`. |
 | `sharednet serve --service` | What the service runs. It is an ordinary `serve` except that it does not end when there is nothing to do yet (see below). |
 
-These are options of `serve`, like `--status` and `--stop`, and not a new verb. `--install` (with or without `--handoff`) and `--uninstall` take no other `serve` option: the service always serves every seat joined from a Codex or Claude Code session, the same seats a plain `serve` drives.
+These are options of `serve`, like `--status` and `--stop`, and not a new verb. `--install` and `--uninstall` take no other `serve` option: the service always serves every seat joined from a Codex or Claude Code session, the same seats a plain `serve` drives. There is no handoff flag. A listener already holding the lock is stopped first (`sharednet serve --stop`, or by retiring whatever supervises it), and then the service is installed.
 
 Install from the environment the service should have. On a machine that reaches the model API only through a proxy, that means a shell where the proxy is set:
 
@@ -93,32 +92,27 @@ Everything written is printed with its value. Since nothing secret can pass thes
 
 ## Never two serves
 
-There is still one connector slot per storage root, `serve.json`. The changes keep it that way:
+There is one connector slot per storage root, its `serve.json`. The install-time contract was agreed in Cloud Dev (Room #134–#144), and it is deliberately narrow:
 
-- **A `serve` the service did not start holds the slot.** `--install` refuses (`serve_running`, naming the pid) rather than race it. Stop it first with `sharednet serve --stop`, or install with `--handoff`. With `--handoff` the service does not fail and get restarted over and over: it logs that it is waiting, checks every 10 s, and takes the slot when the other one stops.
-- **Another supervisor respawns serve.** A hand-made LaunchAgent or user unit that keeps a serve alive for the same storage root would start it again beside the service, over and over. So `--install` refuses (`service_conflict`) even with `--handoff`. For each such definition it names the command that stops it and why it blocks, and asks for the definition to be moved out of the way. Detection only reads; the CLI never stops or edits these definitions. One found on a real machine: `ai.sharednet.listener-supervisor`, running `~/.local/share/sharednet/bin/supervise.py`. Implemented in `serve-conflicts.ts`.
-  - **The manager is asked, not the files.** A definition's effective configuration is what its service manager makes of it: continuation lines across comments, drop-ins, precedence across the whole search path, the manager's own environment, launchd's override database. Four review rounds of reading unit files by hand each found another corner, so the CLI asks the manager instead:
-    - **systemd, candidates:** `systemctl --user list-unit-files` and `list-units --all` (services, timers, paths and sockets) list candidates across the full search path.
-    - **systemd, each candidate:** one batched `systemctl --user show` reports each candidate's effective `Environment=`, `EnvironmentFiles=`, `UnsetEnvironment=`, `ExecStart=`, `Triggers=`, `FragmentPath=`, `DropInPaths=`, `UnitFileState=` and `ActiveState=`.
-    - **systemd, inherited environment:** `systemctl --user show-environment` gives the environment the manager hands every unit.
-    - **launchd, loaded jobs:** for a job in `~/Library/LaunchAgents` or `/Library/LaunchAgents`, `launchctl print gui/<uid>/<label>` gives its effective environment (default, inherited and own blocks) and its state.
-    - **launchd, jobs not loaded:** the plist is read only for a job that is not loaded, converted by `plutil` when it is binary, and `launchctl print-disabled` gives the override.
-  - **Which definitions count:** one whose reported command, environment, description or source files mention SharedNet together with serve, a supervisor, a listener or wake, other than this service itself. A masked unit cannot run and does not count.
-  - **Same storage root only.** A definition's root is resolved from the `HOME` and `XDG_CONFIG_HOME` it is started with: the manager's environment, then the definition's own. Neither set means the account's standard root.
-  - **What cannot be read for certain is unresolved, and an unresolved definition blocks.** It is treated as this root, and the refusal says why it could not be scoped. That covers:
-    - `EnvironmentFile=`;
-    - `UnsetEnvironment=` of either variable;
-    - a manager environment that cannot be read;
-    - a relative `HOME` or `XDG_CONFIG_HOME`;
-    - a binary plist that `plutil` cannot convert;
-    - unreadable `EnvironmentVariables`.
+- **SharedNet's own service, exactly.** Install checks only its own label and file for the resolved storage root: whether the file exists, and whether launchd or systemd holds that exact label. If either is true, install refuses (`service_installed`) and names the root, the label, the file and any running pid. Its own label is never excluded from that check.
+- **This root's serve lock, whoever holds it.** If a live listener holds the lock (checked as described under "The serve lock" below), install refuses (`serve_running`) and names the root and the pid. No flag bypasses it. If the holder is gone, or its pid now belongs to another process, the lock is stale and does not block.
+- **Nothing else.** SharedNet does not interpret launchd or systemd definitions it did not write: other labels, timers, drop-ins, overrides, other search directories. Install says so in its report, and asks the operator to retire any supervisor they run themselves.
 
-    When `systemctl --user` cannot be asked at all, every unit file that mentions SharedNet in the manager's home directories is reported as unresolved and blocking.
-  - **Timers, paths and sockets** are scoped by what they start. The manager's `Triggers=` (drop-ins applied) maps each one to its service. The service's environment gives the root, the activator's enablement counts as the service's, and the stop command names both.
-  - **Only what will run blocks.**
-    - **launchd:** a loaded job blocks (stop command `bootout`). A job that is not loaded blocks if launchd will load it at the next login (stop command `launchctl disable`). An explicit `print-disabled` override (enabled or disabled) wins; with no override, the plist's `Disabled` key decides.
-    - **systemd:** a unit blocks if it, or anything that triggers it, is enabled or active, or reports a state the CLI does not know.
-    - A definition that will not run (disabled, static or masked, and inactive) only adds a warning to the install report.
+The guarantee itself is at runtime. A second `serve` for a root whose lock is held by a live listener exits with `serve_running`, naming the root and the pid. A supervisor nobody told SharedNet about therefore cannot start a second listener beside the service. Its serve exits, and the service, if it is the one waiting, waits for the lock instead of running beside the other.
+
+### The serve lock
+
+The lock is `serve.json`, created with an exclusive-create flag, so two starters cannot both win. Its pid is trusted only after checking that the pid is still the listener that wrote it (`process-identity.ts`, Room #137–#142):
+
+- **Recording.** At lock time, the listener records its own start identity, read from the same OS source a later check reads:
+  - Linux: field 22 of `/proc/self/stat`, taken after the last `)` because the command name in field 2 may contain spaces and `)`;
+  - macOS: `ps -o lstart= -p <pid>`.
+- **Checking.** A holder is live only if signal 0 finds its pid alive, and its start identity read the same way is exactly the recorded string. `EPERM` (someone else's process) counts as alive. A pid that is gone, or that now belongs to another process after a crash or reboot, is a stale lock: `serve` and `--install` take it over.
+- **Old status files.** A status file written before identities were recorded has none. Its pid counts as live only if that process's full argv (`/proc/<pid>/cmdline`, or `ps -o args=`) names `sharednet` and has a `serve` argument.
+- **Stopping.** `serve --stop` signals only a holder that passes this check. Otherwise it reports why and signals nothing, so a stale `serve.json` can never make it kill an unrelated process.
+
+The runtime behaviour around the lock:
+
 - **No seats yet.** A plain `serve` ends with `not_in_a_room`. The service holds the slot and checks every 5 s for a seat joined from a Codex or Claude Code session.
 - **Every seat stopped** (credentials revoked, say). A plain `serve` ends. The service keeps running, instead of being restarted every 30 s by its manager into the same stopped seats.
 - **A stopped seat comes back without a restart.** Each seat's loop is begun with a fingerprint of its seat file (base URL, token, join time, Room type, wake) and, for an account seat, its session's token. A seat whose loop ended (refused for good, wake off, its Room gone) is left alone while that fingerprint is unchanged, so a refusal is not retried every 5 s. The next look (every 5 s) sits in it again once the fingerprint changes: after a rejoin, a new account token, or `wake set`. This also applies to a plain `serve` that still has other live seats. Before this change, such a seat stayed stopped until serve restarted. That was already true on the base whenever another seat kept serve running, and the service would have made it permanent.
@@ -137,11 +131,22 @@ A wake delivery from the service still runs through `deliveryEnv`, so the turn g
   - program choice: npx, global install or checkout, no npx;
   - definitions: plist keys and escaping; each systemd directive by its own rules (ExecStart, Environment, path settings), line breaks refused; read-back of the program;
   - naming: by storage root; the plist in the account's home; the systemd unit in the manager's own `UnitPath` directory (Ubuntu 24.04's real list included);
-  - install, uninstall, state and start against a recording host: launchd and systemd command lines, the bootout race, refusals, lingering read and reported (never sudo), supervisors detected and refused without being touched.
+  - install, uninstall, state and start against a recording host: launchd and systemd command lines, refusal when SharedNet's own service for the root is installed or loaded (and not for another root), lingering read and reported (never sudo), the warning about supervisors the operator runs.
 - **systemd's own parser.** Where `systemd-analyze` exists, `serve-service.test.ts` writes a generated unit with spaces, `%`, `$`, quotes and backslashes in every directive and runs `systemd-analyze --user verify` on it, falling back to the system-mode parser when no user manager can start. It also runs a negative control: the quoted `WorkingDirectory=` the first version wrote must fail. CI runs these on Ubuntu as their own step, with systemd-analyze required (`SHAREDNET_REQUIRE_SYSTEMD_ANALYZE=1`, and whenever `CI` is set on Linux), so a missing parser fails rather than skips.
+- **The serve lock, `process-identity.test.ts` and `guest.test.ts`:**
+  - EPERM is alive, ESRCH is gone;
+  - `/proc/<pid>/stat` is parsed after the last `)`;
+  - a real process's identity reads the same twice;
+  - the old-status argv rule;
+  - a live holder refuses a second `serve`, naming the root;
+  - a dead pid, and a reused pid with a different identity, are taken over;
+  - EPERM counts as alive;
+  - an old status file whose live argv is a sharednet serve counts as alive, and one whose argv is not, does not;
+  - `--stop` signals nothing when the identity does not match (the process this test started lives on), and stops a verified holder;
+  - a second, real `serve` process on the same root exits non-zero naming the locked root while the first holds it.
 - **CLI, `guest.test.ts`:**
   - `join` starts the installed service rather than a detached `serve`, including from a sandbox and when the start fails;
-  - `--install`, `--uninstall` and `--status` go through the service control; install refuses beside a running serve unless `--handoff`, and refuses beside a supervisor even with it;
+  - `--install`, `--uninstall` and `--status` go through the service control; install refuses while this root's lock has a live holder (no bypass) and goes ahead past a stale one;
   - `--service` waits for a held slot and for seats, and outlives stopped seats;
   - `--stop` explains the restart.
 - **No test runs `launchctl` or `systemctl`.** A real launchd round trip is recorded in the pull request. It used a test-only label, a disposable HOME and XDG root, and a harmless program, which was then booted out and deleted.

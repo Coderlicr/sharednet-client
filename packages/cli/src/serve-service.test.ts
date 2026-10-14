@@ -286,15 +286,15 @@ function fakeHost(platform: NodeJS.Platform, home: string, answers: Record<strin
     home,
     username: "synthetic",
     readFile: async (path) => files.get(path) ?? null,
-    listDir: async (path) => [...files.keys()].filter((file) => dirname(file) === path).map((file) => file.slice(path.length + 1)),
     writeFile: async (path, content) => void files.set(path, content),
     remove: async (path) => files.delete(path),
     ensureDir: async (path) => void dirs.push(path),
-    sleep: async () => undefined,
     run: async (command, args) => {
       const line = [command, ...args].join(" ");
       calls.push(line);
-      const answer = Object.entries(answers).find(([prefix]) => line.startsWith(prefix))?.[1] ?? { exitCode: 0 };
+      // launchd has no job by that label unless a test says so.
+      const fallback = command === "launchctl" && args[0] === "print" ? { exitCode: 113, stderr: "Could not find service" } : { exitCode: 0 };
+      const answer = Object.entries(answers).find(([prefix]) => line.startsWith(prefix))?.[1] ?? fallback;
       return { exitCode: answer.exitCode, stdout: answer.stdout ?? "", stderr: answer.stderr ?? "" };
     },
   };
@@ -304,63 +304,72 @@ function fakeHost(platform: NodeJS.Platform, home: string, answers: Record<strin
 describe("installing, inspecting and removing it", () => {
   const program = { entry: "/opt/sharednet/bin/sharednet.js", execPath: "/usr/local/bin/node", execArgv: [] as string[] };
 
-  it("on macOS writes the LaunchAgent and bootstraps it into the login session, replacing one already loaded", async () => {
+  it("on macOS writes the LaunchAgent and bootstraps it into the login session, and names the root it serves", async () => {
     const bin = await binWith("node");
     const env = { HOME: "/Users/synthetic", USER: "synthetic", LOGNAME: "synthetic", PATH: bin, HTTPS_PROXY: "http://127.0.0.1:10080", CLAUDE_CODE_SESSION_ID: "6613bb00" };
     const { host, files, calls, dirs } = fakeHost("darwin", "/Users/synthetic");
     const report = await new ServiceControl(env, host, program).install();
     const file = "/Users/synthetic/Library/LaunchAgents/ai.sharednet.serve.plist";
-    expect(calls).toEqual(["launchctl bootout gui/501/ai.sharednet.serve", `launchctl bootstrap gui/501 ${file}`]);
+    // It asks launchd about its own label only, then loads its own file.
+    expect(calls).toEqual(["launchctl print gui/501/ai.sharednet.serve", `launchctl bootstrap gui/501 ${file}`]);
     expect(files.get(file)).toContain("<string>--service</string>");
     expect(files.get(file)).not.toContain("6613bb00");
     expect(dirs).toEqual(["/Users/synthetic/.local/state/sharednet"]);
-    expect(report).toMatchObject({ installed: true, manager: "launchd", label: "ai.sharednet.serve", file, log: "/Users/synthetic/.local/state/sharednet/serve.log" });
-    expect(report.warnings).toBeUndefined();
+    expect(report).toMatchObject({ installed: true, root: "/Users/synthetic/.config/sharednet", manager: "launchd", label: "ai.sharednet.serve", file, log: "/Users/synthetic/.local/state/sharednet/serve.log" });
+    // It says what it did not check, and asks the operator to retire a supervisor of their own.
+    expect(report.warnings).toEqual([expect.stringMatching(/Only SharedNet's own service \(ai\.sharednet\.serve, .*ai\.sharednet\.serve\.plist\).*supervisor you manage yourself.*retire it/)]);
   });
 
-  it("waits out a bootout launchd has not finished before it bootstraps again", async () => {
+  it("refuses when SharedNet's own service for this root is already there, by its exact file or its exact label, and writes nothing", async () => {
     const bin = await binWith("node");
-    let refusals = 2;
-    const { host, calls } = fakeHost("darwin", "/Users/synthetic");
-    const run = host.run;
-    host.run = async (command, args) => {
-      if (args[0] === "bootstrap" && refusals-- > 0) {
-        calls.push([command, ...args].join(" "));
-        return { exitCode: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error" };
-      }
-      return run(command, args);
-    };
-    await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, host, program).install();
-    expect(calls.filter((call) => call.includes("bootstrap"))).toHaveLength(3);
+    const file = "/Users/synthetic/Library/LaunchAgents/ai.sharednet.serve.plist";
+    // Its file is there.
+    const present = fakeHost("darwin", "/Users/synthetic");
+    present.files.set(file, "<plist/>");
+    await expect(new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, present.host, program).install()).rejects.toMatchObject({
+      code: "service_installed",
+      message: expect.stringContaining(`for storage root /Users/synthetic/.config/sharednet is already installed: ai.sharednet.serve at ${file}`),
+    });
+    expect(present.calls.filter((call) => !call.startsWith("launchctl print "))).toEqual([]);
+    expect(present.files.get(file)).toBe("<plist/>");
+    // Its file is gone, but launchd still holds its label (running): the same refusal, naming the pid.
+    const loaded = fakeHost("darwin", "/Users/synthetic", { "launchctl print gui/501/ai.sharednet.serve": { exitCode: 0, stdout: "\tstate = running\n\tpid = 4321\n" } });
+    await expect(new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, loaded.host, program).install()).rejects.toMatchObject({ code: "service_installed", message: expect.stringContaining("loaded: ai.sharednet.serve") });
+    expect(loaded.files.size).toBe(0);
+    // Another root's service is another label and file: it does not stand in the way.
+    const other = fakeHost("darwin", "/Users/synthetic");
+    other.files.set(file, "<plist/>");
+    const report = await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin, XDG_CONFIG_HOME: "/tmp/elsewhere" }, other.host, program).install();
+    expect(report).toMatchObject({ root: "/tmp/elsewhere/sharednet", label: expect.stringMatching(/^ai\.sharednet\.serve\.[0-9a-f]{8}$/) });
+    // systemd: its unit file, or the manager holding the unit.
+    const unit = fakeHost("linux", "/home/synthetic", { "systemctl --user show sharednet-serve.service": { exitCode: 0, stdout: "LoadState=loaded\nActiveState=inactive\nUnitFileState=enabled\nMainPID=0\n" } });
+    await expect(new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, unit.host, program).install()).rejects.toMatchObject({ code: "service_installed", message: expect.stringContaining("sharednet-serve.service") });
   });
 
   it("says plainly when launchd refuses it, and warns when no proxy was there to keep", async () => {
     const bin = await binWith("node");
     const { host } = fakeHost("darwin", "/Users/synthetic", {
-      "launchctl bootout": { exitCode: 3, stderr: "Boot-out failed: 3: No such process" },
       "launchctl bootstrap": { exitCode: 5, stderr: "Bootstrap failed: 5: Input/output error" },
     });
     await expect(new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, host, program).install()).rejects.toMatchObject({ code: "service_not_loaded" });
 
     const ok = fakeHost("darwin", "/Users/synthetic");
     const report = await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, ok.host, program).install();
-    expect(report.warnings).toEqual([expect.stringContaining("No proxy variable")]);
+    expect(report.warnings).toEqual([expect.stringContaining("supervisor you manage yourself"), expect.stringContaining("No proxy variable")]);
   });
 
   it("reads back whether it is installed, loaded and running, and with which pid", async () => {
     const bin = await binWith("node");
     const env = { HOME: "/Users/synthetic", PATH: bin };
-    const { host, files } = fakeHost("darwin", "/Users/synthetic", {
+    const running = fakeHost("darwin", "/Users/synthetic", {
       "launchctl print": { exitCode: 0, stdout: "gui/501/ai.sharednet.serve = {\n\tactive count = 1\n\tstate = running\n\tpid = 94930\n\tprogram = /usr/local/bin/node\n}\n" },
     });
+    expect(await new ServiceControl(env, running.host, program).state()).toMatchObject({ installed: false, loaded: true, running: true, pid: 94930 });
+    const { host, files } = fakeHost("darwin", "/Users/synthetic");
     const control = new ServiceControl(env, host, program);
-    expect(await control.state()).toMatchObject({ installed: false, loaded: true, running: true, pid: 94930 });
     await control.install();
-    expect(await control.state()).toMatchObject({ installed: true, program: [join(bin, "node"), program.entry, "serve", "--service"] });
+    expect(await control.state()).toMatchObject({ installed: true, loaded: false, program: [join(bin, "node"), program.entry, "serve", "--service"] });
     expect(files.size).toBe(1);
-
-    const gone = fakeHost("darwin", "/Users/synthetic", { "launchctl print": { exitCode: 113, stderr: "Could not find service" } });
-    expect(await new ServiceControl(env, gone.host, program).state()).toMatchObject({ installed: false, loaded: false, running: false });
   });
 
   it("starts an installed service that is not running, and never a second one beside a running one", async () => {
@@ -401,18 +410,19 @@ describe("installing, inspecting and removing it", () => {
   it("on Linux writes a systemd --user unit, enables and restarts it, and notes lingering", async () => {
     const bin = await binWith("node");
     const unitPath = "systemctl --user show --property=UnitPath --value";
-    const { host, files, calls } = fakeHost("linux", "/home/synthetic", {
+    const answers: Record<string, { exitCode: number; stdout?: string }> = {
       [unitPath]: { exitCode: 0, stdout: "/home/synthetic/.config/systemd/user.control /home/synthetic/.config/systemd/user /etc/systemd/user\n" },
       "loginctl show-user synthetic": { exitCode: 0, stdout: "Linger=no\n" },
-      "systemctl --user show sharednet-serve.service": { exitCode: 0, stdout: "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nMainPID=4242\n" },
-    });
+    };
+    const { host, files, calls } = fakeHost("linux", "/home/synthetic", answers);
     // This shell points XDG_CONFIG_HOME elsewhere; the unit still goes where the manager reads units.
     const control = new ServiceControl({ HOME: "/home/synthetic", USER: "synthetic", PATH: bin, XDG_CONFIG_HOME: "/home/synthetic/.config" }, host, program);
     const report = await control.install();
-    // Everything before the load only asks (conflicts read the manager); then the load, then lingering.
-    const changing = calls.findIndex((call) => call === "systemctl --user daemon-reload");
-    expect(calls.slice(0, changing).every((call) => / (show|list-unit-files|list-units|show-environment)( |$)/.test(call))).toBe(true);
-    expect(calls.slice(changing)).toEqual([
+    // It asks the manager where units go and about its own unit only; then the load, then lingering.
+    expect(calls).toEqual([
+      unitPath,
+      unitPath,
+      "systemctl --user show sharednet-serve.service --property=LoadState,ActiveState,UnitFileState,MainPID",
       "systemctl --user daemon-reload",
       "systemctl --user enable sharednet-serve.service",
       "systemctl --user restart sharednet-serve.service",
@@ -422,6 +432,7 @@ describe("installing, inspecting and removing it", () => {
     expect(report.linger).toBe(false);
     expect(report.warnings).toEqual(expect.arrayContaining([expect.stringContaining("Lingering is off for synthetic"), expect.stringContaining("sudo loginctl enable-linger synthetic")]));
     expect(calls.some((call) => call.startsWith("sudo"))).toBe(false);
+    answers["systemctl --user show sharednet-serve.service"] = { exitCode: 0, stdout: "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nMainPID=4242\n" };
     expect(await control.state()).toMatchObject({ kind: "systemd", installed: true, loaded: true, running: true, pid: 4242 });
     calls.length = 0;
     await control.uninstall();
@@ -431,7 +442,7 @@ describe("installing, inspecting and removing it", () => {
     const lingering = fakeHost("linux", "/home/synthetic", { "loginctl show-user": { exitCode: 0, stdout: "Linger=yes\n" } });
     const quiet = await new ServiceControl({ HOME: "/home/synthetic", USER: "synthetic", PATH: bin, HTTPS_PROXY: "http://127.0.0.1:1" }, lingering.host, program).install();
     expect(quiet).toMatchObject({ linger: true });
-    expect(quiet.warnings).toBeUndefined();
+    expect(quiet.warnings).toEqual([expect.stringContaining("supervisor you manage yourself")]);
   });
 
   it("on Linux writes into the manager's own unit directory when it is not ~/.config", async () => {
