@@ -484,7 +484,7 @@ describe("installing, inspecting and removing it", () => {
 });
 
 /**
- * systemd's own parser, where it exists: the unit unit tests above cannot prove loads. On Linux CI
+ * systemd's own parser, where it exists: whether a unit loads is what the tests above cannot prove. On Linux CI
  * (ubuntu, systemd 255) it is required, so a missing systemd-analyze fails rather than skips.
  */
 const analyzer = spawnSync("systemd-analyze", ["--version"], { encoding: "utf8" });
