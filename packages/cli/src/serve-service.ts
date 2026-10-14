@@ -437,8 +437,10 @@ export interface ServiceState {
   label: string;
   file: string;
   installed: boolean;
-  /** launchd has it bootstrapped / systemd has it enabled or active. */
+  /** The manager holds the exact label: launchd has it bootstrapped; systemd's LoadState is anything but not-found. */
   loaded: boolean;
+  /** The storage root it serves (the same one install would write, lock and name). */
+  root?: string;
   running: boolean;
   pid?: number;
   /** What the installed definition starts. */
@@ -492,11 +494,31 @@ export class ServiceControl {
   /** Where the definition is, or null where there is no service manager to ask. */
   private async where(): Promise<ServiceLocation | null> {
     if (this.host.platform !== "darwin" && this.host.platform !== "linux") return null;
+    const { env } = this.captured();
     this.root();
-    if (this.host.platform !== "linux") return serviceLocation(this.host.platform, this.env, this.host.home);
+    if (this.host.platform !== "linux") return serviceLocation(this.host.platform, env, this.host.home);
     const shown = await this.host.run("systemctl", ["--user", "show", "--property=UnitPath", "--value"]);
     const dir = shown.exitCode === 0 ? userUnitDir(shown.stdout, this.host.home) : null;
-    return serviceLocation("linux", this.env, this.host.home, dir ?? undefined);
+    return serviceLocation("linux", env, this.host.home, dir ?? undefined);
+  }
+
+  /**
+   * The environment the service will run with, captured once from this one. Its location, name,
+   * lock root and log all come from it, so a root-defining variable it cannot carry (one with a line
+   * break, say) is refused instead of quietly serving another root than the one reported.
+   */
+  private captured(): CapturedEnvironment {
+    const captured = captureServiceEnv(this.env, { home: this.host.home, username: this.host.username });
+    for (const name of ["HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"] as const) {
+      const given = this.env[name];
+      if (given === undefined || given === "" || captured.env[name] === given) continue;
+      const why = captured.skipped.find((skipped) => skipped.name === name)?.why ?? "it cannot be written into a service definition";
+      throw localError(
+        "service_not_installed",
+        `${name} cannot be carried into the service: ${why}. The service would then serve another storage root than this shell's. Install from a shell where ${name} is a plain absolute path.`,
+      );
+    }
+    return captured;
   }
 
   async location(): Promise<ServiceLocation> {
@@ -505,7 +527,8 @@ export class ServiceControl {
 
   /** This install's storage root, resolved; a relative HOME or XDG_CONFIG_HOME is refused. */
   private root(): string {
-    const resolved = rootFrom({ HOME: this.env.HOME, XDG_CONFIG_HOME: this.env.XDG_CONFIG_HOME }, this.host.home);
+    const { env } = this.captured();
+    const resolved = rootFrom({ HOME: env.HOME, XDG_CONFIG_HOME: env.XDG_CONFIG_HOME }, this.host.home);
     if ("unresolved" in resolved) throw localError("service_not_installed", `This shell's storage root cannot be resolved: ${resolved.unresolved}. Install from a shell with an absolute HOME and XDG_CONFIG_HOME.`);
     return resolved.root;
   }
@@ -516,7 +539,7 @@ export class ServiceControl {
     if (where === null) return null;
     const content = await this.host.readFile(where.file);
     const program = content === null ? undefined : programIn(where.kind, content);
-    const base = { ...where, installed: content !== null, ...(program ? { program } : {}) };
+    const base = { ...where, root: this.root(), installed: content !== null, ...(program ? { program } : {}) };
     if (where.kind === "launchd") {
       const printed = await this.host.run("launchctl", ["print", `gui/${this.host.uid}/${where.label}`]);
       if (printed.exitCode !== 0) return { ...base, loaded: false, running: false };
@@ -527,9 +550,11 @@ export class ServiceControl {
     const property = (name: string) => new RegExp(`^${name}=(.*)$`, "m").exec(shown.stdout)?.[1]?.trim() ?? "";
     const running = property("ActiveState") === "active";
     const pid = Number(property("MainPID"));
+    // Only not-found means systemd does not hold the exact unit; loaded (static, disabled, linked,
+    // enabled-runtime…), masked, bad-setting or an unreported state all hold it.
     return {
       ...base,
-      loaded: property("LoadState") === "loaded" && (property("UnitFileState") === "enabled" || running),
+      loaded: property("LoadState") !== "not-found",
       running,
       ...(running && Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
     };
@@ -553,7 +578,7 @@ export class ServiceControl {
         `SharedNet's service for storage root ${root} is already ${existing.installed ? "installed" : "loaded"}: ${existing.label} at ${existing.file}${existing.running ? ` (running${existing.pid ? `, pid ${existing.pid}` : ""})` : ""}. To install it again: sharednet serve --uninstall, then sharednet serve --install.`,
       );
     }
-    const captured = captureServiceEnv(this.env, { home: this.host.home, username: this.host.username });
+    const captured = this.captured();
     for (const required of ["HOME", "PATH"] as const) {
       if (!captured.env[required]) throw localError("service_not_installed", `${required} is not set here, and the service cannot run without it.`);
     }
@@ -622,15 +647,37 @@ export class ServiceControl {
   /** Stops the service and removes its definition. A serve started by hand is not touched. */
   async uninstall(): Promise<Record<string, unknown>> {
     const where = await this.location();
-    let unloaded = false;
-    if (where.kind === "launchd") {
-      unloaded = (await this.host.run("launchctl", ["bootout", `gui/${this.host.uid}/${where.label}`])).exitCode === 0;
-    } else {
-      unloaded = (await this.host.run("systemctl", ["--user", "disable", "--now", where.label])).exitCode === 0;
+    const root = this.root();
+    const stop = where.kind === "launchd" ? `launchctl bootout gui/${this.host.uid}/${where.label}` : `systemctl --user disable --now ${where.label}`;
+    const done = where.kind === "launchd"
+      ? await this.host.run("launchctl", ["bootout", `gui/${this.host.uid}/${where.label}`])
+      : await this.host.run("systemctl", ["--user", "disable", "--now", where.label]);
+    const stopped = done.exitCode === 0;
+    if (!stopped) {
+      // A stop that failed because nothing was running is no failure. One that left the job loaded
+      // (launchd) or active (systemd) is: the definition stays, so the uninstall can be retried.
+      let still: boolean;
+      if (where.kind === "launchd") {
+        still = (await this.host.run("launchctl", ["print", `gui/${this.host.uid}/${where.label}`])).exitCode === 0;
+      } else {
+        const shown = await this.host.run("systemctl", ["--user", "show", where.label, "--property=LoadState,ActiveState,UnitFileState,MainPID"]);
+        const active = /^ActiveState=(.*)$/m.exec(shown.stdout)?.[1]?.trim() ?? "";
+        // A state that cannot be read is not a stopped one.
+        still = shown.exitCode !== 0 || !["inactive", "failed", "dead"].includes(active);
+      }
+      if (still) {
+        throw localError(
+          "service_not_uninstalled",
+          `${stop} failed (exit ${done.exitCode}: ${lastLine(done.stderr || done.stdout)}), and the ${where.kind === "launchd" ? "job is still loaded" : "unit is still active"} for storage root ${root}. Its definition was left at ${where.file} so this can be retried: run sharednet serve --uninstall again, or run ${stop} yourself and then remove ${where.file}.`,
+        );
+      }
     }
     const removed = await this.host.remove(where.file);
     if (where.kind === "systemd") await this.host.run("systemctl", ["--user", "daemon-reload"]);
-    return { uninstalled: removed || unloaded, manager: where.kind, label: where.label, file: where.file, stopped: unloaded, removed };
+    if ((await this.host.readFile(where.file)) !== null) {
+      throw localError("service_not_uninstalled", `The service for storage root ${root} was ${stopped ? "stopped" : "not running"}, but its definition at ${where.file} could not be removed. Remove it yourself.`);
+    }
+    return { uninstalled: true, root, manager: where.kind, label: where.label, file: where.file, stopped, removed };
   }
 
   /**

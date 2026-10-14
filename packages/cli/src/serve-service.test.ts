@@ -293,7 +293,12 @@ function fakeHost(platform: NodeJS.Platform, home: string, answers: Record<strin
       const line = [command, ...args].join(" ");
       calls.push(line);
       // launchd has no job by that label unless a test says so.
-      const fallback = command === "launchctl" && args[0] === "print" ? { exitCode: 113, stderr: "Could not find service" } : { exitCode: 0 };
+      const fallback =
+        command === "launchctl" && args[0] === "print"
+          ? { exitCode: 113, stderr: "Could not find service" }
+          : command === "systemctl" && args[1] === "show" && args[3]?.startsWith("--property=LoadState")
+            ? { exitCode: 0, stdout: "LoadState=not-found\nActiveState=inactive\nUnitFileState=\nMainPID=0\n" }
+            : { exitCode: 0 };
       const answer = Object.entries(answers).find(([prefix]) => line.startsWith(prefix))?.[1] ?? fallback;
       return { exitCode: answer.exitCode, stdout: answer.stdout ?? "", stderr: answer.stderr ?? "" };
     },
@@ -454,6 +459,70 @@ describe("installing, inspecting and removing it", () => {
     const report = await new ServiceControl({ HOME: "/home/synthetic", USER: "synthetic", PATH: bin }, host, program).install();
     expect(report.file).toBe("/home/synthetic/cfg/systemd/user/sharednet-serve.service");
     expect(files.has("/home/synthetic/cfg/systemd/user/sharednet-serve.service")).toBe(true);
+  });
+
+  it("counts every systemd LoadState but not-found as the manager holding the exact unit (review 5, point 3)", async () => {
+    const bin = await binWith("node");
+    for (const [load, file] of [["loaded", "static"], ["loaded", "disabled"], ["loaded", "enabled-runtime"], ["loaded", "linked"], ["masked", "masked"], ["bad-setting", ""]]) {
+      const held = fakeHost("linux", "/home/synthetic", { "systemctl --user show sharednet-serve.service": { exitCode: 0, stdout: `LoadState=${load}\nActiveState=inactive\nUnitFileState=${file}\nMainPID=0\n` } });
+      await expect(new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, held.host, program).install(), `${load}/${file}`).rejects.toMatchObject({ code: "service_installed" });
+      expect(held.files.size).toBe(0);
+      expect(held.calls.some((call) => / (daemon-reload|enable|restart) /.test(`${call} `))).toBe(false);
+    }
+    const absent = fakeHost("linux", "/home/synthetic", { "systemctl --user show sharednet-serve.service": { exitCode: 0, stdout: "LoadState=not-found\nActiveState=inactive\nUnitFileState=\nMainPID=0\n" } });
+    expect(await new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, absent.host, program).install()).toMatchObject({ installed: true });
+  });
+
+  it("refuses a root-defining variable it cannot write into the service, so the reported root is the one served (review 5, point 4)", async () => {
+    const bin = await binWith("node");
+    for (const env of [
+      { HOME: "/Users/synthetic", PATH: bin, XDG_CONFIG_HOME: "/tmp/odd\nroot" },
+      { HOME: "/Users/synthetic", PATH: bin, XDG_STATE_HOME: "/tmp/odd\nstate" },
+      { HOME: "/Users/odd\nhome", PATH: bin },
+    ]) {
+      const { host, files, calls } = fakeHost("darwin", "/Users/synthetic");
+      const control = new ServiceControl(env, host, program);
+      await expect(control.install()).rejects.toMatchObject({ code: "service_not_installed", message: expect.stringContaining("line break") });
+      await expect(control.state()).rejects.toMatchObject({ code: "service_not_installed" });
+      expect(files.size).toBe(0);
+      expect(calls.filter((call) => !call.startsWith("launchctl print"))).toEqual([]);
+    }
+    // What it writes, reports and names is one root: the label hashes the root the unit's own variables give.
+    const { host, files } = fakeHost("darwin", "/Users/synthetic");
+    const report = await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin, XDG_CONFIG_HOME: "/tmp/elsewhere" }, host, program).install();
+    expect(report.root).toBe("/tmp/elsewhere/sharednet");
+    expect(files.get(String(report.file))).toContain("<key>XDG_CONFIG_HOME</key>\n\t\t<string>/tmp/elsewhere</string>");
+  });
+
+  it("does not claim an uninstall while the manager still runs the job, and keeps the file to retry with (review 5, point 5)", async () => {
+    const bin = await binWith("node");
+    const file = "/Users/synthetic/Library/LaunchAgents/ai.sharednet.serve.plist";
+    const stuck = fakeHost("darwin", "/Users/synthetic", {
+      "launchctl bootout": { exitCode: 5, stderr: "Boot-out failed: 5: Input/output error" },
+      "launchctl print gui/501/ai.sharednet.serve": { exitCode: 0, stdout: "\tstate = running\n\tpid = 4321\n" },
+    });
+    stuck.files.set(file, "<plist/>");
+    await expect(new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, stuck.host, program).uninstall()).rejects.toMatchObject({
+      code: "service_not_uninstalled",
+      message: expect.stringMatching(/^launchctl bootout gui\/501\/ai\.sharednet\.serve failed .*job is still loaded.*left at .*ai\.sharednet\.serve\.plist.*sharednet serve --uninstall again/s),
+    });
+    expect(stuck.files.get(file)).toBe("<plist/>");
+    // A bootout that fails because nothing was loaded is no failure: the file goes, and it says so.
+    const idle = fakeHost("darwin", "/Users/synthetic", { "launchctl bootout": { exitCode: 3, stderr: "Boot-out failed: 3: No such process" } });
+    idle.files.set(file, "<plist/>");
+    expect(await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin }, idle.host, program).uninstall()).toMatchObject({ uninstalled: true, stopped: false, removed: true });
+    // systemd: disable --now failed and the unit is still active.
+    const units = "/home/synthetic/.config/systemd/user/sharednet-serve.service";
+    const active = fakeHost("linux", "/home/synthetic", {
+      "systemctl --user disable": { exitCode: 1, stderr: "Failed to disable unit: Access denied" },
+      "systemctl --user show sharednet-serve.service": { exitCode: 0, stdout: "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nMainPID=99\n" },
+    });
+    active.files.set(units, "[Service]\n");
+    await expect(new ServiceControl({ HOME: "/home/synthetic", PATH: bin }, active.host, program).uninstall()).rejects.toMatchObject({
+      code: "service_not_uninstalled",
+      message: expect.stringContaining("systemctl --user disable --now sharednet-serve.service"),
+    });
+    expect(active.files.get(units)).toBe("[Service]\n");
   });
 
   it("refuses Windows, and other systems, clearly", async () => {

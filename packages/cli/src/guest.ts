@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join as joinPath, resolve as resolvePathFrom } from "node:path";
 
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
@@ -2777,14 +2777,26 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       throw localError("service_not_installed", "This session runs in a sandbox; install the service from a terminal outside it.");
     }
     if (!install) return control.uninstall();
-    // The install-time contract (Room #134–#144): SharedNet's own definition for this root (checked
-    // in control.install(), exact label and file), and this root's serve lock, whoever holds it.
+    // The install-time contract (Room #134–#144), in this order. First SharedNet's own service for
+    // this root, exact label and file: an installed one holds the lock itself, and its manager would
+    // undo a --stop, so the way on is --uninstall. Then this root's serve lock, whoever holds it.
     // Supervisors SharedNet did not write are not interpreted; the report tells the operator so.
+    const own = await control.state();
+    if (own !== null && (own.installed || own.loaded)) {
+      throw localError(
+        "service_installed",
+        `SharedNet's service for storage root ${own.root ?? paths.configDir} is already ${own.installed ? "installed" : "loaded"}: ${own.label} at ${own.file}${own.running ? ` (running${own.pid ? `, pid ${own.pid}` : ""})` : ""}. To install it again: sharednet serve --uninstall, then sharednet serve --install.`,
+      );
+    }
+    // The lock checked is the one the service will use: both come from the same storage root.
+    if (own?.root !== undefined && own.root !== resolvePathFrom(paths.configDir)) {
+      throw localError("service_not_installed", `This shell's storage root ${paths.configDir} is not the root the service would use (${own.root}); install from a shell with plain absolute HOME and XDG_CONFIG_HOME.`);
+    }
     const running = (await readServeStatus(paths, dependencies.processProbe)) as { running?: boolean; pid?: number; holder_check?: string };
     if (running.running && running.pid) {
       throw localError(
         "serve_running",
-        `A connector already holds the serve lock for storage root ${paths.configDir} (pid ${running.pid}, checked by ${running.holder_check === "argv" ? "its command line" : "its start identity"}), whoever started it. Stop it first with \`sharednet serve --stop\` (or retire the supervisor that runs it), then install again.`,
+        `A connector already holds the serve lock for storage root ${paths.configDir} (pid ${running.pid}, ${running.holder_check === "start_identity" ? "verified by its start identity" : running.holder_check === "argv" ? "presumed from its command line" : "alive, identity unreadable"}), whoever started it. Stop it first with \`sharednet serve --stop\` (or retire the supervisor that runs it), then install again.`,
       );
     }
     return reportInstall(await control.install(), dependencies);
@@ -2840,9 +2852,11 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   // This process's start identity, from the source a later check of the lock reads (process-identity.ts).
   const probe = dependencies.processProbe ?? systemProcessProbe;
   const identity = probe.identity(process.pid);
+  const lockId = randomUUID();
   const statusOf = (all: StoredRoomCredential[]): ServeStatus => ({
     pid: process.pid,
     ...(identity !== null ? { start_identity: identity } : {}),
+    lock_id: lockId,
     started_at: started,
     rooms: [...new Set(all.map((seat) => seat.room_id))],
     drives: !command,
@@ -2865,6 +2879,11 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       holder = await claimServe(paths, statusOf(seats), probe);
     }
     if (holder !== null) return { served: 0 };
+    // Stopped while it waited, though the slot came free on the last look: give it straight back.
+    if (dependencies.signal?.aborted) {
+      await releaseServe(paths, lockId);
+      return { served: 0 };
+    }
   }
   if (holder !== null) {
     throw localError(
@@ -2893,6 +2912,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   // nothing is said. Ctrl-C takes the doorbells down before it goes.
   const stopping = new AbortController();
   const stop = () => stopping.abort();
+  if (dependencies.signal?.aborted) stop();
   dependencies.signal?.addEventListener("abort", stop, { once: true });
   /** A startup retry must not keep an installed service alive for the full backoff after shutdown. */
   const retryDelay = async (ms: number): Promise<void> => {
@@ -2928,7 +2948,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       process.once("SIGTERM", stop);
     }
   } catch (error) {
-    await releaseServe(paths);
+    await releaseServe(paths, lockId);
     throw error;
   }
 
@@ -3325,7 +3345,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     );
     await doorbell.close();
   }
-  await releaseServe(paths);
+  await releaseServe(paths, lockId);
   if (failure !== null) throw failure;
   return { served: begun.size };
 }
@@ -3425,6 +3445,8 @@ type ServeStatus = {
   pid: number;
   /** The holder's start identity (process-identity.ts); absent in a status file written before it existed. */
   start_identity?: string;
+  /** This connector's own lock, told apart from another connector even in the same process. */
+  lock_id?: string;
   started_at: string;
   rooms: string[];
   /** True for a connector that resumes sessions; one running a --run command, or an older one, does not. */
@@ -3440,63 +3462,139 @@ function serveStatusPath(paths: ReturnType<typeof getStoragePaths>): string {
 
 async function writeServeStatus(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus): Promise<void> {
   await mkdir(paths.configDir, { recursive: true, mode: 0o700 });
+  // Only the connector holding the lock writes its status, so one name per process is enough.
   const temporary = `${serveStatusPath(paths)}.${process.pid}.tmp`;
   await writeFile(temporary, `${JSON.stringify(status)}\n`, { mode: 0o600 });
   await rename(temporary, serveStatusPath(paths));
 }
 
+/** Creates `path` with `content` only if nothing is there, complete or not at all (write aside, then link). */
+async function createExclusive(path: string, content: string): Promise<boolean> {
+  const temporary = `${path}.${randomUUID()}.new`;
+  await writeFile(temporary, content, { mode: 0o600, flag: "wx" });
+  try {
+    await link(temporary, path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  } finally {
+    await unlink(temporary).catch(() => undefined);
+  }
+}
+
 /**
- * Takes the storage root's one connector slot: null when it is now this process's, or the pid of the
- * live connector that holds it (0 while one is being written). A slot whose holder is gone, or whose
- * pid now belongs to another process, is taken over.
+ * Takes the storage root's one connector slot: null when it is now this connector's, or the pid of
+ * the connector that holds it (0 while one is starting or reclaiming). Another connector in this
+ * same process is another holder: it is told apart by its lock id, not by the pid.
+ *
+ * A stale lock (holder gone, or its pid now another process) is reclaimed without ever deleting a
+ * lock by its name, which raced: two starters read the same stale file, one replaced it, and the
+ * other's already-decided unlink deleted the fresh lock. Instead, a reclaim of a given stale lock
+ * first creates a one-time token named for that lock's id (exclusive, so one starter wins it), checks
+ * the lock is still exactly the stale one it read, and then replaces it in one rename. A token whose
+ * creator died is passed over for the next one, never deleted, so no two starters can hold a token
+ * for the same stale lock while both are alive.
  */
 async function claimServe(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus, probe: ProcessProbe = systemProcessProbe): Promise<number | null> {
   await mkdir(paths.configDir, { recursive: true, mode: 0o700 });
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  const path = serveStatusPath(paths);
+  const content = `${JSON.stringify(status)}\n`;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    if (await createExclusive(path, content)) return null;
+    let raw: string;
     try {
-      await writeFile(serveStatusPath(paths), `${JSON.stringify(status)}\n`, { mode: 0o600, flag: "wx" });
-      return null;
+      raw = await readFile(path, "utf8");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
     }
-    let holder: { running?: boolean; pid?: number };
+    let current: ServeStatus;
     try {
-      holder = (await readServeStatus(paths, probe)) as { running?: boolean; pid?: number };
+      current = JSON.parse(raw) as ServeStatus;
     } catch {
-      // Being written this moment by a connector that is starting.
       return 0;
     }
-    // A connector run inside this very process (a test, an embedding) is this process's own.
-    if (holder.running && holder.pid && holder.pid !== process.pid) return holder.pid;
-    await unlink(serveStatusPath(paths)).catch(() => undefined);
+    if (current.lock_id !== undefined && current.lock_id === status.lock_id) return null;
+    if (holderOf(current, probe).live) return current.pid;
+    const reclaimed = await reclaimServe(path, raw, current, content, probe);
+    if (reclaimed === "won") return null;
+    if (reclaimed === "busy") return 0;
   }
   return 0;
 }
 
-/** Gives the slot back, if it is still this process's. */
-async function releaseServe(paths: ReturnType<typeof getStoragePaths>): Promise<void> {
+async function reclaimServe(path: string, raw: string, stale: ServeStatus, content: string, probe: ProcessProbe): Promise<"won" | "busy" | "retry"> {
+  const key = stale.lock_id ?? createHash("sha256").update(raw).digest("hex").slice(0, 32);
+  const me = probe.identity(process.pid);
+  const claim = `${JSON.stringify({ pid: process.pid, ...(me !== null ? { start_identity: me } : {}) })}\n`;
+  let token: string | null = null;
+  for (let index = 0; index < 16 && token === null; index += 1) {
+    const candidate = `${path}.reclaim.${key}.${index}`;
+    if (await createExclusive(candidate, claim)) {
+      token = candidate;
+      break;
+    }
+    const other = await readFile(candidate, "utf8").catch(() => null);
+    let creator: ServeStatus | null = null;
+    try {
+      creator = other === null ? null : (JSON.parse(other) as ServeStatus);
+    } catch {
+      creator = null;
+    }
+    // A reclaim by a starter that may still be alive is that starter's to finish.
+    if (creator === null || holderOf(creator, probe).live) return "busy";
+  }
+  if (token === null) return "busy";
+  try {
+    const now = await readFile(path, "utf8").catch((error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? null : Promise.reject(error)));
+    if (now !== raw) return now === null ? "retry" : "busy";
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    await writeFile(temporary, content, { mode: 0o600 });
+    await rename(temporary, path);
+    return "won";
+  } finally {
+    // Tokens for a lock that is no longer the current one cannot win anything: a late starter that
+    // makes one again finds the lock changed and stops.
+    for (let index = 0; index < 16; index += 1) await unlink(`${path}.reclaim.${key}.${index}`).catch(() => undefined);
+  }
+}
+
+/** Gives the slot back, if it is still this connector's. */
+async function releaseServe(paths: ReturnType<typeof getStoragePaths>, lockId: string): Promise<void> {
   const raw = await readFile(serveStatusPath(paths), "utf8").catch(() => null);
-  const status = raw === null ? null : (JSON.parse(raw) as { pid?: number });
-  if (status?.pid === process.pid) await unlink(serveStatusPath(paths)).catch(() => undefined);
+  let status: { lock_id?: string } | null = null;
+  try {
+    status = raw === null ? null : (JSON.parse(raw) as { lock_id?: string });
+  } catch {
+    status = null;
+  }
+  if (status?.lock_id === lockId) await unlink(serveStatusPath(paths)).catch(() => undefined);
 }
 
 /**
- * Whether the pid in a status file is still the listener that wrote it: alive (EPERM counts: it is
- * someone else's process), and its start identity is the one recorded, compared as exact strings.
- * A status file written before identities were recorded counts only if the pid's full argv names
- * sharednet and serve. `holder` says which check decided.
+ * Whether the pid in a status file is still the listener that wrote it:
+ * - `verified`: alive (EPERM counts: it is someone else's process), and its start identity is
+ *   exactly the one recorded. Only a verified holder may be signalled.
+ * - `unverified`: alive, but its identity cannot be read now. It still holds the lock.
+ * - `argv`: a status file from before identities, whose live pid's argv reads as a sharednet serve.
+ *   It holds the lock (a start is refused), but that is a presumption and never a reason to signal.
+ * - otherwise stale: gone, or its pid now another process.
  */
-function holderOf(status: ServeStatus, probe: ProcessProbe): { live: boolean; holder: "start_identity" | "argv"; why?: string } {
-  if (!probe.alive(status.pid)) return { live: false, holder: status.start_identity ? "start_identity" : "argv", why: "the process that wrote this status is gone" };
-  if (status.start_identity !== undefined) {
+function holderOf(status: ServeStatus, probe: ProcessProbe): { live: boolean; verified: boolean; holder: "start_identity" | "unverified" | "argv"; why?: string } {
+  const recorded = status.start_identity !== undefined;
+  if (!probe.alive(status.pid)) return { live: false, verified: false, holder: recorded ? "start_identity" : "argv", why: "the process that wrote this status is gone" };
+  if (recorded) {
     const now = probe.identity(status.pid);
-    return now === status.start_identity
-      ? { live: true, holder: "start_identity" }
-      : { live: false, holder: "start_identity", why: `pid ${status.pid} is now another process (its start identity ${now === null ? "could not be read" : "differs"}); the listener that wrote this status is gone` };
+    if (now === status.start_identity) return { live: true, verified: true, holder: "start_identity" };
+    if (now === null) return { live: true, verified: false, holder: "unverified", why: `pid ${status.pid} is alive but its start identity cannot be read now, so it still holds the lock and is not signalled` };
+    return { live: false, verified: false, holder: "start_identity", why: `pid ${status.pid} is now another process (its start identity differs); the listener that wrote this status is gone` };
   }
-  return looksLikeServe(probe.argv(status.pid))
-    ? { live: true, holder: "argv" }
-    : { live: false, holder: "argv", why: `pid ${status.pid} is not a sharednet serve (this status predates start identities, and its command does not name sharednet serve)` };
+  const argv = probe.argv(status.pid);
+  if (argv === null) return { live: true, verified: false, holder: "unverified", why: `pid ${status.pid} is alive and this status predates start identities; its command cannot be read, so it still holds the lock and is not signalled` };
+  return looksLikeServe(argv)
+    ? { live: true, verified: false, holder: "argv", why: `this status predates start identities; pid ${status.pid} reads as a sharednet serve, which holds the lock, but SharedNet cannot verify it is the listener, so it is not signalled` }
+    : { live: false, verified: false, holder: "argv", why: `pid ${status.pid} is not a sharednet serve (this status predates start identities, and its command does not name sharednet serve)` };
 }
 
 /** `running` is checked, not claimed: a status file outlives the process that wrote it. */
@@ -3509,15 +3607,22 @@ async function readServeStatus(paths: ReturnType<typeof getStoragePaths>, probe:
   }
   const status = JSON.parse(raw) as ServeStatus;
   const checked = holderOf(status, probe);
-  return { running: checked.live, root: paths.configDir, ...status, holder_check: checked.holder, ...(checked.why ? { reason: checked.why } : {}) };
+  return { running: checked.live, verified: checked.verified, root: paths.configDir, ...status, holder_check: checked.holder, ...(checked.why ? { reason: checked.why } : {}) };
 }
 
-/** Stops the listener holding this root's slot, and only after checking it is that listener. */
+/** Stops the listener holding this root's slot, and only a holder verified by its start identity. */
 async function stopServe(paths: ReturnType<typeof getStoragePaths>, dependencies: GuestDependencies, control?: WakeServiceControl): Promise<unknown> {
-  const status = (await readServeStatus(paths, dependencies.processProbe)) as { running?: boolean; pid?: number; reason?: string };
-  if (!status.running || !status.pid) {
+  const status = (await readServeStatus(paths, dependencies.processProbe)) as { running?: boolean; verified?: boolean; pid?: number; reason?: string };
+  if (!status.running || !status.verified || !status.pid) {
     // Never a signal to a pid that is not verifiably the listener: after a reboot it can be anyone's.
-    return { stopped: false, root: paths.configDir, ...(status.pid ? { pid: status.pid } : {}), reason: status.reason ?? `no connector is running for storage root ${paths.configDir}` };
+    return {
+      stopped: false,
+      root: paths.configDir,
+      ...(status.pid ? { pid: status.pid } : {}),
+      reason: status.running && status.pid
+        ? `${status.reason}. Nothing was signalled; if pid ${status.pid} is the listener, stop it yourself.`
+        : (status.reason ?? `no connector is running for storage root ${paths.configDir}`),
+    };
   }
   process.kill(status.pid, "SIGTERM");
   dependencies.stderr?.(`serve: asked pid ${status.pid} to stop\n`);

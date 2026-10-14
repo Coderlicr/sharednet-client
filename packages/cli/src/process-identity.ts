@@ -8,9 +8,11 @@ import { readFileSync } from "node:fs";
  * start identity, read from the OS source the later check reads too, and the two are compared as
  * exact strings (Room #137–#142):
  *
- * - Linux: field 22 of /proc/<pid>/stat (start time in clock ticks since boot), taken after the
- *   last `)` because the command name in field 2 may itself contain spaces and `)`.
- * - macOS and other systems: `ps -o lstart= -p <pid>`.
+ * - Linux: the kernel's boot id (/proc/sys/kernel/random/boot_id) and field 22 of
+ *   /proc/<pid>/stat (start time in clock ticks since that boot), taken after the last `)` because
+ *   the command name in field 2 may itself contain spaces and `)`. Ticks alone repeat across reboots.
+ * - macOS and other systems: `ps -o lstart= -p <pid>`, run with TZ=UTC and LC_ALL=C, since lstart
+ *   is printed in the caller's timezone and locale.
  *
  * A status file written before this existed has no identity; its pid counts only if that process's
  * full argv names both sharednet and serve.
@@ -42,9 +44,12 @@ export function statStartTime(line: string): string | null {
   return line.slice(close + 2).split(" ")[19] ?? null;
 }
 
+/** ps with a fixed environment, so what it prints does not depend on who asks. */
+const PS_ENV = { PATH: "/bin:/usr/bin", TZ: "UTC", LC_ALL: "C", LANG: "C" };
+
 function ps(field: string, pid: number): string | null {
   try {
-    const out = execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const out = execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"], env: PS_ENV }).trim();
     return out === "" ? null : out;
   } catch {
     return null;
@@ -56,7 +61,9 @@ export const systemProcessProbe: ProcessProbe = {
   identity: (pid) => {
     if (process.platform === "linux") {
       try {
-        return statStartTime(readFileSync(`/proc/${pid}/stat`, "utf8"));
+        const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+        const ticks = statStartTime(readFileSync(`/proc/${pid}/stat`, "utf8"));
+        return boot !== "" && ticks !== null ? `${boot}:${ticks}` : null;
       } catch {
         return null;
       }
@@ -76,7 +83,10 @@ export const systemProcessProbe: ProcessProbe = {
   },
 };
 
-/** An old status file's holder counts only if it is visibly a sharednet serve. */
+/**
+ * An old status file's holder is presumed alive (it blocks a start) when it is visibly a sharednet
+ * serve. A presumption is not proof: it never authorises a signal.
+ */
 export function looksLikeServe(argv: string | null): boolean {
   return argv !== null && /sharednet/i.test(argv) && /(^|\s)serve(\s|$)/.test(argv);
 }

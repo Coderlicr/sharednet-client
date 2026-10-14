@@ -17,7 +17,7 @@ Without this, `serve` is a detached child that `join` leaves behind (`startWakeS
 | Command | Does |
 | --- | --- |
 | `sharednet serve --install` | Writes SharedNet's own service definition for this storage root and has the manager load and start it. On stderr it prints the storage root, the label and file it wrote, the program, and every variable it wrote with its value. With `--json`, stdout carries the same report. Before writing anything, it refuses in two cases: SharedNet's own service for this root is already installed or loaded (`service_installed`; uninstall first to reinstall), or this root's serve lock is held by a live listener, whoever started it (`serve_running`). |
-| `sharednet serve --uninstall` | Stops the service and removes its definition. It does not touch a `serve` you started by hand. |
+| `sharednet serve --uninstall` | Stops the service and removes its definition. It does not touch a `serve` you started by hand. If the stop fails while launchd still has the job loaded, or systemd still has the unit active, it reports `service_not_uninstalled`, keeps the definition so the uninstall can be retried, and names the manual command. |
 | `sharednet serve --status` | Shows the connector, as before. When a service exists, it adds `service: { installed, loaded, running, pid, label, file, program }`. |
 | `sharednet serve --stop` | Stops the listener that holds this root's serve lock, only after checking that the pid is still that listener (see "The serve lock"). When it was the installed service, the manager starts it again within 30 s. That is how the service restarts onto the newest CLI. To stop it for good, use `--uninstall`. |
 | `sharednet serve --service` | What the service runs. It is an ordinary `serve` except that it does not end when there is nothing to do yet (see below). |
@@ -94,7 +94,8 @@ Everything written is printed with its value. Since nothing secret can pass thes
 
 There is one connector slot per storage root, its `serve.json`. The install-time contract was agreed in Cloud Dev (Room #134–#144), and it is deliberately narrow:
 
-- **SharedNet's own service, exactly.** Install checks only its own label and file for the resolved storage root: whether the file exists, and whether launchd or systemd holds that exact label. If either is true, install refuses (`service_installed`) and names the root, the label, the file and any running pid. Its own label is never excluded from that check.
+- **SharedNet's own service, exactly, first.** Install checks only its own label and file for the resolved storage root: whether the file exists, and whether the manager holds that exact label. launchd holds it when it is bootstrapped. systemd holds it for any `LoadState` other than `not-found`, including static, disabled, linked, masked and bad-setting. If either check finds it, install refuses (`service_installed`) and names the root, the label, the file and any running pid. Its own label is never excluded. This check comes before the lock: an installed service holds the lock itself, and its manager would undo a `--stop`, so the way on is `--uninstall`.
+- **One captured environment.** The service's location, name, lock root and log all come from the environment it is written with. A root-defining variable (`HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`) that cannot be written into it, such as one containing a line break, refuses the install. Otherwise the service would serve a different root from the one reported.
 - **This root's serve lock, whoever holds it.** If a live listener holds the lock (checked as described under "The serve lock" below), install refuses (`serve_running`) and names the root and the pid. No flag bypasses it. If the holder is gone, or its pid now belongs to another process, the lock is stale and does not block.
 - **Nothing else.** SharedNet does not interpret launchd or systemd definitions it did not write: other labels, timers, drop-ins, overrides, other search directories. Install says so in its report, and asks the operator to retire any supervisor they run themselves.
 
@@ -102,14 +103,23 @@ The guarantee itself is at runtime. A second `serve` for a root whose lock is he
 
 ### The serve lock
 
-The lock is `serve.json`, created with an exclusive-create flag, so two starters cannot both win. Its pid is trusted only after checking that the pid is still the listener that wrote it (`process-identity.ts`, Room #137–#142):
+The lock is `serve.json`. A connector creates it whole or not at all: it writes the file aside and links it into place, and the link fails if a lock is already there. Each connector's lock carries a random `lock_id`, so two connectors in one process are told apart. The lock's pid is trusted only after checking that it is still the listener that wrote it (`process-identity.ts`, Room #137–#142, review 5):
 
-- **Recording.** At lock time, the listener records its own start identity, read from the same OS source a later check reads:
-  - Linux: field 22 of `/proc/self/stat`, taken after the last `)` because the command name in field 2 may contain spaces and `)`;
-  - macOS: `ps -o lstart= -p <pid>`.
-- **Checking.** A holder is live only if signal 0 finds its pid alive, and its start identity read the same way is exactly the recorded string. `EPERM` (someone else's process) counts as alive. A pid that is gone, or that now belongs to another process after a crash or reboot, is a stale lock: `serve` and `--install` take it over.
-- **Old status files.** A status file written before identities were recorded has none. Its pid counts as live only if that process's full argv (`/proc/<pid>/cmdline`, or `ps -o args=`) names `sharednet` and has a `serve` argument.
-- **Stopping.** `serve --stop` signals only a holder that passes this check. Otherwise it reports why and signals nothing, so a stale `serve.json` can never make it kill an unrelated process.
+- **Recording.** At lock time the listener records its own start identity. A later check reads the same source the same way:
+  - **Linux:** the kernel boot id (`/proc/sys/kernel/random/boot_id`) and field 22 of `/proc/<pid>/stat`, the start time in ticks since that boot. Field 22 is taken after the last `)`, because the command name may contain spaces and `)`. Ticks alone would repeat across reboots.
+  - **macOS:** `ps -o lstart= -p <pid>`, always run with `TZ=UTC LC_ALL=C`, so the string does not depend on the caller's timezone or locale.
+- **Checking a holder.**
+  - **Verified:** signal 0 finds the pid alive (`EPERM`, someone else's process, counts as alive) and its identity is exactly the recorded string.
+  - **Unverified:** alive, but its identity cannot be read now. It still holds the lock.
+  - **Presumed:** a status file from before identities, whose live pid's full argv (`/proc/<pid>/cmdline` or `ps -o args=`) names `sharednet` and has a `serve` argument, or whose argv cannot be read. It holds the lock.
+  - **Stale:** the pid is gone, its identity differs (the pid now belongs to another process), or it is an old file whose argv is not a sharednet serve.
+- **Stopping.** `serve --stop` signals only a verified holder. For an unverified or presumed holder it signals nothing, says why, and leaves the operator to stop that pid after checking it. A stale or legacy `serve.json` therefore cannot make it kill an unrelated process.
+- **Reclaiming a stale lock.** Starters never delete a lock by its name. That raced: two starters read the same stale file, one replaced it, and the other's already-decided delete removed the fresh lock. Instead:
+  - a reclaim first creates a one-time token named for that stale lock's id, and only one starter can create it;
+  - it then checks the lock is still exactly the stale one it read, and replaces it in one rename;
+  - a token whose creator died is passed over for the next number, never deleted, while its lock is still the current one.
+
+  A real multi-process test (eight `serve --service` processes against one stale lock, six rounds) pins that exactly one holds the lock.
 
 The runtime behaviour around the lock:
 

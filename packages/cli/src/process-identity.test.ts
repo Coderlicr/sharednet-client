@@ -1,5 +1,7 @@
 // @vitest-environment node
 
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import { looksLikeServe, processAlive, statStartTime, systemProcessProbe } from "./process-identity.ts";
@@ -38,6 +40,26 @@ describe("is the process that wrote the lock still there", () => {
     expect(systemProcessProbe.identity(2 ** 22 + 17)).toBeNull();
     expect(systemProcessProbe.argv(process.pid)).toContain(process.execPath.split("/").pop());
     expect(systemProcessProbe.argv(2 ** 22 + 17)).toBeNull();
+  });
+
+  it("reads the same identity whatever this process's timezone or locale, and ties it to this boot on Linux (review 5, P1)", () => {
+    const saved = { TZ: process.env.TZ, LC_ALL: process.env.LC_ALL, LANG: process.env.LANG };
+    try {
+      process.env.TZ = "UTC";
+      const utc = systemProcessProbe.identity(process.pid);
+      process.env.TZ = "America/New_York";
+      process.env.LC_ALL = "de_DE.UTF-8";
+      expect(systemProcessProbe.identity(process.pid)).toBe(utc);
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+    if (process.platform === "linux") {
+      const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      expect(systemProcessProbe.identity(process.pid)).toMatch(new RegExp(`^${boot}:\\d+$`));
+    }
   });
 
   it("accepts an old status file's holder only when its argv names sharednet and a serve argument", () => {
