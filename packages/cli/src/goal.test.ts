@@ -183,6 +183,34 @@ describe("goal watch", () => {
     expect(quiet.calls.some((call) => call.path.endsWith("/owner-messages"))).toBe(false);
   });
 
+  it("with consensus, ends once every Agent's claim stands of the workspace as it is", async () => {
+    const out = await temporary();
+    const OTHER = "i_AgentSeat02";
+    const { client } = fakeRoom({
+      until: ["said DONE", "after 1h"],
+      pages: [
+        [{ sequence: 2, content: "DONE", sender: AGENT }],
+        // Talk does not take a teammate's claim away, and words that only contain the claim are none.
+        [{ sequence: 3, content: "Looks right to me, not DONE yet", sender: OTHER }],
+        // The workspace changed before this claim: the first one is of what the files were.
+        [{ sequence: 4, content: "DONE", sender: OTHER }],
+        // An Agent that says something else takes its own claim back.
+        [{ sequence: 5, content: "Checked the new parser.", sender: AGENT }],
+        [{ sequence: 6, content: "DONE.", sender: AGENT }],
+      ],
+    });
+    const contents = ["tree-a", "tree-a", "tree-b", "tree-b", "tree-b"];
+    const result = await goalWatch(client, "sni_member", "snk_owner", { roomId: ROOM, workspace: out, out, checkEveryMs: 60_000, quietChecks: true, consensus: true }, {
+      now: clock(),
+      sleep: async () => undefined,
+      snapshot: null,
+      fingerprint: async () => contents.shift() ?? null,
+      claimants: () => [{ id: AGENT, name: "codex-1" }, { id: OTHER, name: "codex-2" }],
+    });
+    expect(result.ended_by).toMatchObject({ trigger: "said DONE", detail: "DONE." });
+    expect(result.messages).toBe(5);
+  });
+
   it("notices an end the service made by itself, and does not close it again", async () => {
     const out = await temporary();
     const { client, calls } = fakeRoom({

@@ -358,9 +358,11 @@ export function withoutTaskActs(wake: WakeShape): WakeShape {
 }
 
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
-export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting }): string {
+export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; consensus?: boolean }): string {
   const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => input.roomType === "compiled" ? `${seat.name} (${seat.member_id ?? "not seated"})` : seat.name);
   const claims = input.until.filter((trigger) => trigger.startsWith("said ")).map((trigger) => `"${trigger.slice(5)}"`);
+  const checked = input.until.some((trigger) => trigger.startsWith("check "));
+  const ends = input.consensus ? input.until.map((trigger) => trigger.startsWith("said ") ? `every agent's ${trigger.slice(5)} stands` : trigger) : input.until;
   return [
     `You are ${input.seat.name}, one of ${input.seats.length} agents working on one goal in SharedNet Room ${input.roomId}.${others.length > 0 ? ` The others: ${others.join(", ")}.` : ""}`,
     "",
@@ -369,8 +371,10 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
     input.goal.trim(),
     "</goal>",
     "",
-    `The Room ends when the first of these happens: ${input.until.join("; ")}.`,
-    ...(claims.length > 0 ? [`Say ${claims.join(" or ")} in the Room only when you believe the goal is met: saying it runs the check.`] : []),
+    `The Room ends when the first of these happens: ${ends.join("; ")}.`,
+    ...(claims.length === 0 ? [] : input.consensus ? [
+      `When you believe the goal is met, check the shared directory as it is now, then say ${claims.join(" or ")} in the Room, with \`sharednet say\`, as a message of its own: your own final reply is not posted. It stands until you say something else or anyone changes the shared directory; once every agent's stands, the Room ends${checked ? " if the check passes" : ""}. If you disagree with a teammate's, say why.`,
+    ] : [`Say ${claims.join(" or ")} in the Room only when you believe the goal is met: saying it runs the check.`]),
     "",
     `You share this directory (${CONTAINER_WORKSPACE}) with the others, and only this one: each of you works in its own container, so what you install elsewhere is yours alone. Talk to them only through the Room, with the sharednet command:`,
     "  sharednet read --last 30 --json    what has been said",
@@ -547,6 +551,8 @@ export interface GoalRunInput {
   mentionGate?: boolean;
   taskGate?: boolean;
   messageRouting?: MessageRouting;
+  /** Each Agent's `said` is its own claim of the workspace as it is; the Room ends once every one stands. */
+  consensus?: boolean;
 }
 
 export interface GoalRunDependencies {
@@ -848,9 +854,12 @@ export async function runGoal(
       return failed;
     };
 
+    // The Agents that have stopped for good: a claim of being done is no longer waited for from them.
+    const stopped = new Set<string>();
+
     // Every seat starts once. Subsequent wakes follow the configured routing policy.
     const seatLoop = async (seat: SeatRecord) => {
-      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting });
+      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, consensus: input.consensus });
       let wake: WakeShape | null = null;
       let failedInARow = 0;
       while (!ended) {
@@ -860,6 +869,7 @@ export async function runGoal(
         if (ended) break;
         if (failedInARow >= FAILED_TURNS_LIMIT) {
           log(`goal: ${seat.name} failed ${FAILED_TURNS_LIMIT} turns in a row and takes no more; see agents/${seat.name}/\n`);
+          stopped.add(seat.name);
           break;
         }
         while (!ended) {
@@ -881,6 +891,7 @@ export async function runGoal(
     };
     const seats = records.map((seat) =>
       seatLoop(seat).catch((error: unknown) => {
+        stopped.add(seat.name);
         log(`goal: ${seat.name} stopped (${error instanceof Error ? error.message : "error"})\n`);
       }),
     );
@@ -889,7 +900,14 @@ export async function runGoal(
       client,
       memberToken,
       apiKey,
-      { roomId: input.roomId, workspace: plan.workspace, out: input.out, checkEveryMs: input.checkEveryMs, quietChecks: input.quietChecks },
+      {
+        roomId: input.roomId,
+        workspace: plan.workspace,
+        out: input.out,
+        checkEveryMs: input.checkEveryMs,
+        quietChecks: input.quietChecks,
+        ...(input.consensus ? { consensus: true } : {}),
+      },
       {
         now: dependencies.now,
         ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}),
@@ -900,6 +918,7 @@ export async function runGoal(
           return { exitCode: result.code, output: `${result.stdout}${result.stderr}` };
         },
         spend,
+        claimants: () => records.filter((seat) => seat.member_id && !stopped.has(seat.name)).map((seat) => ({ id: seat.member_id!, name: seat.name })),
       },
     );
     ended = true;
@@ -951,6 +970,7 @@ export async function runGoal(
           mention_gate: input.mentionGate ?? false,
           task_gate: input.taskGate ?? false,
           message_routing: messageRouting,
+          consensus: input.consensus ?? false,
           agents: records,
           totals: { ...(episode.totals as object), tokens: spend(), cached_tokens: records.reduce((sum, seat) => sum + seat.usage.cached, 0) },
         },

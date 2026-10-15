@@ -132,7 +132,7 @@ const optionValueNames = new Set([
   "message-routing",
   "type",
 ]);
-const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate"]);
+const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate", "consensus"]);
 
 /** Room mode is fixed at creation. Omission retains the service default. */
 function roomType(parsed: ParsedArguments): "board" | "compiled" | undefined {
@@ -572,7 +572,7 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "consensus"]);
   const type = roomType(parsed);
   const messageRouting = option(parsed, "message-routing");
   if (messageRouting !== undefined && messageRouting !== "broadcast" && messageRouting !== "mentions") throw localError("invalid_arguments", "--message-routing must be broadcast or mentions.");
@@ -582,7 +582,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--mention-gate] [--task-gate] [--message-routing broadcast|mentions]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--mention-gate] [--task-gate] [--message-routing broadcast|mentions] [--consensus]",
     );
   }
   const isolate = parsed.options.get("isolate") === true;
@@ -600,6 +600,10 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   }
   const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
   const until = parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime(), { budget: true });
+  const consensus = parsed.options.get("consensus") === true;
+  if (consensus && !until.wire.some((trigger) => trigger.startsWith("said "))) {
+    throw localError("invalid_arguments", "--consensus makes each agent's claim of being done count: add the claim with --until \"said: DONE\".");
+  }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
   const workspace = resolvePathFrom(dependencies.cwd, option(parsed, "workspace") ?? ".");
   if (!(await stat(workspace).then((entry) => entry.isDirectory(), () => false))) {
@@ -672,6 +676,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           ...(messageRouting ? { messageRouting } : {}),
           webSearch,
           ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
+          consensus,
         },
         { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr },
       );

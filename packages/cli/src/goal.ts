@@ -130,6 +130,13 @@ export interface GoalWatchDependencies {
   snapshot?: ((label: string) => Promise<string | null>) | null;
   /** Tokens the Agents have used so far, when this runner started them (`goal run`); a budget is judged on it. */
   spend?: () => number;
+  /**
+   * The shared workspace's content as of the last snapshot, for `consensus`; tests replace it, and
+   * null leaves the content out (a claim then stands until its Agent says something else).
+   */
+  fingerprint?: (() => Promise<string | null>) | null;
+  /** With `consensus`: the Agents whose claims it takes, as they are now; one that has stopped is left out. */
+  claimants?: () => Array<{ id: string; name: string }>;
 }
 
 export interface GoalWatchOptions {
@@ -143,6 +150,11 @@ export interface GoalWatchOptions {
   quietChecks: boolean;
   /** Read the Room's state at least this often, to notice an end the service or the owner made. */
   roomCheckMs?: number;
+  /**
+   * A `said` is each Agent's own claim, of the workspace as it is when said: it stands until that
+   * Agent says something else or the workspace changes, and the Room ends once every claim stands.
+   */
+  consensus?: boolean;
 }
 
 /** The wait the runner sits in, bounded the way the service bounds every wait. */
@@ -156,6 +168,21 @@ const OUTAGE_CAP_MS = 30_000;
 const CLOSE_ATTEMPTS = 6;
 /** How often a budget is looked at while nothing is said. */
 const BUDGET_LOOK_MS = 5_000;
+
+/** With consensus a claim is a line that starts with the words: "not DONE yet" is none. */
+function claimIn(content: string, trigger: Extract<Trigger, { kind: "said" }>): boolean {
+  if (trigger.expression) return saidIn(content, trigger);
+  const text = content.trim();
+  return text.startsWith(trigger.pattern) && !/^\w/.test(text.slice(trigger.pattern.length));
+}
+
+/** The record's own git directory knows the workspace's content as of its last snapshot. */
+function recordedFingerprint(out: string): () => Promise<string | null> {
+  return async () => {
+    const tree = await git([`--git-dir=${join(out, "workspace.git")}`, "rev-parse", "--verify", "HEAD^{tree}"], out);
+    return tree.code === 0 ? tree.stdout.trim() || null : null;
+  };
+}
 
 /**
  * A fetch that gives up on any one request after `limitMs`. A runner sits for hours, and a
@@ -304,6 +331,12 @@ export async function goalWatch(
   for (const check of checks) checkState.set(check.label, { passing: false, ranAt: null });
   let end: { trigger: string; detail: string | null } | null = null;
   let endedByService: GoalShape["ended_by"] = goal.ended_by;
+  // With consensus: each Agent's standing claim, with the workspace's content when it was said.
+  const consensus = options.consensus === true;
+  const fingerprint = dependencies.fingerprint === undefined ? (dependencies.snapshot === undefined ? recordedFingerprint(options.out) : null) : dependencies.fingerprint;
+  const claims = new Map<string, string | null>();
+  const claimants = () => dependencies.claimants?.() ?? [];
+  const standing = (content: string | null) => claimants().filter((agent) => claims.has(agent.id) && (content === null || claims.get(agent.id) === content));
 
   const takeSnapshot = async (label: string) => {
     if (!snapshot) return;
@@ -419,8 +452,14 @@ export async function goalWatch(
     }
 
     let claim: MessageShape | null = null;
-    for (const item of items.sort((left, right) => left.sequence - right.sequence)) {
-      if (!Number.isSafeInteger(item.sequence) || item.sequence <= cursor) continue;
+    const fresh = items.filter((item) => Number.isSafeInteger(item.sequence) && item.sequence > cursor).sort((left, right) => left.sequence - right.sequence);
+    // The workspace as these lines were said: a claim among them is of this content.
+    let content: string | null = null;
+    if (fresh.length > 0) {
+      await takeSnapshot(`seq ${fresh.at(-1)!.sequence}`);
+      if (consensus && fingerprint) content = await fingerprint().catch(() => null);
+    }
+    for (const item of fresh) {
       cursor = item.sequence;
       messages += 1;
       await appendFile(roomLog, `${JSON.stringify(item)}\n`);
@@ -436,11 +475,17 @@ export async function goalWatch(
         mentions(item.content, { memberId: goalSpeaker.member_id ?? "", name: goalSpeaker.name ?? null })
       ) {
         end = { trigger: "mention", detail: item.content.slice(0, 500) };
+      } else if (consensus) {
+        // An Agent's claim stands until it says something else; the content it was of is checked when all have claimed.
+        const claiming = said.some((trigger) => claimIn(item.content, trigger));
+        if (claiming) claims.set(sender, content);
+        else claims.delete(sender);
+        const agents = claimants();
+        if (claiming && claim === null && agents.length > 0 && standing(content).length === agents.length) claim = item;
       } else if (said.some((trigger) => saidIn(item.content, trigger)) && claim === null) {
         claim = item;
       }
     }
-    if (items.length > 0) await takeSnapshot(`seq ${cursor}`);
 
     // A claim of being done: the check decides when there is one, and a failing check is said back.
     if (!end && claim) {
@@ -458,6 +503,8 @@ export async function goalWatch(
             `#${claim.sequence} says done, but \`${check.command}\` still fails (exit ${result.exitCode}):\n\n${tail(result.output).trim() || "(no output)"}`,
           );
         }
+        // A failing check answers every claim: each Agent claims it again, of what it then is.
+        if (!end && consensus) claims.clear();
       }
     }
     if (end) break;

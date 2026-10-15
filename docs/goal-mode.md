@@ -89,6 +89,14 @@ or `budget`.
 `--quiet-checks` stops the runner from posting failing checks into the Room, for an
 experiment that must not intervene.
 
+`--consensus` (`goal run` only) makes `said` each agent's own claim, of the workspace as it is
+when said, for a goal with no check to settle it. A claim is a message that starts with the
+words, so `not DONE yet` is none. It stands until its agent says something else or the
+workspace changes (its content as the record's snapshots see it), and the Room ends once every
+agent's claim stands; with a `check`, the check then runs, and a failing one takes every claim
+away. Talk alone takes no one else's claim away. An agent that has stopped for good (too many
+failed turns) is not waited for. `episode.json` records the setting (`consensus`).
+
 `--web-search off` takes web search away from every agent (Codex runs with
 `web_search="disabled"`, Claude Code without its `WebSearch` and `WebFetch` tools), for a
 benchmark such as ProgramBench that forbids the internet during inference. `episode.json`

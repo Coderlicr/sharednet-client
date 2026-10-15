@@ -455,6 +455,17 @@ describe("runGoal", () => {
   });
 });
 
+describe("consensus", () => {
+  it("tells each Agent that every one's claim must stand of the shared directory as it is", () => {
+    const seats = parseAgents(["codex", "codex"]);
+    const opening = openingPrompt({ seat: seats[0]!, seats, roomId: ROOM, goal: "Make it pass.", goalSequence: 1, until: ["said DONE", "after 30m"], consensus: true });
+    expect(opening).toContain("The Room ends when the first of these happens: every agent's DONE stands; after 30m.");
+    expect(opening).toContain('then say "DONE" in the Room, with `sharednet say`, as a message of its own: your own final reply is not posted. It stands until you say something else or anyone changes the shared directory; once every agent\'s stands, the Room ends.');
+    expect(opening).not.toContain("saying it runs the check");
+    expect(openingPrompt({ seat: seats[0]!, seats, roomId: ROOM, goal: "Make it pass.", goalSequence: 1, until: ["said DONE", "check make test"], consensus: true })).toContain("the Room ends if the check passes.");
+  });
+});
+
 describe("an isolated run", () => {
   it("is prepared only with a key the gateway can sign with, and its gateway image", async () => {
     const home = await temporary();
