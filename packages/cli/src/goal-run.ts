@@ -553,6 +553,8 @@ export interface GoalRunInput {
   messageRouting?: MessageRouting;
   /** Each Agent's `said` is its own claim of the workspace as it is; the Room ends once every one stands. */
   consensus?: boolean;
+  /** The runner reminds the Agents when none has been in a turn, and nothing has been said, for this long. */
+  remindMs?: number;
 }
 
 export interface GoalRunDependencies {
@@ -854,7 +856,9 @@ export async function runGoal(
       return failed;
     };
 
-    // The Agents that have stopped for good: a claim of being done is no longer waited for from them.
+    // What the runner's watch reads of the Agents: who is in a turn, since when, and who has stopped for good.
+    let inTurn = 0;
+    let lastActivity = dependencies.now().getTime();
     const stopped = new Set<string>();
 
     // Every seat starts once. Subsequent wakes follow the configured routing policy.
@@ -863,7 +867,15 @@ export async function runGoal(
       let wake: WakeShape | null = null;
       let failedInARow = 0;
       while (!ended) {
-        const failed = await runTurn(seat, prompt, wake);
+        inTurn += 1;
+        lastActivity = dependencies.now().getTime();
+        let failed: boolean;
+        try {
+          failed = await runTurn(seat, prompt, wake);
+        } finally {
+          inTurn -= 1;
+          lastActivity = dependencies.now().getTime();
+        }
         if (wake?.wake_id) await exec(seat, ["sharednet", "ack", wake.wake_id, "--json"]);
         failedInARow = failed ? failedInARow + 1 : 0;
         if (ended) break;
@@ -907,6 +919,7 @@ export async function runGoal(
         checkEveryMs: input.checkEveryMs,
         quietChecks: input.quietChecks,
         ...(input.consensus ? { consensus: true } : {}),
+        ...(input.remindMs === undefined ? {} : { remindMs: input.remindMs }),
       },
       {
         now: dependencies.now,
@@ -919,6 +932,7 @@ export async function runGoal(
         },
         spend,
         claimants: () => records.filter((seat) => seat.member_id && !stopped.has(seat.name)).map((seat) => ({ id: seat.member_id!, name: seat.name })),
+        activity: () => ({ busy: inTurn > 0, at: lastActivity }),
       },
     );
     ended = true;
@@ -971,6 +985,7 @@ export async function runGoal(
           task_gate: input.taskGate ?? false,
           message_routing: messageRouting,
           consensus: input.consensus ?? false,
+          remind_s: input.remindMs === undefined ? null : Math.round(input.remindMs / 1000),
           agents: records,
           totals: { ...(episode.totals as object), tokens: spend(), cached_tokens: records.reduce((sum, seat) => sum + seat.usage.cached, 0) },
         },

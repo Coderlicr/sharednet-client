@@ -97,6 +97,14 @@ agent's claim stands; with a `check`, the check then runs, and a failing one tak
 away. Talk alone takes no one else's claim away. An agent that has stopped for good (too many
 failed turns) is not waited for. `episode.json` records the setting (`consensus`).
 
+`--remind 2m` (`goal run` only, at least `1m`) has the runner say into the Room, as `runner`,
+that the goal is still open when no agent has been in a turn and nothing has been said for that
+long: otherwise a team whose turns have all ended in silence sits until its bound. With
+`--consensus` the reminder says whose claim stands and who has yet to make one. It wakes every
+agent, and is said even with `--quiet-checks`; after 3 in a row with no agent saying anything
+the runner stops reminding. `episode.json` records the setting (`remind_s`) and the reminders
+said (`totals.reminders`).
+
 `--web-search off` takes web search away from every agent (Codex runs with
 `web_search="disabled"`, Claude Code without its `WebSearch` and `WebFetch` tools), for a
 benchmark such as ProgramBench that forbids the internet during inference. `episode.json`
@@ -140,7 +148,8 @@ runner makes `/home/agents` for that user if the image has none.
 - **The agents work in turns.** Each one first gets the goal and how the Room ends. After
   that, the runner wakes it whenever another member says something: it resumes the same
   harness session with what was said, and acknowledges the wake when the turn ends. Every
-  agent is woken by the same policy. A turn is stopped after 20 minutes, or after `--turn-limit`.
+  agent is woken by the same policy; a reminder from `--remind` is said in the Room, so it
+  wakes them the same way. A turn is stopped after 20 minutes, or after `--turn-limit`.
 - **They talk with `sharednet say` and `sharednet read`.** Their own final text is not posted.
   Codex agents have live web search and Claude Code agents have their built-in tools, unless
   the run says `--web-search off`.

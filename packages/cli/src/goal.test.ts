@@ -211,6 +211,33 @@ describe("goal watch", () => {
     expect(result.messages).toBe(5);
   });
 
+  it("reminds the Agents as the runner once none has worked or spoken for long enough, and stops after a few", async () => {
+    const run = async (busy: boolean) => {
+      const out = await temporary();
+      const room = fakeRoom({ until: ["said DONE", "after 1h"], pages: [[{ sequence: 2, content: "DONE", sender: AGENT }]] });
+      const start = Date.parse("2026-10-05T12:00:00.000Z");
+      const result = await goalWatch(room.client, "sni_member", "snk_owner", { roomId: ROOM, workspace: out, out, checkEveryMs: 60_000, quietChecks: true, consensus: true, remindMs: 120_000 }, {
+        now: clock(),
+        sleep: async () => undefined,
+        snapshot: null,
+        claimants: () => [{ id: AGENT, name: "codex-1" }, { id: "i_AgentSeat02", name: "codex-2" }],
+        activity: () => ({ busy, at: start }),
+      });
+      const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
+      return { result, episode, reminders: room.calls.filter((call) => call.path.endsWith("/owner-messages")).map((call) => call.body as { content: string; as: string }) };
+    };
+    // Quiet checks keep the runner's judgement out of the Room, not its reminders.
+    const quiet = await run(false);
+    expect(quiet.reminders).toHaveLength(3);
+    expect(quiet.reminders[0]).toMatchObject({ as: "runner" });
+    expect(quiet.reminders[0]!.content).toContain("Nothing has happened for 2m, and the goal is still open.");
+    expect(quiet.reminders[0]!.content).toContain('"DONE" stands for: codex-1. Still to say it of the shared directory as it is now: codex-2.');
+    expect(quiet.result.ended_by).toMatchObject({ trigger: "after 1h" });
+    expect(quiet.episode.totals).toMatchObject({ reminders: 3 });
+    // An Agent at work is not reminded.
+    expect((await run(true)).reminders).toHaveLength(0);
+  });
+
   it("notices an end the service made by itself, and does not close it again", async () => {
     const out = await temporary();
     const { client, calls } = fakeRoom({

@@ -131,6 +131,7 @@ const optionValueNames = new Set([
   "agent-user",
   "message-routing",
   "type",
+  "remind",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate", "consensus"]);
 
@@ -572,7 +573,7 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "consensus"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "consensus", "remind"]);
   const type = roomType(parsed);
   const messageRouting = option(parsed, "message-routing");
   if (messageRouting !== undefined && messageRouting !== "broadcast" && messageRouting !== "mentions") throw localError("invalid_arguments", "--message-routing must be broadcast or mentions.");
@@ -582,7 +583,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--mention-gate] [--task-gate] [--message-routing broadcast|mentions] [--consensus]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--mention-gate] [--task-gate] [--message-routing broadcast|mentions] [--consensus] [--remind 2m]",
     );
   }
   const isolate = parsed.options.get("isolate") === true;
@@ -603,6 +604,10 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   const consensus = parsed.options.get("consensus") === true;
   if (consensus && !until.wire.some((trigger) => trigger.startsWith("said "))) {
     throw localError("invalid_arguments", "--consensus makes each agent's claim of being done count: add the claim with --until \"said: DONE\".");
+  }
+  const remindMs = parsed.options.has("remind") ? parseDuration(option(parsed, "remind"), "--remind") : undefined;
+  if (remindMs !== undefined && remindMs < 60_000) {
+    throw localError("invalid_arguments", "--remind is at least 1m.");
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
   const workspace = resolvePathFrom(dependencies.cwd, option(parsed, "workspace") ?? ".");
@@ -677,6 +682,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           webSearch,
           ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
           consensus,
+          ...(remindMs === undefined ? {} : { remindMs }),
         },
         { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr },
       );

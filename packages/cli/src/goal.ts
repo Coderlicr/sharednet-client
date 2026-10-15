@@ -137,6 +137,8 @@ export interface GoalWatchDependencies {
   fingerprint?: (() => Promise<string | null>) | null;
   /** With `consensus`: the Agents whose claims it takes, as they are now; one that has stopped is left out. */
   claimants?: () => Array<{ id: string; name: string }>;
+  /** With `remindMs`: whether any Agent is in a turn, and when a turn last started or ended. */
+  activity?: () => { busy: boolean; at: number };
 }
 
 export interface GoalWatchOptions {
@@ -155,6 +157,8 @@ export interface GoalWatchOptions {
    * Agent says something else or the workspace changes, and the Room ends once every claim stands.
    */
   consensus?: boolean;
+  /** When no Agent has been in a turn and nothing has been said for this long, the runner reminds them all. */
+  remindMs?: number;
 }
 
 /** The wait the runner sits in, bounded the way the service bounds every wait. */
@@ -168,12 +172,21 @@ const OUTAGE_CAP_MS = 30_000;
 const CLOSE_ATTEMPTS = 6;
 /** How often a budget is looked at while nothing is said. */
 const BUDGET_LOOK_MS = 5_000;
+/** How often the Agents' activity is looked at, for a reminder, while nothing is said. */
+const REMIND_LOOK_MS = 5_000;
+/** Reminders in a row with nothing said by an Agent in between, before the runner stops reminding. */
+const REMIND_LIMIT = 3;
 
 /** With consensus a claim is a line that starts with the words: "not DONE yet" is none. */
 function claimIn(content: string, trigger: Extract<Trigger, { kind: "said" }>): boolean {
   if (trigger.expression) return saidIn(content, trigger);
   const text = content.trim();
   return text.startsWith(trigger.pattern) && !/^\w/.test(text.slice(trigger.pattern.length));
+}
+
+/** A duration as a person writes it: 2m, 90s. */
+function spoken(ms: number): string {
+  return ms % 60_000 === 0 ? `${ms / 60_000}m` : `${Math.round(ms / 1000)}s`;
 }
 
 /** The record's own git directory knows the workspace's content as of its last snapshot. */
@@ -337,6 +350,10 @@ export async function goalWatch(
   const claims = new Map<string, string | null>();
   const claimants = () => dependencies.claimants?.() ?? [];
   const standing = (content: string | null) => claimants().filter((agent) => claims.has(agent.id) && (content === null || claims.get(agent.id) === content));
+  let lastSeenAt: number | null = null;
+  let lastReminderAt: number | null = null;
+  let reminders = 0;
+  let remindersInARow = 0;
 
   const takeSnapshot = async (label: string) => {
     if (!snapshot) return;
@@ -373,6 +390,31 @@ export async function goalWatch(
     } catch (error) {
       log(`goal: the check result was not posted (${error instanceof CliError ? error.code : "error"})\n`);
     }
+  };
+
+  /** Said into the Room as the runner whatever the run's settings: the Agents have all stopped, and the goal is open. */
+  const remind = async () => {
+    await takeSnapshot("remind");
+    const content = fingerprint ? await fingerprint().catch(() => null) : null;
+    const words = said.map((trigger) => `"${trigger.pattern}"`).join(" or ");
+    const lines = [`Nothing has happened for ${spoken(options.remindMs!)}, and the goal is still open.`];
+    if (consensus && said.length > 0) {
+      const stands = standing(content).map((agent) => agent.name);
+      const yet = claimants().filter((agent) => !stands.includes(agent.name)).map((agent) => agent.name);
+      lines.push(`${words} stands for: ${stands.join(", ") || "no one"}. Still to say it of the shared directory as it is now: ${yet.join(", ") || "no one"}.`);
+      lines.push(`If there is more to do, do it and tell the others. If you believe the goal is met, check the shared directory as it is now, then say ${words} in the Room with \`sharednet say\`, as a message of its own: a final reply is not posted. Whoever's ${words} stands need do nothing.`);
+    } else {
+      lines.push(`If there is more to do, do it and tell the others.${said.length > 0 ? ` If you believe the goal is met, say ${words}.` : ""}`);
+    }
+    try {
+      const posted = await client.request<{ message?: { sender_instance_id?: string } }>("POST", `${roomPath}/owner-messages`, apiKey, { content: lines.join("\n"), as: "runner" });
+      if (posted?.message?.sender_instance_id) runnerSeats.add(posted.message.sender_instance_id);
+      reminders += 1;
+    } catch (error) {
+      log(`goal: the reminder was not posted (${error instanceof CliError ? error.code : "error"})\n`);
+    }
+    remindersInARow += 1;
+    lastReminderAt = dependencies.now().getTime();
   };
 
   /** An outage is ridden out with a growing pause, and the loop goes on: the clock and the checks still count. */
@@ -422,6 +464,13 @@ export async function goalWatch(
     }
     if (end) break;
 
+    // Every Agent has stopped and nothing has been said for long enough: the runner reminds them.
+    if (options.remindMs !== undefined && dependencies.activity && remindersInARow < REMIND_LIMIT) {
+      const activity = dependencies.activity();
+      const quietSince = Math.max(activity.at, lastSeenAt ?? startedAt, lastReminderAt ?? 0);
+      if (!activity.busy && now - quietSince >= options.remindMs) await remind();
+    }
+
     // Sit until something is said, or the next thing on the clock is due.
     let waitMs = WAIT_MAX_SECONDS * 1000;
     for (const trigger of triggers) {
@@ -431,6 +480,8 @@ export async function goalWatch(
       // Spend grows between messages, as turns end: look at it every few seconds.
       if (trigger.kind === "budget" && spend) waitMs = Math.min(waitMs, BUDGET_LOOK_MS);
     }
+    // Whether the Agents are at work changes without a word in the Room.
+    if (options.remindMs !== undefined) waitMs = Math.min(waitMs, REMIND_LOOK_MS);
     for (const check of checks) {
       const ranAt = checkState.get(check.label)!.ranAt;
       waitMs = Math.min(waitMs, ranAt === null ? 0 : ranAt + options.checkEveryMs - now);
@@ -464,9 +515,11 @@ export async function goalWatch(
       messages += 1;
       await appendFile(roomLog, `${JSON.stringify(item)}\n`);
       if (item.sequence <= goal.sequence) continue;
+      lastSeenAt = dependencies.now().getTime();
       const sender = item.sender_instance_id ?? item.sender?.member_id ?? "";
       if (runnerSeats.has(sender)) continue;
       lastMessageAt = dependencies.now().getTime();
+      remindersInARow = 0;
       if (end) continue;
       if (triggers.some((trigger) => trigger.kind === "message")) end = { trigger: "message", detail: item.content.slice(0, 500) };
       else if (
@@ -556,7 +609,7 @@ export async function goalWatch(
         goal: { message_id: goal.message_id, sequence: goal.sequence, until: goal.until, started_at: goal.started_at },
         ended_by: endedBy,
         runner: { started_at: runnerStartedAt, ended_at: dependencies.now().toISOString(), workspace: resolve(options.workspace) },
-        totals: { messages, checks: checkCount, snapshots, ...(spend ? { tokens: spend() } : {}) },
+        totals: { messages, checks: checkCount, snapshots, ...(options.remindMs !== undefined ? { reminders } : {}), ...(spend ? { tokens: spend() } : {}) },
         ...(budget.length > 0 ? { not_measured: budget.map((label) => `${label}: goal watch did not start the Agents, so it cannot read their spend; goal run can`) } : {}),
       },
       null,

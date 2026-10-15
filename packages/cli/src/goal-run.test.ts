@@ -455,7 +455,7 @@ describe("runGoal", () => {
   });
 });
 
-describe("consensus", () => {
+describe("consensus and reminders", () => {
   it("tells each Agent that every one's claim must stand of the shared directory as it is", () => {
     const seats = parseAgents(["codex", "codex"]);
     const opening = openingPrompt({ seat: seats[0]!, seats, roomId: ROOM, goal: "Make it pass.", goalSequence: 1, until: ["said DONE", "after 30m"], consensus: true });
@@ -463,6 +463,65 @@ describe("consensus", () => {
     expect(opening).toContain('then say "DONE" in the Room, with `sharednet say`, as a message of its own: your own final reply is not posted. It stands until you say something else or anyone changes the shared directory; once every agent\'s stands, the Room ends.');
     expect(opening).not.toContain("saying it runs the check");
     expect(openingPrompt({ seat: seats[0]!, seats, roomId: ROOM, goal: "Make it pass.", goalSequence: 1, until: ["said DONE", "check make test"], consensus: true })).toContain("the Room ends if the check passes.");
+  });
+
+  it("ends once both Agents stand by it, after the runner has reminded them, idle, by name", async () => {
+    const out = await temporary();
+    const workspace = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseAgents(["codex", "codex"]),
+      workspace,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: { kind: "login", file: "/Users/someone/.codex/auth.json" },
+      claudeAuth: null,
+    };
+    const { docker } = fakeDocker(async (call, command) => {
+      const seat = call.args.find((arg) => arg.startsWith("SHAREDNET_SEAT="))?.slice("SHAREDNET_SEAT=".length) ?? null;
+      if (command[0] === "sharednet" && command[1] === "join") {
+        const name = command[command.indexOf("--name") + 1]!;
+        return { stdout: JSON.stringify({ member_id: name === "codex-1" ? "i_CodexOne01" : "i_CodexTwo02" }) };
+      }
+      if (command[2] === "codex") return { lines: [JSON.stringify({ type: "thread.started", thread_id: `thread-${seat}` })] };
+      // Each Agent takes its first turn and then waits out the Room.
+      if (command[0] === "sharednet" && command[1] === "wait") return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, events: [], messages: [] }) };
+      return {};
+    });
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["said DONE", "after 2h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    const reminders: string[] = [];
+    let said = 0;
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) return { room: { id: ROOM, type: "board", state: "open", goal }, memberships: [] };
+        if (method === "GET" && path.startsWith(`/rooms/${ROOM}/wait?`)) {
+          await new Promise((resolve) => setTimeout(resolve, 2));
+          const say = (sequence: number, sender: string) => ({ items: [{ sequence, content: "DONE", sender_instance_id: sender, sender: { member_id: sender, name: null } }] });
+          if (said === 0) return (said += 1), say(2, "i_CodexOne01");
+          if (said === 1 && reminders.length > 0) return (said += 1), say(3, "i_CodexTwo02");
+          return { items: [] };
+        }
+        if (method === "POST" && path === `/rooms/${ROOM}/owner-messages`) {
+          reminders.push((body as { content: string }).content);
+          return { message: { sequence: 99, sender_instance_id: "i_Runner0001" } };
+        }
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: "2026-10-05T12:05:00.000Z" } } } };
+        throw new Error(`unexpected ${method} ${path}`);
+      },
+    } as unknown as ApiClient;
+
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    const result = await runGoal(
+      client,
+      "sni_owner-seat",
+      OWNER_KEY,
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "Make it pass.", goalSequence: 1, until: goal.until, baseUrl: "http://127.0.0.1:3117", out, checkEveryMs: 60_000, quietChecks: true, consensus: true, remindMs: 60_000 },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
+    );
+
+    expect(result.ended_by).toMatchObject({ trigger: "said DONE" });
+    expect(reminders).toHaveLength(1);
+    expect(reminders[0]).toContain('"DONE" stands for: codex-1. Still to say it of the shared directory as it is now: codex-2.');
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ consensus: true, remind_s: 60, totals: { reminders: 1 } });
   });
 });
 
