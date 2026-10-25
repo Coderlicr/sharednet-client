@@ -434,10 +434,27 @@ export interface CodexBase {
   custom: boolean;
 }
 
+/** How hard a Codex seat's model reasons on each call: Codex passes it to the model API as `reasoning.effort`. */
+export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+
+/**
+ * What a run tells Codex about its seats' model, each passed to Codex as it is. Codex knows these for
+ * OpenAI's models; for another provider's it does not, and without a context window it never
+ * compacts a long history, so a turn ends once the history outgrows what the API accepts.
+ */
+export interface CodexModel {
+  reasoningEffort?: ReasoningEffort;
+  /** The model's context window in tokens: Codex's `model_context_window`. */
+  contextWindow?: number;
+  /** Compact the history once it reaches this many tokens: Codex's `model_auto_compact_token_limit`. */
+  compactAt?: number;
+}
+
 /** The provider Codex is given for a model API other than OpenAI's: Responses over HTTP, keyed from OPENAI_API_KEY. */
 const CODEX_PROVIDER = "goal_api";
 
-export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live", turnLimitSeconds = TURN_LIMIT_SECONDS, codexBase: CodexBase | null = null): string[] {
+export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live", turnLimitSeconds = TURN_LIMIT_SECONDS, codexBase: CodexBase | null = null, model: CodexModel = {}): string[] {
   const limit = ["timeout", String(turnLimitSeconds)];
   if (seat.driver === "codex") {
     // Live web search, which Claude Code has by default: a goal is as often research as code.
@@ -453,7 +470,13 @@ export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string |
       "-c", `${provider}.wire_api="responses"`,
       "-c", `${provider}.supports_websockets=false`,
     ] : ["-c", `openai_base_url="${codexBase.url}"`];
-    const flags = ["--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", search, ...base, ...(seat.model ? ["-m", seat.model] : [])];
+    // Left unset, a model reasons as its API's default has it, which for some is as long as it may.
+    const tuning = [
+      ...(model.reasoningEffort === undefined ? [] : ["-c", `model_reasoning_effort="${model.reasoningEffort}"`]),
+      ...(model.contextWindow === undefined ? [] : ["-c", `model_context_window=${model.contextWindow}`]),
+      ...(model.compactAt === undefined ? [] : ["-c", `model_auto_compact_token_limit=${model.compactAt}`]),
+    ];
+    const flags = ["--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", search, ...base, ...tuning, ...(seat.model ? ["-m", seat.model] : [])];
     return sessionId === null ? [...limit, "codex", "exec", ...flags, prompt] : [...limit, "codex", "exec", "resume", ...flags, sessionId, prompt];
   }
   return [
@@ -600,6 +623,8 @@ export interface GoalRunInput {
   consensus?: boolean;
   /** The runner reminds the Agents when none has been in a turn, and nothing has been said, for this long. */
   remindMs?: number;
+  /** What Codex is told about the Codex seats' model; Codex's own defaults when left out. */
+  codexModel?: CodexModel;
 }
 
 export interface GoalRunDependencies {
@@ -867,7 +892,7 @@ export async function runGoal(
       const reader = new TurnReader(seat.driver);
       const startedAt = dependencies.now().toISOString();
       let writes = Promise.resolve();
-      const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds, codexBase);
+      const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds, codexBase, input.codexModel ?? {});
       if (input.taskGate && seat.driver === "claude-code") command.splice(command.length - 1, 0, "--settings", TASK_HOOK_SETTINGS);
       const result = await exec(seat, command, {
         through: wake?.through ?? input.goalSequence,
@@ -1032,7 +1057,12 @@ export async function runGoal(
           ...(isolated ? { addresses } : {}),
           web_search: input.webSearch ?? "live",
           // Where the Codex seats' model was: a run's numbers are read with the model and its provider.
-          ...(plan.codexAuth !== null ? { model_api: `${api.origin}${api.path}` } : {}),
+          ...(plan.codexAuth !== null ? {
+            model_api: `${api.origin}${api.path}`,
+            reasoning_effort: input.codexModel?.reasoningEffort ?? null,
+            context_window: input.codexModel?.contextWindow ?? null,
+            compact_at: input.codexModel?.compactAt ?? null,
+          } : {}),
           turn_limit_s: turnLimitSeconds,
           mention_gate: input.mentionGate ?? false,
           task_gate: input.taskGate ?? false,

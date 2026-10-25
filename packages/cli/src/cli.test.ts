@@ -340,6 +340,21 @@ describe("reach: forming a group from the account CLI", () => {
     expect(refused.requests).toEqual([]);
   });
 
+  it("refuses what it would tell Codex about its model when it is not something Codex takes, or the run has no codex agent, before anything is sent", async () => {
+    const unknown = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after: 1h", "--reasoning-effort", "bogus"], []);
+    expect(unknown.exitCode).not.toBe(0);
+    expect(unknown.stderr.join(" ")).toContain("--reasoning-effort is one of none, minimal, low, medium, high, xhigh");
+    expect(unknown.requests).toEqual([]);
+    const claude = await harness(["goal", "run", "TASK.md", "--agent", "claude-code", "--until", "after: 1h", "--reasoning-effort", "medium"], []);
+    expect(claude.stderr.join(" ")).toContain("this run has no codex agent");
+    expect(claude.requests).toEqual([]);
+    const window = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after: 1h", "--context-window", "200000", "--compact-at", "262144"], []);
+    expect(window.stderr.join(" ")).toContain("--compact-at is fewer tokens than --context-window");
+    expect(window.requests).toEqual([]);
+    const words = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after: 1h", "--context-window", "256k"], []);
+    expect(words.stderr.join(" ")).toContain("--context-window is a number of tokens");
+  });
+
   it("accepts independent board gates before validating the rest of a run", async () => {
     for (const flags of [["--mention-gate"], ["--task-gate"], ["--mention-gate", "--task-gate"]]) {
       const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after 1h", "--turn-limit", "30s", ...flags], []);

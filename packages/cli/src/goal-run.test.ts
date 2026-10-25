@@ -129,6 +129,13 @@ describe("a turn", () => {
     expect(turn).toContain("-c model_providers.goal_api.supports_websockets=false");
     expect(turn).toContain("-m qwen/qwen3.8-27b");
     expect(turn).not.toContain("openai_base_url");
+    // How hard the model reasons is set only when the run says so.
+    const tuned = turnCommand(codex!, "the goal", null, "off", 1200, null, { reasoningEffort: "medium", contextWindow: 262144, compactAt: 150000 }).join(" ");
+    expect(tuned).toContain('-c model_reasoning_effort="medium"');
+    expect(tuned).toContain("-c model_context_window=262144");
+    expect(tuned).toContain("-c model_auto_compact_token_limit=150000");
+    expect(turn).not.toContain("model_reasoning_effort");
+    expect(turn).not.toContain("model_context_window");
     // OpenAI's own API keeps Codex's built-in provider, at the gateway when the run is isolated.
     const openai = turnCommand(codex!, "the goal", null, "off", 1200, { url: "http://gateway:8080/v1", custom: false }).join(" ");
     expect(openai).toContain('-c openai_base_url="http://gateway:8080/v1"');
@@ -627,7 +634,7 @@ describe("an isolated run", () => {
       client,
       "sni_owner-seat",
       OWNER_KEY,
-      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, webSearch: "off" },
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, webSearch: "off", ...(api.custom ? { codexModel: { reasoningEffort: "medium" as const, contextWindow: 262144, compactAt: 150000 } } : {}) },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
     );
 
@@ -654,6 +661,8 @@ describe("an isolated run", () => {
     // Codex is pointed at the gateway by its config (it reads no OPENAI_BASE_URL), and holds a placeholder for the key.
     // Another API is a provider of Codex's own at the gateway, with that API's path.
     expect(turn.args.join(" ")).toContain(api.custom ? '-c model_providers.goal_api.base_url="http://gateway:8080/api/v1"' : '-c openai_base_url="http://gateway:8080/v1"');
+    expect(turn.args.join(" ").includes('-c model_reasoning_effort="medium"')).toBe(api.custom);
+    expect(turn.args.join(" ").includes("-c model_auto_compact_token_limit=150000")).toBe(api.custom);
     expect(turn.args.find((arg) => arg.startsWith("OPENAI_API_KEY="))).toBe("OPENAI_API_KEY=sk-isolated-the-gateway-holds-the-key");
     // The home of an image that has none is made as root, for the Agents' user.
     expect(calls.some((call) => call.args.join(" ").includes("--user root") && call.args.join(" ").endsWith("mkdir -p /home/agents && chown agent /home/agents"))).toBe(true);
@@ -673,7 +682,7 @@ describe("an isolated run", () => {
       `rm --force ${names.gateway}`,
       `network rm ${names.network}`,
     ]);
-    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ isolated: true, agent_user: "agent", addresses: { "codex-1": "10.9.0.3" }, web_search: "off", model_api: baseUrl ?? "https://api.openai.com/v1" });
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ isolated: true, agent_user: "agent", addresses: { "codex-1": "10.9.0.3" }, web_search: "off", model_api: baseUrl ?? "https://api.openai.com/v1", reasoning_effort: api.custom ? "medium" : null, context_window: api.custom ? 262144 : null, compact_at: api.custom ? 150000 : null });
   });
 });
 

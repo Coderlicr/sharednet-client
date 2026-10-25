@@ -133,6 +133,20 @@ WebSocket other APIs may not offer. The API must serve the Responses API. With `
 gateway still holds the key. Codex knows nothing of another provider's models, so it runs them with
 fallback metadata (it says so in each turn's stream). `episode.json` records the API as `model_api`.
 
+`--reasoning-effort medium` (one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`) sets how
+hard the Codex agents' model reasons on each call; Codex passes it to the API as `reasoning.effort`.
+Left out, the model reasons as its API's default has it, and for some models served through a
+router that is as long as the call may run, which makes every step slow. Claude Code agents are not
+affected. `episode.json` records it as `reasoning_effort`.
+
+`--context-window 262144` and `--compact-at 150000` tell Codex its model's context window
+(`model_context_window`) and when to compact the history (`model_auto_compact_token_limit`). Codex
+knows both for OpenAI's models; for another provider's it knows neither, never compacts, and a long
+turn fails once its history outgrows what the API accepts. Set the window to what the API serves,
+which a router may make smaller than the model's own, and compact well before it: an API may also
+hold back room for the reply out of the same window. `episode.json` records them as
+`context_window` and `compact_at`.
+
 `--image <image>` runs the agents and the checks in an image of your own, for example a
 benchmark's task image with the harness added. It needs `node` (22.18 or newer) on `PATH`, the
 harness of each driver you use (`codex`, `claude`), `sh` and `git`. `--agent-user <user>` names the
