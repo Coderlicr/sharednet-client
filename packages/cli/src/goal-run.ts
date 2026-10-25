@@ -51,7 +51,8 @@ export function parseAgents(raws: readonly string[]): AgentSpec[] {
     const driver = (separator === -1 ? raw : raw.slice(0, separator)).trim() as Driver;
     const model = separator === -1 ? null : raw.slice(separator + 1).trim() || null;
     if (!DRIVERS.includes(driver)) throw localError("invalid_arguments", `--agent ${raw}: the driver is codex or claude-code.`);
-    if (model !== null && !/^[A-Za-z0-9._/-]{1,100}$/.test(model)) throw localError("invalid_arguments", `--agent ${raw}: that is not a model name.`);
+    // A model name may carry a router's variant after a colon of its own, as in qwen/qwen3.8-27b:nitro.
+    if (model !== null && !/^[A-Za-z0-9._/-][A-Za-z0-9._/:-]{0,99}$/.test(model)) throw localError("invalid_arguments", `--agent ${raw}: that is not a model name.`);
     const number = (counts.get(driver) ?? 0) + 1;
     counts.set(driver, number);
     return { name: `${driver}-${number}`, driver, model };

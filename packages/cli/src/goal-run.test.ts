@@ -85,6 +85,12 @@ describe("--agent", () => {
     }
   });
 
+  it("takes a model name with a router's variant after a colon of its own", () => {
+    expect(parseAgents(["codex:qwen/qwen3.8-27b:nitro"])).toEqual([{ name: "codex-1", driver: "codex", model: "qwen/qwen3.8-27b:nitro" }]);
+    expect(() => parseAgents(["codex::nitro"])).toThrow();
+    expect(() => parseAgents(["codex:qwen 3"])).toThrow();
+  });
+
   it("starts up to fifty, so a team can be scaled past eight", () => {
     const seats = parseAgents(Array.from({ length: 50 }, (_, index) => (index % 2 === 0 ? "codex" : "claude-code")));
     expect(seats).toHaveLength(50);
