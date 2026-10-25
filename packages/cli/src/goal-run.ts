@@ -232,6 +232,23 @@ export interface Isolation {
   anthropic: string;
 }
 
+/**
+ * Codex's model API: OpenAI's own, or what OPENAI_BASE_URL names with its path, such as
+ * https://openrouter.ai/api/v1. Any other host is a provider of Codex's own, reached over HTTP.
+ */
+export interface CodexApi {
+  origin: string;
+  path: string;
+  custom: boolean;
+}
+
+/** OpenAI's API stays Codex's built-in provider; any other is one the run names for it. */
+export function codexApi(value: string | undefined): CodexApi {
+  if (!value?.trim()) return { origin: OPENAI_ORIGIN, path: "/v1", custom: false };
+  const url = modelUrl(value);
+  return { origin: url.origin, path: url.pathname.replace(/\/+$/, "") || "/v1", custom: url.origin !== OPENAI_ORIGIN };
+}
+
 export interface RunPlan {
   image: string;
   /** The user the Agents and the checks run as in the image: `node` in the default image. */
@@ -244,6 +261,8 @@ export interface RunPlan {
   cli: { root: string; entry: string };
   /** How the Codex seats sign in: an API key from this environment, or this machine's Codex login. */
   codexAuth: { kind: "api-key" } | { kind: "login"; file: string } | null;
+  /** Where the Codex seats' model API is; OpenAI's own when it is left out. */
+  codexApi?: CodexApi;
   /** The variable that signs the Claude Code seats in, passed through by name. */
   claudeAuth: "CLAUDE_CODE_OAUTH_TOKEN" | "ANTHROPIC_API_KEY" | null;
 }
@@ -285,9 +304,12 @@ export async function prepareRun(
     if (built.code !== 0) throw localError("image_build_failed", `The Agents' image could not be built: ${built.stderr.trim().split("\n").slice(-3).join(" ")}`);
   }
   let codexAuth: RunPlan["codexAuth"] = null;
+  const codex = codexApi(input.env.OPENAI_BASE_URL);
   if (input.agents.some((agent) => agent.driver === "codex")) {
     const login = join(input.home, ".codex", "auth.json");
     if (input.env.OPENAI_API_KEY) codexAuth = { kind: "api-key" };
+    // A Codex login signs in to OpenAI alone.
+    else if (codex.custom) throw localError("agent_auth_missing", `A codex Agent reaches ${codex.origin} with that API's key in OPENAI_API_KEY; set it.`);
     // The gateway signs an isolated seat's requests with a key; a login lives in the container that uses it.
     else if (input.isolate) throw localError("agent_auth_missing", "An isolated codex Agent reaches OpenAI through the run's gateway, which signs its requests with OPENAI_API_KEY; set it. A Codex login cannot be lent to the gateway.");
     // Mounted by its real path: Docker would otherwise mount the link, not the login.
@@ -312,14 +334,14 @@ export async function prepareRun(
       const pulled = await docker(["pull", GATEWAY_IMAGE]);
       if (pulled.code !== 0) throw localError("image_not_found", `The gateway's image ${GATEWAY_IMAGE} could not be pulled: ${pulled.stderr.trim().split("\n").slice(-1).join(" ")}`);
     }
-    isolation = { openai: modelOrigin(input.env.OPENAI_BASE_URL, "https://api.openai.com"), anthropic: modelOrigin(input.env.ANTHROPIC_BASE_URL, "https://api.anthropic.com") };
+    isolation = { openai: codex.origin, anthropic: modelOrigin(input.env.ANTHROPIC_BASE_URL, "https://api.anthropic.com") };
   }
-  return { image, agentUser, isolation, agents: input.agents, workspace: input.workspace, cli: cliPackage(input.entry), codexAuth, claudeAuth };
+  return { image, agentUser, isolation, agents: input.agents, workspace: input.workspace, cli: cliPackage(input.entry), codexAuth, claudeAuth, ...(codex.custom ? { codexApi: codex } : {}) };
 }
 
-/** A model API's origin, from this machine's own setting for it when there is one. */
-function modelOrigin(value: string | undefined, fallback: string): string {
-  if (!value?.trim()) return fallback;
+const OPENAI_ORIGIN = "https://api.openai.com";
+
+function modelUrl(value: string): URL {
   let url: URL;
   try {
     url = new URL(value.trim());
@@ -327,7 +349,12 @@ function modelOrigin(value: string | undefined, fallback: string): string {
     throw localError("invalid_arguments", `${value} is not a URL a gateway can forward to.`);
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") throw localError("invalid_arguments", `${value} is not a URL a gateway can forward to.`);
-  return url.origin;
+  return url;
+}
+
+/** A model API's origin, from this machine's own setting for it when there is one. */
+function modelOrigin(value: string | undefined, fallback: string): string {
+  return value?.trim() ? modelUrl(value).origin : fallback;
 }
 
 // ---- turns ----
@@ -401,13 +428,31 @@ export function wakePrompt(wake: WakeShape): string {
 /** Whether the Agents may search the web: on by default, off for a benchmark that forbids it. */
 export type WebSearch = "live" | "off";
 
-export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live", turnLimitSeconds = TURN_LIMIT_SECONDS, openaiBaseUrl: string | null = null): string[] {
+/** The address a Codex turn calls its model at, and whether that is a provider other than OpenAI. */
+export interface CodexBase {
+  url: string;
+  custom: boolean;
+}
+
+/** The provider Codex is given for a model API other than OpenAI's: Responses over HTTP, keyed from OPENAI_API_KEY. */
+const CODEX_PROVIDER = "goal_api";
+
+export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live", turnLimitSeconds = TURN_LIMIT_SECONDS, codexBase: CodexBase | null = null): string[] {
   const limit = ["timeout", String(turnLimitSeconds)];
   if (seat.driver === "codex") {
     // Live web search, which Claude Code has by default: a goal is as often research as code.
     const search = webSearch === "live" ? 'web_search="live"' : 'web_search="disabled"';
-    // Codex takes its API's address from its config, not from OPENAI_BASE_URL.
-    const base = openaiBaseUrl === null ? [] : ["-c", `openai_base_url="${openaiBaseUrl}"`];
+    // Codex takes its API's address from its config, not from OPENAI_BASE_URL. OpenAI's built-in provider
+    // cannot be redefined, and talks to OpenAI over a WebSocket another API may not offer.
+    const provider = `model_providers.${CODEX_PROVIDER}`;
+    const base = codexBase === null ? [] : codexBase.custom ? [
+      "-c", `model_provider="${CODEX_PROVIDER}"`,
+      "-c", `${provider}.name="${CODEX_PROVIDER}"`,
+      "-c", `${provider}.base_url="${codexBase.url}"`,
+      "-c", `${provider}.env_key="OPENAI_API_KEY"`,
+      "-c", `${provider}.wire_api="responses"`,
+      "-c", `${provider}.supports_websockets=false`,
+    ] : ["-c", `openai_base_url="${codexBase.url}"`];
     const flags = ["--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", search, ...base, ...(seat.model ? ["-m", seat.model] : [])];
     return sessionId === null ? [...limit, "codex", "exec", ...flags, prompt] : [...limit, "codex", "exec", "resume", ...flags, sessionId, prompt];
   }
@@ -796,6 +841,12 @@ export async function runGoal(
       throw error;
     }
 
+    // An isolated seat calls its model at the gateway, with the API's own path; one that is not calls another API itself.
+    const api = plan.codexApi ?? codexApi(undefined);
+    const codexBase: CodexBase | null = isolated
+      ? { url: `http://${GATEWAY_ALIAS}:${GATEWAY_PORTS.openai}${api.path}`, custom: api.custom }
+      : api.custom ? { url: `${api.origin}${api.path}`, custom: true } : null;
+
     const runTurn = async (seat: SeatRecord, prompt: string, wake: WakeShape | null) => {
       if (input.roomType === "compiled") {
         // The CLI inside the seat's container holds its own credential; the owner cannot render its obligations.
@@ -816,7 +867,7 @@ export async function runGoal(
       const reader = new TurnReader(seat.driver);
       const startedAt = dependencies.now().toISOString();
       let writes = Promise.resolve();
-      const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds, isolated ? `http://${GATEWAY_ALIAS}:${GATEWAY_PORTS.openai}/v1` : null);
+      const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds, codexBase);
       if (input.taskGate && seat.driver === "claude-code") command.splice(command.length - 1, 0, "--settings", TASK_HOOK_SETTINGS);
       const result = await exec(seat, command, {
         through: wake?.through ?? input.goalSequence,
@@ -980,6 +1031,8 @@ export async function runGoal(
           isolated,
           ...(isolated ? { addresses } : {}),
           web_search: input.webSearch ?? "live",
+          // Where the Codex seats' model was: a run's numbers are read with the model and its provider.
+          ...(plan.codexAuth !== null ? { model_api: `${api.origin}${api.path}` } : {}),
           turn_limit_s: turnLimitSeconds,
           mention_gate: input.mentionGate ?? false,
           task_gate: input.taskGate ?? false,

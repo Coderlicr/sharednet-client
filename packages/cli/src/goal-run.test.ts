@@ -13,6 +13,7 @@ import {
   DEFAULT_IMAGE,
   GATEWAY_IMAGE,
   TurnReader,
+  codexApi,
   codexSessionUsage,
   containerName,
   freshTokens,
@@ -112,6 +113,26 @@ describe("a turn", () => {
     expect(turnCommand(codex, "the goal", null, "live", 2700).slice(0, 3)).toEqual(["timeout", "2700", "codex"]);
     const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
     expect(turnCommand(claude, "new lines", "session-1", "live", 2700).slice(0, 3)).toEqual(["timeout", "2700", "claude"]);
+  });
+
+  it("gives Codex a provider of its own for a model API other than OpenAI's, over HTTP", () => {
+    const [codex] = parseAgents(["codex:qwen/qwen3.8-27b"]);
+    expect(codexApi(undefined)).toEqual({ origin: "https://api.openai.com", path: "/v1", custom: false });
+    expect(codexApi("https://openrouter.ai/api/v1/")).toEqual({ origin: "https://openrouter.ai", path: "/api/v1", custom: true });
+    expect(codexApi("https://api.openai.com")).toEqual({ origin: "https://api.openai.com", path: "/v1", custom: false });
+    expect(() => codexApi("ftp://openrouter.ai")).toThrow();
+    const turn = turnCommand(codex!, "the goal", null, "off", 1200, { url: "http://gateway:8080/api/v1", custom: true }).join(" ");
+    expect(turn).toContain('-c model_provider="goal_api"');
+    expect(turn).toContain('-c model_providers.goal_api.base_url="http://gateway:8080/api/v1"');
+    expect(turn).toContain('-c model_providers.goal_api.env_key="OPENAI_API_KEY"');
+    expect(turn).toContain('-c model_providers.goal_api.wire_api="responses"');
+    expect(turn).toContain("-c model_providers.goal_api.supports_websockets=false");
+    expect(turn).toContain("-m qwen/qwen3.8-27b");
+    expect(turn).not.toContain("openai_base_url");
+    // OpenAI's own API keeps Codex's built-in provider, at the gateway when the run is isolated.
+    const openai = turnCommand(codex!, "the goal", null, "off", 1200, { url: "http://gateway:8080/v1", custom: false }).join(" ");
+    expect(openai).toContain('-c openai_base_url="http://gateway:8080/v1"');
+    expect(openai).not.toContain("model_provider");
   });
 
   it("takes web search away from every Agent when it is off, for a benchmark that forbids the internet", () => {
@@ -542,6 +563,10 @@ describe("an isolated run", () => {
     const plan = await prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-test", OPENAI_BASE_URL: "https://llm.example.test/v1" }, isolate: true, agentUser: "agent" }, missing.docker, () => undefined);
     expect(missing.calls.some((call) => call.args.join(" ") === `pull ${GATEWAY_IMAGE}`)).toBe(true);
     expect(plan).toMatchObject({ agentUser: "agent", isolation: { openai: "https://llm.example.test", anthropic: "https://api.anthropic.com" }, codexAuth: { kind: "api-key" } });
+    // Another model API: its key in OPENAI_API_KEY, its path kept; a Codex login signs in to OpenAI alone.
+    const routed = await prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-or-test", OPENAI_BASE_URL: "https://openrouter.ai/api/v1" }, isolate: true }, ready.docker, () => undefined);
+    expect(routed).toMatchObject({ isolation: { openai: "https://openrouter.ai" }, codexApi: { origin: "https://openrouter.ai", path: "/api/v1", custom: true } });
+    await expect(prepareRun({ ...base, env: { OPENAI_BASE_URL: "https://openrouter.ai/api/v1" } }, ready.docker, () => undefined)).rejects.toMatchObject({ code: "agent_auth_missing" });
     // Not isolated, nothing changes: the default user and no gateway.
     expect(await prepareRun({ ...base, env: {} }, ready.docker, () => undefined)).toMatchObject({ agentUser: "node", isolation: null });
   });
@@ -561,13 +586,18 @@ describe("an isolated run", () => {
       .toContain('proxy_set_header Authorization "Bearer ${CLAUDE_CODE_OAUTH_TOKEN}";');
   });
 
-  it("puts every container on an internal network behind the gateway, and keeps every key out", async () => {
+  it.each([
+    ["OpenAI", undefined],
+    ["another model API", "https://openrouter.ai/api/v1"],
+  ] as const)("puts every container on an internal network behind the gateway, and keeps every key out, for %s", async (_name, baseUrl) => {
     const out = await temporary();
     const workspace = await temporary();
+    const api = codexApi(baseUrl);
     const plan: RunPlan = {
       image: "programbench-agent:1",
       agentUser: "agent",
-      isolation: { openai: "https://api.openai.com", anthropic: "https://api.anthropic.com" },
+      isolation: { openai: api.origin, anthropic: "https://api.anthropic.com" },
+      ...(api.custom ? { codexApi: api } : {}),
       agents: parseAgents(["codex:gpt-6-luna"]),
       workspace,
       cli: { root: "/opt/cli", entry: "src/main.ts" },
@@ -607,7 +637,7 @@ describe("an isolated run", () => {
     expect(gateway.args).not.toContain("--network");
     expect(gateway.args).toContain(GATEWAY_IMAGE);
     expect(gateway.args.join(" ")).toContain("-e GATEWAY_TEMPLATE -e OPENAI_API_KEY");
-    expect(gateway.env.GATEWAY_TEMPLATE).toContain("proxy_pass https://api.openai.com;");
+    expect(gateway.env.GATEWAY_TEMPLATE).toContain(`proxy_pass ${api.origin};`);
     expect(calls.some((call) => call.args.join(" ") === `network connect --alias gateway ${names.network} ${names.gateway}`)).toBe(true);
     // Every other container is on the internal network, and none of them can reach this machine.
     const runs = calls.filter((call) => call.args[0] === "run" && !call.args.includes(names.gateway));
@@ -622,7 +652,8 @@ describe("an isolated run", () => {
     const turn = calls.find((call) => call.args.includes("codex"))!;
     expect(turn.args).toContain("SHAREDNET_BASE_URL=http://127.0.0.1:8081");
     // Codex is pointed at the gateway by its config (it reads no OPENAI_BASE_URL), and holds a placeholder for the key.
-    expect(turn.args.join(" ")).toContain('-c openai_base_url="http://gateway:8080/v1"');
+    // Another API is a provider of Codex's own at the gateway, with that API's path.
+    expect(turn.args.join(" ")).toContain(api.custom ? '-c model_providers.goal_api.base_url="http://gateway:8080/api/v1"' : '-c openai_base_url="http://gateway:8080/v1"');
     expect(turn.args.find((arg) => arg.startsWith("OPENAI_API_KEY="))).toBe("OPENAI_API_KEY=sk-isolated-the-gateway-holds-the-key");
     // The home of an image that has none is made as root, for the Agents' user.
     expect(calls.some((call) => call.args.join(" ").includes("--user root") && call.args.join(" ").endsWith("mkdir -p /home/agents && chown agent /home/agents"))).toBe(true);
@@ -642,7 +673,7 @@ describe("an isolated run", () => {
       `rm --force ${names.gateway}`,
       `network rm ${names.network}`,
     ]);
-    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ isolated: true, agent_user: "agent", addresses: { "codex-1": "10.9.0.3" }, web_search: "off" });
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ isolated: true, agent_user: "agent", addresses: { "codex-1": "10.9.0.3" }, web_search: "off", model_api: baseUrl ?? "https://api.openai.com/v1" });
   });
 });
 

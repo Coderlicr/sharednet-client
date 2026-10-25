@@ -124,6 +124,15 @@ on the model provider's side, past any gateway. The gateway's access log, one li
 with the address of the container it came from, goes into the record, and `episode.json` maps
 each seat to its address.
 
+Codex agents can use a model API other than OpenAI's: set `OPENAI_BASE_URL` to that API's base
+URL with its path, such as `https://openrouter.ai/api/v1`, put that API's key in `OPENAI_API_KEY`,
+and name its model with the agent, as in `--agent codex:qwen/qwen3.8-27b`. Any host other than
+`api.openai.com` is given to Codex as a provider of its own (`goal_api`), over the Responses API on
+plain HTTP: Codex's built-in OpenAI provider cannot be redefined, and talks to OpenAI over a
+WebSocket other APIs may not offer. The API must serve the Responses API. With `--isolate` the
+gateway still holds the key. Codex knows nothing of another provider's models, so it runs them with
+fallback metadata (it says so in each turn's stream). `episode.json` records the API as `model_api`.
+
 `--image <image>` runs the agents and the checks in an image of your own, for example a
 benchmark's task image with the harness added. It needs `node` (22.18 or newer) on `PATH`, the
 harness of each driver you use (`codex`, `claude`), `sh` and `git`. `--agent-user <user>` names the
